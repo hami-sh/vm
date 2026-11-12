@@ -219,6 +219,13 @@ func TestDrainCompletionWaitsForTerminationAndEmptyDriver(t *testing.T) {
 				t.Fatal("cannot reattach drained capacity:", err)
 			}
 			assertTopology(4, 2)
+			admission, err := scheduler.Snapshot(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.ContainsFunc(admission.Hosts, func(h api.Host) bool { return h.ID == "r1-h1" && h.AdminState == api.AdminActive }) {
+				t.Fatalf("reattached host still refuses scheduler placements: %+v", admission.Hosts)
+			}
 		})
 	}
 }
@@ -226,6 +233,76 @@ func TestDrainCompletionWaitsForTerminationAndEmptyDriver(t *testing.T) {
 type eventScheduler struct {
 	standIn
 	truncated bool
+}
+
+func TestSimulationChangesPublishWhilePausedWithoutExtraChecks(t *testing.T) {
+	ctx := t.Context()
+	cfg := config.Default()
+	c := clock.NewScaled(time.Unix(0, 0), 1)
+	c.Pause()
+	factory := func(ctx context.Context, cfg config.Config, c clock.Clock, n api.Transport, path string) (Scheduler, func(), error) {
+		_, close, err := newStandIn(ctx, cfg, c, n, path)
+		// Every checker read would report a retention gap. Repeated wall-clock
+		// publications must not keep incrementing that violation while paused.
+		return eventScheduler{truncated: true}, close, err
+	}
+	f, err := New(ctx, Options{Config: cfg, Racks: 1, HostsPerRack: 1, Clock: c, SchedulerFactory: factory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	snapshots, _, unsubscribe := f.Subscribe()
+	defer unsubscribe()
+	<-snapshots
+	await := func(matches func(api.Snapshot) bool) api.Snapshot {
+		t.Helper()
+		timer := (clock.Real{}).NewTimer(cfg.SSEEvery)
+		defer timer.Stop()
+		for {
+			select {
+			case s := <-snapshots:
+				if matches(s) {
+					return s
+				}
+			case <-timer.C():
+				t.Fatal("simulation change not published within SSEEvery")
+			}
+		}
+	}
+	change := func(action string, request api.SimRequest) {
+		t.Helper()
+		if _, err := f.Chaos.Sim(ctx, action, request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	change("play", api.SimRequest{})
+	await(func(s api.Snapshot) bool { return !s.Sim.Paused })
+	change("pause", api.SimRequest{})
+	paused := await(func(s api.Snapshot) bool { return s.Sim.Paused })
+	change("speed", api.SimRequest{Speed: 3})
+	await(func(s api.Snapshot) bool { return s.Sim.Speed == 3 && s.Sim.Paused })
+	intensity := .25
+	change("chaos", api.SimRequest{Intensity: &intensity})
+	await(func(s api.Snapshot) bool { return s.Sim.Intensity == intensity })
+	change("step", api.SimRequest{StepMs: 1})
+	stepped := await(func(s api.Snapshot) bool { return s.At == paused.At+1 && s.Sim.Paused })
+	baseline := slices.Clone(stepped.Invariants)
+	wallBudget := (clock.Real{}).NewTimer(3 * cfg.SSEEvery)
+	defer wallBudget.Stop()
+	for range 2 {
+		// Two subsequent updates with no Sim requests prove the paused wall
+		// ticker publishes, rather than only the explicit change notification.
+		select {
+		case stepped = <-snapshots:
+		case <-wallBudget.C():
+			t.Fatal("paused wall-clock publications stopped")
+		}
+		if stepped.At != paused.At+1 || !slices.Equal(stepped.Invariants, baseline) {
+			t.Fatalf("wall publication advanced simulation or repeated checker: %+v", stepped)
+		}
+	}
+	change("play", api.SimRequest{})
+	await(func(s api.Snapshot) bool { return !s.Sim.Paused })
 }
 
 func (s eventScheduler) Snapshot(context.Context) (api.Snapshot, error) {

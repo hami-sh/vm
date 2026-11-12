@@ -211,3 +211,169 @@ func TestRealFleetFailureScenarios(t *testing.T) {
 		})
 	}
 }
+
+func TestRealCompromiseQuarantinesWithoutHurtingNeighbour(t *testing.T) {
+	h := newScenarioFleet(t)
+	h.create(2)
+	before := h.ready(2)
+	victim, neighbour := before.VMs[0], before.VMs[1]
+	h.fault("compromise", victim.ID)
+	h.wait(h.cfg.QuarantineWindow, "real attacker quarantine", func(s api.Snapshot) bool {
+		if s.Security.Succeeded != 0 {
+			t.Fatalf("attack escaped isolation: %+v", s.Security)
+		}
+		if !slices.ContainsFunc(s.VMs, func(v api.VM) bool {
+			return v.ID == neighbour.ID && v.State == api.VMReady && v.Generation == neighbour.Generation && v.HostID == neighbour.HostID
+		}) {
+			t.Fatal("compromised guest disrupted its neighbour")
+		}
+		return s.Security.Blocked >= h.cfg.QuarantineAttempts && slices.ContainsFunc(s.VMs, func(v api.VM) bool {
+			return v.ID == victim.ID && v.State == api.VMFailed && v.LastReason == api.ReasonQuarantined && v.Generation == victim.Generation
+		})
+	})
+}
+
+func TestRealRollingMaintenance(t *testing.T) {
+	h := newScenarioFleet(t)
+	h.create(8)
+	before := h.ready(8)
+	rate := .05
+	if _, err := h.f.Chaos.Sim(h.ctx, "chaos", api.SimRequest{LoadRate: &rate}); err != nil {
+		t.Fatal(err)
+	}
+	_, events, unsubscribe := h.f.Subscribe()
+	defer unsubscribe()
+	h.fault("rolling-maintenance", "")
+	assertRollingMaintenance(t, h, before, h.cfg.DrainGrace, events)
+}
+
+func TestRealSlowStoreDelaysCommitAndHeals(t *testing.T) {
+	h := newScenarioFleet(t)
+	h.create(1)
+	h.ready(1)
+	setDelay := func(ms float64) {
+		t.Helper()
+		if _, err := h.f.Chaos.Do(h.ctx, "slow-store", api.ChaosRequest{Params: map[string]float64{"ms": ms}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setDelay(200)
+	start := h.f.Clock.Now()
+	if _, err := h.f.Control.CreateVM(h.ctx, "slow-commit", api.CreateVMRequest{Pool: config.Pools[0].Name}); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := h.f.Clock.Now().Sub(start); elapsed < 200*time.Millisecond {
+		t.Fatalf("durable create bypassed store delay: %s", elapsed)
+	}
+	setDelay(0)
+	h.ready(2)
+}
+
+func TestRealDrainQueuesClassZeroReplacements(t *testing.T) {
+	h := newScenarioFleet(t)
+	capacity := h.cfg.Racks * h.cfg.HostsPerRack * h.cfg.SlotsPerHost
+	h.create(capacity)
+	before := h.ready(capacity)
+	rack := before.Racks[0]
+	want := map[string]bool{}
+	for _, v := range before.VMs {
+		if v.Rack == rack.ID {
+			want[v.ID] = true
+		}
+	}
+	h.fault("remove-rack", rack.ID)
+	h.wait(h.cfg.DrainGrace+h.cfg.HostLeaseTTL, "class-zero drain replacements", func(s api.Snapshot) bool {
+		found := 0
+		for _, q := range s.Queue {
+			if want[q.VMID] {
+				if q.Priority != api.PriorityReplacement || q.Reason != api.QueueReplace {
+					t.Fatalf("drain replacement lost class 0: %+v", q)
+				}
+				found++
+			}
+		}
+		return found == len(want) && !slices.ContainsFunc(s.Racks, func(r api.Rack) bool { return r.ID == rack.ID })
+	})
+}
+
+func assertRollingMaintenance(t *testing.T, h *scenarioFleet, before api.Snapshot, grace time.Duration, events <-chan api.Event) {
+	t.Helper()
+	started := map[string]int64{}
+	removed := map[string]bool{}
+	removedHosts := map[string]bool{}
+	drained := map[string][]api.VM{}
+	order := []string{}
+	previousSnapshot := before
+	h.wait(time.Duration(len(before.Racks))*(grace+2*h.cfg.BootDeadline), "rolling maintenance under load", func(s api.Snapshot) bool {
+		defer func() { previousSnapshot = s }()
+		// Removal and re-add can both happen between published snapshots.
+		// Drain topology events continuously instead of requiring an absent frame.
+		for collecting := true; collecting; {
+			select {
+			case e := <-events:
+				if e.Kind == api.EventTopology && e.Detail == "drain completed" {
+					removedHosts[e.HostID] = true
+				}
+			default:
+				collecting = false
+			}
+		}
+		if slices.ContainsFunc(s.VMs, func(v api.VM) bool {
+			return v.State == api.VMFailed || v.State == api.VMLost || v.State == api.VMTerminated
+		}) {
+			t.Fatalf("maintenance lost admitted work: %+v", s.VMs)
+		}
+		for _, rack := range before.Racks {
+			if !slices.ContainsFunc(rack.Hosts, func(id string) bool { return !removedHosts[id] }) {
+				removed[rack.ID] = true
+			}
+			isDraining := slices.ContainsFunc(s.Hosts, func(host api.Host) bool { return host.Rack == rack.ID && host.AdminState == api.AdminDraining })
+			if isDraining && started[rack.ID] == 0 {
+				started[rack.ID] = s.At
+				order = append(order, rack.ID)
+				for _, v := range previousSnapshot.VMs {
+					if v.Rack == rack.ID && v.State == api.VMReady {
+						drained[rack.ID] = append(drained[rack.ID], v)
+					}
+				}
+				if len(order) > 1 {
+					previous := order[len(order)-2]
+					if !removed[previous] || !slices.ContainsFunc(s.Racks, func(r api.Rack) bool { return r.ID == previous }) {
+						t.Fatalf("started %s before restoring %s", rack.ID, previous)
+					}
+					for _, v := range drained[previous] {
+						if !slices.ContainsFunc(s.VMs, func(now api.VM) bool {
+							return now.ID == v.ID && now.State == api.VMReady && now.Rack != previous && now.Generation > v.Generation
+						}) {
+							t.Fatalf("started next rack before drained VM recovered elsewhere: %s", v.ID)
+						}
+					}
+				}
+			}
+			if at := started[rack.ID]; at != 0 && s.At-at < (grace-h.cfg.HostHeartbeat).Milliseconds() {
+				for _, v := range drained[rack.ID] {
+					if !slices.ContainsFunc(s.VMs, func(now api.VM) bool {
+						return now.ID == v.ID && now.State == api.VMReady && now.HostID == v.HostID && now.Generation == v.Generation
+					}) {
+						t.Fatalf("VM moved before drain grace elapsed: %s", v.ID)
+					}
+				}
+			}
+			if started[rack.ID] != 0 && !slices.ContainsFunc(s.Racks, func(r api.Rack) bool { return r.ID == rack.ID }) {
+				removed[rack.ID] = true
+			}
+		}
+		if len(order) != len(before.Racks) || len(removed) != len(before.Racks) || s.Sim.Scenario != "" {
+			return false
+		}
+		if !slices.Equal(order, []string{"r1", "r2", "r3"}) {
+			t.Fatalf("maintenance order: %v", order)
+		}
+		for _, old := range before.VMs {
+			if !slices.ContainsFunc(s.VMs, func(v api.VM) bool { return v.ID == old.ID && v.State == api.VMReady && v.Generation > old.Generation }) {
+				return false
+			}
+		}
+		return len(s.Hosts) == len(before.Hosts) && len(s.Racks) == len(before.Racks) && len(s.VMs) > len(before.VMs)
+	})
+}

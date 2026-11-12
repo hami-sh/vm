@@ -25,6 +25,7 @@ type Scheduler interface {
 	EventsSince(context.Context, int64) ([]api.Event, bool, error)
 	SetDown(context.Context, bool) error
 	SetHostAdmin(context.Context, string, api.AdminState) error
+	SetStoreDelay(context.Context, time.Duration) error
 }
 type SchedulerFactory func(context.Context, config.Config, clock.Clock, api.Transport, string) (Scheduler, func(), error)
 type Options struct {
@@ -174,6 +175,8 @@ func (f *Fleet) publish(cfg config.Config, events <-chan api.Event) {
 	check := invariant.New(cfg)
 	tick := f.Clock.NewTicker(cfg.InvariantEvery)
 	defer tick.Stop()
+	wall := (clock.Real{}).NewTicker(cfg.SSEEvery)
+	defer wall.Stop()
 	subs := map[*subscription]bool{}
 	defer func() {
 		for s := range subs {
@@ -186,6 +189,7 @@ func (f *Fleet) publish(cfg config.Config, events <-chan api.Event) {
 	var eventSeq, snapshotSeq, schedulerSeq int64
 	var logIncarnation int64
 	var next time.Time
+	var nextCheck time.Time
 	appendEvent := func(e api.Event) {
 		if e.Kind == api.EventChaos && e.Detail == "reset " {
 			check = invariant.New(cfg)
@@ -200,47 +204,53 @@ func (f *Fleet) publish(cfg config.Config, events <-chan api.Event) {
 			}
 		}
 	}
-	refresh := func() {
-		s, raw, epoch, err := f.runtime.observe(f.ctx)
-		if err != nil {
-			return
-		}
-		if epoch != logIncarnation {
-			schedulerSeq = 0
-			logIncarnation = epoch
-		}
-		batch, truncated, err := f.runtime.events(f.ctx, schedulerSeq)
-		if err != nil {
-			return
-		}
-		if truncated {
-			appendEvent(check.EventsLost(s.At))
-		}
-		for _, e := range batch {
-			if e.Seq > schedulerSeq {
-				schedulerSeq = e.Seq
+	refresh := func(force bool) {
+		s := clone(latest)
+		now := f.Clock.Now()
+		if nextCheck.IsZero() || !now.Before(nextCheck) {
+			observed, raw, epoch, err := f.runtime.observe(f.ctx)
+			if err != nil {
+				return
+			}
+			s = observed
+			if epoch != logIncarnation {
+				schedulerSeq = 0
+				logIncarnation = epoch
+			}
+			batch, truncated, err := f.runtime.events(f.ctx, schedulerSeq)
+			if err != nil {
+				return
+			}
+			if truncated {
+				appendEvent(check.EventsLost(s.At))
+			}
+			for _, e := range batch {
+				if e.Seq > schedulerSeq {
+					schedulerSeq = e.Seq
+					appendEvent(e)
+				}
+			}
+			for {
+				select {
+				case e := <-events:
+					appendEvent(e)
+				default:
+					goto drained
+				}
+			}
+		drained:
+			s.Recent = recent
+			for _, e := range check.Check(s, raw...) {
 				appendEvent(e)
 			}
+			nextCheck = now.Add(cfg.InvariantEvery)
 		}
-		for {
-			select {
-			case e := <-events:
-				appendEvent(e)
-			default:
-				goto drained
-			}
-		}
-	drained:
 		s.At = f.Clock.Now().UnixMilli()
-		s.Recent = recent
-		for _, e := range check.Check(s, raw...) {
-			appendEvent(e)
-		}
 		if sim, err := f.Chaos.Status(f.ctx); err == nil {
 			s.Sim = sim
 		}
 		s.Invariants = check.Status()
-		if next.IsZero() || !f.Clock.Now().Before(next) {
+		if force || next.IsZero() || !f.Clock.Now().Before(next) {
 			snapshotSeq++
 			s.Seq = snapshotSeq
 			s.Recent = recent
@@ -258,13 +268,19 @@ func (f *Fleet) publish(cfg config.Config, events <-chan api.Event) {
 			}
 		}
 	}
-	refresh()
+	refresh(true)
 	for {
 		select {
 		case <-f.ctx.Done():
 			return
 		case <-tick.C():
-			refresh()
+			refresh(false)
+		case <-f.Chaos.Changes():
+			refresh(true)
+		case <-wall.C():
+			if f.Clock.Paused() {
+				refresh(true)
+			}
 		case e := <-events:
 			appendEvent(e)
 		case q := <-f.queries:

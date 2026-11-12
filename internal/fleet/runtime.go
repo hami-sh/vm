@@ -231,6 +231,15 @@ func (r *runtime) addHost(rack, id string) error {
 	r.hosts[id] = &host{addr: addr, agent: a, driver: d, cancel: cancel, admin: api.AdminActive}
 	r.racks[idx].Hosts = append(r.racks[idx].Hosts, id)
 	go a.Run(ctx)
+	// Reusing a removed host ID must also restore scheduler admission. Attach
+	// the endpoint first so any queued placement has a live destination.
+	if r.scheduler != nil {
+		err := r.scheduler.SetHostAdmin(ctx, id, api.AdminActive)
+		var apiErr *api.Error
+		if err != nil && (!errors.As(err, &apiErr) || apiErr.Status != 404) {
+			return err
+		}
+	}
 	return nil
 }
 func (r *runtime) ControlPlane() api.ControlPlane { return r }
@@ -316,7 +325,6 @@ func (r *runtime) read(ctx context.Context) (observed, error) {
 	s.Hosts = slices.DeleteFunc(s.Hosts, func(h api.Host) bool { return r.hosts[h.ID] == nil })
 	for i := range s.Hosts {
 		if h := r.hosts[s.Hosts[i].ID]; h != nil {
-			s.Hosts[i].AdminState = h.admin
 			s.Hosts[i].Faults = slices.Clone(h.faults)
 		}
 	}
@@ -365,12 +373,7 @@ func (r *runtime) apply(ctx context.Context, a string, q api.ChaosRequest) error
 	case "wipe-store":
 		return r.restart(true)
 	case "slow-store":
-		if s, ok := r.scheduler.(interface {
-			SetStoreDelay(context.Context, time.Duration) error
-		}); ok {
-			return s.SetStoreDelay(ctx, time.Duration(param("ms", 200))*time.Millisecond)
-		}
-		return &api.Error{Status: 501, Msg: "scheduler slow-store hook pending"}
+		return r.scheduler.SetStoreDelay(ctx, time.Duration(param("ms", 200))*time.Millisecond)
 	case "latency-spike":
 		ms := param("ms", 200)
 		if ms < 0 || ms > float64(r.cfg.HostLeaseTTL.Milliseconds()) {

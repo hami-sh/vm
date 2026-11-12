@@ -43,28 +43,32 @@ type scheduled struct {
 	req    api.ChaosRequest
 }
 type Engine struct {
-	ctx   context.Context
-	inbox chan request
-	done  chan struct{}
+	ctx     context.Context
+	inbox   chan request
+	done    chan struct{}
+	changes chan struct{}
 }
 type state struct {
-	cfg      config.Config
-	clock    clock.Controllable
-	wall     clock.Clock
-	backend  Backend
-	emit     func(api.Event)
-	status   api.SimStatus
-	rng      *rand.Rand
-	idle     time.Time
-	mix      [3]float64
-	credit   float64
-	previous time.Time
-	tasks    []scheduled
-	serial   uint64
+	cfg              config.Config
+	clock            clock.Controllable
+	wall             clock.Clock
+	backend          Backend
+	emit             func(api.Event)
+	status           api.SimStatus
+	rng              *rand.Rand
+	idle             time.Time
+	mix              [3]float64
+	credit           float64
+	previous         time.Time
+	tasks            []scheduled
+	serial           uint64
+	maintenance      []api.Rack
+	maintenancePhase int // 0: start drain, 1: wait for removal, 2: wait for restored capacity
+	maintenanceVMs   []string
 }
 
 func New(ctx context.Context, cfg config.Config, c clock.Controllable, b Backend, seed int64, emit func(api.Event)) *Engine {
-	e := &Engine{ctx: ctx, inbox: make(chan request), done: make(chan struct{})}
+	e := &Engine{ctx: ctx, inbox: make(chan request), done: make(chan struct{}), changes: make(chan struct{}, 1)}
 	s := &state{cfg: cfg, clock: c, wall: clock.Real{}, backend: b, emit: emit, status: api.SimStatus{Seed: seed}, rng: rand.New(rand.NewSource(seed)), mix: cfg.LoadPriorityMix, previous: c.Now()}
 	s.idle = s.wall.Now()
 	go func() {
@@ -130,8 +134,19 @@ func (e *Engine) Sim(ctx context.Context, a string, r api.SimRequest) (api.SimSt
 	if err != nil {
 		return v.status, err
 	}
+	if v.err == nil && a != "status" {
+		select {
+		case e.changes <- struct{}{}:
+		default:
+		}
+	}
 	return v.status, v.err
 }
+
+// Changes wakes the snapshot publisher even when a Sim action stops the clock.
+// Notifications coalesce; consumers read Status for the latest state.
+func (e *Engine) Changes() <-chan struct{} { return e.changes }
+
 func (e *Engine) Status(ctx context.Context) (api.SimStatus, error) {
 	return e.Sim(ctx, "status", api.SimRequest{})
 }
@@ -232,6 +247,9 @@ func (s *state) reset(ctx context.Context) error {
 		return err
 	}
 	s.tasks = nil
+	s.maintenance = nil
+	s.maintenancePhase = 0
+	s.maintenanceVMs = nil
 	s.credit = 0
 	s.status.Intensity = 0
 	s.status.LoadRate = 0
@@ -331,6 +349,7 @@ func (s *state) create(ctx context.Context) error {
 func (s *state) tick(ctx context.Context, now time.Time) {
 	dt := now.Sub(s.previous).Seconds()
 	s.previous = now
+	s.maintenanceTick(ctx, now)
 	tasks := s.tasks
 	s.tasks = nil
 	for _, t := range tasks {
@@ -437,9 +456,9 @@ func (s *state) preset(ctx context.Context, now time.Time, name string) error {
 			s.tasks = append(s.tasks, scheduled{at: now.Add(s.cfg.PresetStepEvery), action: "flood", req: api.ChaosRequest{Params: map[string]float64{"count": float64(s.cfg.MaxVMs), "interactive": 1}}})
 		}
 	case "rolling-maintenance":
-		for i, r := range snap.Racks {
-			add(time.Duration(i)*heal, "remove-rack", r.ID)
-		}
+		s.maintenance = slices.Clone(snap.Racks)
+		s.maintenancePhase = 0
+		s.maintenanceVMs = nil
 	case "hostile-tenant":
 		for _, v := range snap.VMs[:min(3, len(snap.VMs))] {
 			if err = s.do(ctx, now, "compromise", api.ChaosRequest{Target: v.ID}); err != nil {
@@ -460,6 +479,62 @@ func (s *state) preset(ctx context.Context, now time.Time, name string) error {
 		s.status.Scenario = name
 	}
 	return err
+}
+
+func (s *state) maintenanceTick(ctx context.Context, now time.Time) {
+	if len(s.maintenance) == 0 {
+		return
+	}
+	rack := s.maintenance[0]
+	snap, err := s.backend.Snapshot(ctx)
+	if err != nil {
+		return
+	}
+	switch s.maintenancePhase {
+	case 0:
+		if err := s.do(ctx, now, "remove-rack", api.ChaosRequest{Target: rack.ID}); err != nil {
+			s.event("maintenance drain: "+err.Error(), rack.ID)
+			return
+		}
+		s.maintenanceVMs = nil
+		for _, v := range snap.VMs {
+			if v.Rack == rack.ID && (v.State == api.VMReady || v.State == api.VMBooting || v.State == api.VMUnhealthy) {
+				s.maintenanceVMs = append(s.maintenanceVMs, v.ID)
+			}
+		}
+		s.maintenancePhase = 1
+	case 1:
+		if slices.ContainsFunc(snap.Racks, func(r api.Rack) bool { return r.ID == rack.ID }) {
+			return
+		}
+		if err := s.backend.Topology(ctx, "add-rack", api.TopologyRequest{Rack: rack.ID, Hosts: len(rack.Hosts)}); err != nil {
+			s.event("maintenance restore: "+err.Error(), rack.ID)
+			return
+		}
+		s.maintenancePhase = 2
+	case 2:
+		n := 0
+		for _, h := range snap.Hosts {
+			if h.Rack == rack.ID && h.Lease == api.LeaseHealthy && h.AdminState == api.AdminActive {
+				n++
+			}
+		}
+		if n != len(rack.Hosts) {
+			return
+		}
+		for _, id := range s.maintenanceVMs {
+			if !slices.ContainsFunc(snap.VMs, func(v api.VM) bool { return v.ID == id && v.State == api.VMReady && v.Rack != rack.ID }) {
+				return
+			}
+		}
+		s.event("maintenance rack complete", rack.ID)
+		s.maintenance = s.maintenance[1:]
+		s.maintenancePhase = 0
+		if len(s.maintenance) == 0 {
+			s.status.Scenario = ""
+			s.event("rolling maintenance complete", "")
+		}
+	}
 }
 
 var _ api.ChaosEngine = (*Engine)(nil)

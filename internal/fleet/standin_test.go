@@ -2,6 +2,8 @@ package fleet
 
 import (
 	"context"
+	"time"
+
 	"github.com/hami-sh/vm/internal/api"
 	"github.com/hami-sh/vm/internal/clock"
 	"github.com/hami-sh/vm/internal/config"
@@ -53,4 +55,5 @@ func (standIn) Snapshot(context.Context) (api.Snapshot, error) {
 }
 func (standIn) SetDown(context.Context, bool) error                           { return nil }
 func (standIn) SetHostAdmin(context.Context, string, api.AdminState) error    { return nil }
+func (standIn) SetStoreDelay(context.Context, time.Duration) error            { return nil }
 func (standIn) EventsSince(context.Context, int64) ([]api.Event, bool, error) { return nil, false, nil }
