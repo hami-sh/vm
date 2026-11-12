@@ -41,6 +41,9 @@ type scheduled struct {
 	at     time.Time
 	action string
 	req    api.ChaosRequest
+	// Nonempty only for an ambient recovery. Keep the original fault target
+	// separate: a rack power-off is healed by restarting each of its hosts.
+	fault, target string
 }
 type Engine struct {
 	ctx     context.Context
@@ -354,8 +357,24 @@ func (s *state) tick(ctx context.Context, now time.Time) {
 	s.tasks = nil
 	for _, t := range tasks {
 		if !t.at.After(now) {
+			if t.fault == "remove-rack" {
+				snap, err := s.backend.Snapshot(ctx)
+				if err != nil || slices.ContainsFunc(snap.Racks, func(r api.Rack) bool { return r.ID == t.target }) {
+					// DrainGrace can exceed AmbientHealAfter. Never re-add a
+					// rack until both inventories have allowed its removal.
+					s.tasks = append(s.tasks, t)
+					continue
+				}
+			}
 			if err := s.do(ctx, now, t.action, t.req); err != nil {
 				s.event("failed "+t.action+": "+err.Error(), t.req.Target)
+				if t.fault != "" {
+					// Another ambient fault may temporarily prevent recovery,
+					// e.g. a scheduler outage during an uncordon. Retry it.
+					s.tasks = append(s.tasks, t)
+				}
+			} else if t.fault != "" {
+				s.event("ambient healed "+t.fault+" with "+t.action, t.req.Target)
 			}
 		} else {
 			s.tasks = append(s.tasks, t)
@@ -419,12 +438,66 @@ func (s *state) tick(ctx context.Context, now time.Time) {
 				}
 				target = snap.Racks[s.rng.Intn(len(snap.Racks))].ID
 			}
-			if err := s.do(ctx, now, a.Name, api.ChaosRequest{Target: target}); err != nil {
+			if err := s.ambient(ctx, now, a.Name, target, snap); err != nil {
 				s.event("ambient failed: "+err.Error(), target)
 			}
 		}
 	}
 }
+
+func (s *state) ambient(ctx context.Context, now time.Time, action, target string, snap api.Snapshot) error {
+	if slices.ContainsFunc(s.tasks, func(t scheduled) bool { return t.fault == action && t.target == target }) {
+		return nil // Do not stack or extend an outstanding ambient fault.
+	}
+	// These operations update scheduler admission. Do not partially cordon or
+	// drain agents while the scheduler is unavailable to commit that change.
+	if snap.Scheduler == api.SchedulerDown && (action == "cordon" || action == "remove-rack" || action == "slow-store") {
+		return nil
+	}
+	if err := s.do(ctx, now, action, api.ChaosRequest{Target: target}); err != nil {
+		return err
+	}
+	heal := func(a, destination string, params map[string]float64) {
+		at := now.Add(s.cfg.AmbientHealAfter)
+		s.tasks = append(s.tasks, scheduled{at: at, action: a, req: api.ChaosRequest{Target: destination, Params: params}, fault: action, target: target})
+		s.event("ambient heal scheduled "+action+" -> "+a+" at "+fmt.Sprint(at.UnixMilli()), destination)
+	}
+	switch action {
+	case "kill-scheduler":
+		heal("restart-scheduler", target, nil)
+	case "kill-host", "one-way-partition":
+		heal("restart-host", target, nil)
+	case "partition-rack":
+		heal("heal-rack", target, nil)
+	case "pause-heartbeats":
+		heal("resume-heartbeats", target, nil)
+	case "fill-disk", "reorder-messages":
+		heal(action, target, map[string]float64{"on": 0})
+	case "cordon":
+		heal("uncordon", target, nil)
+	case "slow-store", "latency-spike", "clock-skew":
+		heal(action, target, map[string]float64{"ms": 0})
+	case "packet-loss", "duplicate-messages":
+		heal(action, target, map[string]float64{"percent": 0})
+	case "slow-boot":
+		heal(action, target, map[string]float64{"factor": 1})
+	case "remove-rack", "burst-after-rack-loss":
+		for _, rack := range snap.Racks {
+			if rack.ID != target {
+				continue
+			}
+			if action == "remove-rack" {
+				heal("add-rack", target, map[string]float64{"hosts": float64(len(rack.Hosts))})
+			} else {
+				for _, host := range rack.Hosts {
+					heal("restart-host", host, nil)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func (s *state) preset(ctx context.Context, now time.Time, name string) error {
 	snap, err := s.backend.Snapshot(ctx)
 	if err != nil {

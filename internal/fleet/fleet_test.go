@@ -98,6 +98,28 @@ func TestSchedulerRestartAndResetDoNotDeadlock(t *testing.T) {
 	}
 }
 
+func TestDiskHealRestoresPublishedCapacity(t *testing.T) {
+	c := clock.NewScaled(time.Unix(0, 0), 1)
+	c.Pause()
+	f, err := New(t.Context(), Options{Clock: c, Racks: 1, HostsPerRack: 1, SchedulerFactory: newStandIn})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	for _, on := range []float64{1, 0} {
+		if _, err := f.Chaos.Do(t.Context(), "fill-disk", api.ChaosRequest{Target: "r1-h1", Params: map[string]float64{"on": on}}); err != nil {
+			t.Fatal(err)
+		}
+		s, err := f.runtime.Snapshot(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(s.Hosts) != 1 || slices.Contains(s.Hosts[0].Faults, "fill-disk") != (on == 1) {
+			t.Fatal("disk heal left capacity marked unavailable", s.Hosts)
+		}
+	}
+}
+
 type drainScheduler struct {
 	standIn
 	mu    sync.Mutex

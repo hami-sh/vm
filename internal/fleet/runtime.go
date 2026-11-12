@@ -473,7 +473,11 @@ func (r *runtime) apply(ctx context.Context, a string, q api.ChaosRequest) error
 		}
 		return h.agent.SetClockSkew(ctx, time.Duration(ms)*time.Millisecond)
 	case "fill-disk":
-		h.driver.FillDisk(param("on", 1) != 0)
+		on := param("on", 1) != 0
+		h.driver.FillDisk(on)
+		if !on {
+			h.faults = slices.DeleteFunc(h.faults, func(x string) bool { return x == "fill-disk" })
+		}
 	case "cordon", "uncordon":
 		h.admin = api.AdminCordoned
 		if a == "uncordon" {
