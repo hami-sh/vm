@@ -498,6 +498,7 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 					out = append(out, a.release(v, api.ReasonQuarantined)...)
 				} else {
 					out = append(out, a.unhealthy(v, api.ReasonGuestLease)...)
+					out = append(out, a.release(v, api.ReasonGuestLease)...)
 				}
 			}
 		}

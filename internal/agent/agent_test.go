@@ -531,7 +531,10 @@ func TestBlockedGuestLeaseExpiry(t *testing.T) {
 			}
 			h.until(func(s agent.Snapshot) bool { return s.Security.Blocked == 1 })
 			s := h.until(func(s agent.Snapshot) bool {
-				return len(s.Inventory) == 1 && (s.Inventory[0].State == api.VMFailed || s.Inventory[0].State == api.VMUnhealthy)
+				if recent {
+					return len(s.Inventory) == 1 && s.Inventory[0].State == api.VMFailed
+				}
+				return len(s.Actual) == 0 && len(s.Inventory) == 0
 			})
 			if recent {
 				if len(s.Actual) != 0 || s.Inventory[0].State != api.VMFailed {
@@ -567,8 +570,19 @@ func TestBlockedGuestLeaseExpiry(t *testing.T) {
 					t.Fatal("new generation started for silent attacker")
 				}
 			} else {
-				if s.Inventory[0].State != api.VMUnhealthy {
-					t.Fatalf("expired attack poisoned lease recovery: %+v", s)
+				unhealthy := false
+				for _, m := range h.messages {
+					switch r := m.(type) {
+					case api.UnhealthyReport:
+						unhealthy = unhealthy || r.Reason == api.ReasonGuestLease
+					case api.SecurityReport:
+						if r.Quarantined {
+							t.Fatalf("expired attack poisoned lease recovery: %+v", r)
+						}
+					}
+				}
+				if !unhealthy {
+					t.Fatal("ordinary lease expiry lost its Unhealthy report")
 				}
 				h.send(start("a", 2))
 				h.until(func(s agent.Snapshot) bool { return ready(s, "a", 2) })
@@ -581,7 +595,7 @@ func TestRecycleRecoversLostGuestRegistration(t *testing.T) {
 	h := newHarness(t)
 	h.boot("a", 1)
 	h.d.KillGuest("a")
-	h.until(func(s agent.Snapshot) bool { return s.Inventory[0].State == api.VMUnhealthy })
+	h.until(func(s agent.Snapshot) bool { return len(s.Actual) == 0 && len(s.Inventory) == 0 })
 	placed := h.c.Now()
 	h.send(start("a", 2))
 	h.until(func(s agent.Snapshot) bool {
@@ -622,18 +636,8 @@ func TestQuarantineRefusesLeaseRecycle(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			var delayed api.UnhealthyReport
-			h.until(func(agent.Snapshot) bool {
-				for _, m := range h.messages {
-					if r, ok := m.(api.UnhealthyReport); ok && r.VMID == "a" && r.Generation == 1 && r.Reason == api.ReasonGuestLease {
-						delayed = r
-						return true
-					}
-				}
-				return false
-			})
-			// The stub scheduler delays acting on that lease report, and
-			// loses both quarantine reports before it asks for gen 2.
+			// Lose both quarantine reports. The stub scheduler still asks
+			// for a recycle based on its stale view of this logical VM.
 			h.n.PartitionOneWay(h.host, h.scheduler.Addr(), true)
 			for range h.cfg.QuarantineAttempts {
 				h.guest("a", api.GuestRegister{VMID: "a", Generation: 1, Token: "bad"})
@@ -646,7 +650,7 @@ func TestQuarantineRefusesLeaseRecycle(t *testing.T) {
 				})
 			}
 			h.n.PartitionOneWay(h.host, h.scheduler.Addr(), false)
-			recycle := start(delayed.VMID, delayed.Generation+1)
+			recycle := start("a", 2)
 			// Quarantine dominates older, duplicate and newer starts alike.
 			for _, gen := range []int64{recycle.Generation, 0, 1} {
 				recycle.Generation = gen
@@ -874,10 +878,16 @@ func TestFloodDoesNotStarveNeighbours(t *testing.T) {
 	// Both oversized traffic and rate-limit violations must be blocked through
 	// the real VM endpoint, while the neighbour keeps renewing its lease.
 	h.guest("attacker", strings.Repeat("x", h.cfg.GuestMsgMaxBytes+1))
-	for range h.cfg.GuestMsgPerSec + h.cfg.QuarantineAttempts {
-		_ = h.d.GuestSend("attacker", h.host, api.PortVsock, api.GuestHeartbeat{VMID: "attacker", Generation: 1})
-	}
+	h.until(func(s agent.Snapshot) bool { return s.Security.ByAttack[api.AttackFlood] == 1 })
 	h.until(func(s agent.Snapshot) bool {
+		// A finite burst may straddle the limiter's one-second window under
+		// contention. Sustain the flood until quarantine is observed instead
+		// of assuming all messages were processed in the same window.
+		if s.Security.ByAttack[api.AttackFlood] < h.cfg.QuarantineAttempts {
+			for range h.cfg.GuestMsgPerSec + h.cfg.QuarantineAttempts {
+				_ = h.d.GuestSend("attacker", h.host, api.PortVsock, api.GuestHeartbeat{VMID: "attacker", Generation: 1})
+			}
+		}
 		return len(s.Actual) == 1 && ready(s, "neighbour", 1) && s.Security.ByAttack[api.AttackFlood] >= h.cfg.QuarantineAttempts
 	})
 	for range 40 {
@@ -928,6 +938,107 @@ func TestDiskFillContained(t *testing.T) {
 	h.d.FillDisk(false)
 	h.boot("c", 1)
 }
+func TestGuestLeaseStopsWithoutSchedulerDelivery(t *testing.T) {
+	for _, loseReports := range []bool{false, true} {
+		t.Run(fmt.Sprintf("lose-reports=%v", loseReports), func(t *testing.T) {
+			h := newHarness(t)
+			h.boot("a", 1)
+			if err := h.d.Compromise("a", func(ctx context.Context, _ api.Endpoint) { <-ctx.Done() }); err != nil {
+				t.Fatal(err)
+			}
+			h.n.PartitionOneWay(h.scheduler.Addr(), h.host, true)
+			h.n.PartitionOneWay(h.host, h.scheduler.Addr(), loseReports)
+			expiry := h.c.Now().Add(h.cfg.GuestLeaseTTL)
+			deadline := expiry.Add(h.cfg.GuestHeartbeat)
+			for h.c.Now().Before(deadline) {
+				if !h.c.Now().Before(expiry) {
+					// Neither the recycle command nor stale acknowledgments
+					// can be responsible for stopping gen 1.
+					h.send(start("a", 2))
+					h.send(api.HeartbeatAck{HostID: "h1", Epoch: 1, Stale: []api.InventoryItem{{VMID: "a", Generation: 1}}})
+				}
+				h.step(100 * time.Millisecond)
+			}
+			s := h.snapshot()
+			if len(s.Actual) != 0 || len(s.Inventory) != 0 {
+				t.Fatalf("expired guest still occupies driver/inventory without scheduler delivery: %+v", s)
+			}
+			unhealthy, stopped := false, false
+			for _, m := range h.messages {
+				switch r := m.(type) {
+				case api.UnhealthyReport:
+					unhealthy = unhealthy || r.VMID == "a" && r.Generation == 1 && r.Reason == api.ReasonGuestLease
+				case api.StoppedReport:
+					stopped = stopped || r.VMID == "a" && r.Generation == 1 && r.Reason == api.ReasonGuestLease
+				}
+			}
+			if unhealthy != !loseReports || stopped != !loseReports {
+				t.Fatalf("unexpected lease reports: unhealthy=%v stopped=%v lost=%v", unhealthy, stopped, loseReports)
+			}
+			// Even when both reports were lost, a healed inventory shows
+			// the missing copy, so the stub scheduler can recover it.
+			h.n.PartitionOneWay(h.host, h.scheduler.Addr(), false)
+			before := len(h.messages)
+			h.until(func(agent.Snapshot) bool {
+				for _, m := range h.messages[before:] {
+					if hb, ok := m.(api.HostHeartbeat); ok && len(hb.Inventory) == 0 {
+						return true
+					}
+				}
+				return false
+			})
+			h.n.PartitionOneWay(h.scheduler.Addr(), h.host, false)
+			h.send(start("a", 2))
+			h.until(func(s agent.Snapshot) bool { return ready(s, "a", 2) })
+		})
+	}
+}
+
+func TestGuestLeaseReleaseRetainsCapacityAndPendingStart(t *testing.T) {
+	h := newHarness(t)
+	h.boot("a", 1)
+	h.boot("b", 1)
+	releaseGuest := make(chan struct{})
+	t.Cleanup(func() { close(releaseGuest) })
+	if err := h.d.Compromise("a", func(ctx context.Context, _ api.Endpoint) {
+		<-ctx.Done()
+		<-releaseGuest
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s := h.until(func(agent.Snapshot) bool {
+		for _, m := range h.messages {
+			if r, ok := m.(api.UnhealthyReport); ok && r.VMID == "a" && r.Reason == api.ReasonGuestLease {
+				return true
+			}
+		}
+		return false
+	})
+	if s.Host.Slots[0].VMID != "a" || s.Host.Slots[0].State != api.SlotReleasing {
+		t.Fatalf("expired guest was not releasing locally: %+v", s)
+	}
+	h.send(start("a", 2))
+	h.send(start("c", 1))
+	h.until(func(agent.Snapshot) bool {
+		for _, m := range h.messages {
+			if r, ok := m.(api.StartVMResult); ok && r.VMID == "c" {
+				if r.Admitted || r.Reason != "full" {
+					t.Fatalf("slot reused before driver cleanup: %+v", r)
+				}
+				return true
+			}
+		}
+		return false
+	})
+	for _, v := range h.snapshot().Actual {
+		if v.VMID == "a" && v.Generation != 1 {
+			t.Fatalf("pending start booted before cleanup: %+v", v)
+		}
+	}
+	releaseGuest <- struct{}{}
+	h.until(func(s agent.Snapshot) bool { return ready(s, "a", 2) && ready(s, "b", 1) })
+}
+
 func TestGuestLeaseAndControlPlaneOutage(t *testing.T) {
 	h := newHarness(t)
 	h.boot("a", 1)
@@ -939,14 +1050,7 @@ func TestGuestLeaseAndControlPlaneOutage(t *testing.T) {
 		}
 	}
 	h.d.KillGuest("a")
-	h.until(func(s agent.Snapshot) bool {
-		for _, v := range s.Inventory {
-			if v.State == api.VMUnhealthy {
-				return true
-			}
-		}
-		return false
-	})
+	h.until(func(s agent.Snapshot) bool { return len(s.Actual) == 0 && len(s.Inventory) == 0 })
 	h.n.PartitionRack("r1", false)
 	h.send(start("a", 2))
 	h.until(func(s agent.Snapshot) bool { return ready(s, "a", 2) })
