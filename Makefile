@@ -1,4 +1,6 @@
-.PHONY: build vet test fixture run verify
+.PHONY: build vet test fixture run verify e2e
+
+VERIFY_PARALLEL ?= 4
 
 build:
 	go build ./...
@@ -16,6 +18,10 @@ fixture:
 run:
 	go run ./cmd/controlplane
 
-# The one command. W5 extends it with `vmctl verify --repeat 20` and the
-# end-to-end test once they exist; until then it is vet + race tests.
+# Real actors and SQLite run in-process under the race detector.
 verify: vet test
+	go run -race ./cmd/vmctl verify --repeat 20 --parallel $(VERIFY_PARALLEL)
+
+# Separate integration gate; fails until the HTTP server is wired to web.
+e2e:
+	go run ./cmd/vmctl e2e
