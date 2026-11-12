@@ -44,6 +44,7 @@ type reservation struct {
 	host       string
 	gen, until int64
 	admitted   bool
+	command    api.StartVM
 }
 type state struct {
 	data         store.Data

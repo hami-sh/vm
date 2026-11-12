@@ -66,8 +66,19 @@ func (p *planner) receive(from api.Addr, msg any) {
 		h.disk = m.DiskFull
 		p.hosts[id] = h
 		p.reconcile(id, m.Inventory, rejoin)
+		// Missing/older inventory cannot acknowledge a command that was
+		// dropped. Retry its exact incarnation until admission is observed.
+		for _, res := range p.reservations {
+			if res.host == id && !res.admitted {
+				p.send(id, res.command)
+			}
+		}
 	case api.StartVMResult:
 		if m.HostID != id || !p.current(id, m.VMID, m.Generation) {
+			return
+		}
+		if !m.Admitted && m.Reason == api.ReasonQuarantined {
+			p.quarantine(m.VMID)
 			return
 		}
 		r := p.reservations[m.VMID]
@@ -134,31 +145,58 @@ func (p *planner) receive(from api.Addr, msg any) {
 			return
 		}
 		p.removeCopy(id, m.VMID, m.Generation)
+		if m.Reason == api.ReasonQuarantined {
+			p.quarantine(m.VMID)
+			if p.current(id, m.VMID, m.Generation) && p.data.VMs[m.VMID].VM.State == api.VMTerminating {
+				p.move(m.VMID, api.VMTerminated, api.ReasonDeleted)
+			}
+			return
+		}
 		if !p.current(id, m.VMID, m.Generation) {
 			return
 		}
 		v := p.data.VMs[m.VMID].VM
-		if m.Reason == api.ReasonQuarantined && (v.State == api.VMReady || v.State == api.VMUnhealthy || v.State == api.VMBooting) {
-			p.move(v.ID, api.VMFailed, api.ReasonQuarantined)
-			delete(p.reservations, v.ID)
-		} else if v.State == api.VMTerminating {
+		if v.State == api.VMTerminating {
 			p.move(v.ID, api.VMTerminated, api.ReasonDeleted)
 		} else if v.State == api.VMBooting {
 			p.retry(v.ID, "stopped during boot")
 			p.removeCopy(id, m.VMID, m.Generation)
 		}
 	case api.SecurityReport:
-		if m.HostID != id || !p.current(id, m.VMID, m.Generation) {
+		if m.HostID != id {
+			return
+		}
+		if m.Quarantined {
+			p.quarantine(m.VMID)
+		}
+		if !p.current(id, m.VMID, m.Generation) {
 			return
 		}
 		p.metrics.blocked[m.Attack]++
 		p.log(api.EventSecurity, m.VMID, id, m.Attack)
-		v := p.data.VMs[m.VMID].VM
-		if m.Quarantined && (v.State == api.VMReady || v.State == api.VMBooting || v.State == api.VMUnhealthy) {
-			p.move(v.ID, api.VMFailed, api.ReasonQuarantined)
-			delete(p.reservations, v.ID)
-			p.stop(id, v.ID, v.Generation, api.ReasonQuarantined)
-		}
+	}
+}
+
+// Quarantine belongs to the logical identity, not the reporting incarnation.
+// Evidence from an old host must also fence a replacement on another host.
+func (p *planner) quarantine(id string) {
+	r, ok := p.data.VMs[id]
+	if !ok || vm.Terminal(r.VM.State) {
+		return
+	}
+	v := r.VM
+	if v.State == api.VMLost {
+		p.move(id, api.VMPending, api.ReasonQuarantined)
+	}
+	// Preserve an in-progress delete until the current copy is clean. It is
+	// already desired-deleted and can never be placed again.
+	if v.State != api.VMTerminating {
+		p.move(id, api.VMFailed, api.ReasonQuarantined)
+	}
+	delete(p.data.Queue, id)
+	delete(p.reservations, id)
+	if v.HostID != "" {
+		p.stop(v.HostID, id, v.Generation, api.ReasonQuarantined)
 	}
 }
 
@@ -323,22 +361,19 @@ func (p *planner) reconcile(hostID string, inventory []api.InventoryItem, strict
 			// generation. Commit its outcome before acknowledging the exact copy.
 			stale = append(stale, i)
 			p.removeCopy(hostID, i.VMID, i.Generation)
-			if !wrongHost && p.current(hostID, i.VMID, i.Generation) {
+			p.quarantine(i.VMID)
+			if p.current(hostID, i.VMID, i.Generation) {
 				seen[v.ID] = true
-				switch v.State {
-				case api.VMReady, api.VMUnhealthy, api.VMBooting:
-					p.move(v.ID, api.VMFailed, api.ReasonQuarantined)
-				case api.VMTerminating:
+				if p.data.VMs[v.ID].VM.State == api.VMTerminating {
 					p.move(v.ID, api.VMTerminated, api.ReasonDeleted)
 				}
-				delete(p.reservations, v.ID)
 			}
 			continue
 		}
 		if i.Generation != v.Generation || wrongHost || v.Desired == api.DesiredDeleted || vm.Terminal(v.State) || v.State == api.VMPending || v.State == api.VMLost || v.State == api.VMTerminating {
 			stale = append(stale, i)
 			p.stop(hostID, v.ID, i.Generation, api.ReasonStale)
-			p.log(api.EventFencing, v.ID, hostID, api.ReasonStale)
+			p.event(api.Event{At: p.now.UnixMilli(), Kind: api.EventFencing, VMID: v.ID, HostID: hostID, Generation: i.Generation, Detail: api.ReasonStale})
 			continue
 		}
 		if v.HostID != hostID {
