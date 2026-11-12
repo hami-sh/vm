@@ -124,6 +124,12 @@
 .menu-item.suggested > button { color: var(--ok); }
 .menu-item.suggested > button::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--ok); }
 .menu-item.suggested > button:hover { color: #06101f; }
+.menu-item.danger > button:first-child { color: #ffb3bb; }
+.menu-item.danger > button:first-child:hover { background: var(--bad); color: #1a0508; }
+.menu-item > button.menu-off {
+  flex: none; height: 22px; padding: 0 7px; font-size: 11px; color: var(--dim);
+  border: 1px solid var(--line-2); border-radius: 4px;
+}
 .menu-param { display: inline-flex; align-items: center; gap: 4px; color: var(--dim); font-size: 11px; }
 .menu-param input { width: 48px; height: 22px; padding: 0 4px; font: 11.5px var(--mono); text-align: right; color: var(--text); background: var(--bg); border: 1px solid var(--line-2); border-radius: 4px; }
 .menu-note { padding: 6px 12px 8px; color: var(--faint); font-size: 11.5px; }
