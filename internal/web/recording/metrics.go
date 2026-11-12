@@ -12,9 +12,10 @@ import (
 	"github.com/hami-sh/vm/internal/api"
 )
 
-// recordedMetrics derives latency only from this recording, including old
-// reports whose Ready value came from the scheduler's lifetime histogram.
-func recordedMetrics(dir string, report *api.RunReport) error {
+// DeriveMetrics derives latency only from flushed recording files, including
+// old reports whose Ready value came from the scheduler's lifetime histogram.
+// Callers can evaluate scenario metric expectations before publishing a report.
+func DeriveMetrics(dir string, report *api.RunReport) error {
 	created := map[string]int64{}
 	events := map[int64]api.Event{}
 	excluded := map[int64]bool{}

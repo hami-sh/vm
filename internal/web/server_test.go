@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -65,6 +66,8 @@ func newHarness(t *testing.T, mut func(*Options)) *harness {
 	clk := clock.NewFake(time.Unix(1_800_000_000, 0))
 	o := Options{ControlPlane: f, Chaos: f, Snapshots: f, Config: config.Default(), Clock: clk,
 		RunsDir: t.TempDir(), Logf: t.Logf}
+	// Route contract tests opt out; limiter tests explicitly enable it.
+	o.Config.ChaosPerIP = 0
 	if mut != nil {
 		mut(&o)
 	}
@@ -119,14 +122,22 @@ func (p presetSnapshots) Subscribe() (<-chan api.Snapshot, <-chan api.Event, fun
 // Exercise the HTTP contract: starting a preset records real snapshot data,
 // ignores old violations, preserves new violations and lists the finished run.
 func TestDashboardPresetRecording(t *testing.T) {
-	for _, mode := range []string{"pass", "violation", "reset"} {
+	for _, mode := range []string{"pass", "violation", "reset", "security", "not-ready", "no-generation", "stale", "no-recovery", "slow-recovery", "hostile-empty", "hostile-blocked", "speed-changed", "seed-changed"} {
 		t.Run(mode, func(t *testing.T) {
+			action := "split-brain"
+			if strings.HasPrefix(mode, "hostile-") {
+				action = "hostile-tenant"
+			}
 			initial := api.Snapshot{At: 1000, Sim: api.SimStatus{Seed: 42, Speed: 2},
-				Invariants: []api.InvariantStatus{{Name: api.InvSlotCapacity, Violations: 3}},
-				Recent:     []api.Event{{Seq: 6, At: 1000, Kind: api.EventInvariant, Detail: "old violation"}}}
+				Recent: []api.Event{{Seq: 6, At: 1000, Kind: api.EventInvariant, Detail: "old violation"}}}
+			for _, name := range api.AllInvariants {
+				initial.Invariants = append(initial.Invariants, api.InvariantStatus{Name: name})
+			}
+			initial.Invariants[0].Violations = 3
 			// Default split-brain horizon: 30s heal + 15s boot + 6s lease.
-			final := api.Snapshot{At: 52000, Sim: initial.Sim,
-				Invariants: []api.InvariantStatus{{Name: api.InvSlotCapacity, Violations: 3}},
+			final := api.Snapshot{At: 52000, Sim: api.SimStatus{Seed: 99, Speed: 5},
+				Invariants: slices.Clone(initial.Invariants),
+				VMs:        []api.VM{{ID: "slow", State: api.VMReady, Desired: api.DesiredRunning, Generation: 2}},
 				Recent:     append(append([]api.Event{}, initial.Recent...), api.Event{Seq: 7, At: 1100, Kind: api.EventChaos, Detail: "partition-rack"})}
 			final.Recent = append(final.Recent,
 				api.Event{Seq: 20, At: 2000, Kind: api.EventTransition, VMID: "slow", To: api.VMLost},
@@ -136,6 +147,23 @@ func TestDashboardPresetRecording(t *testing.T) {
 				api.Event{Seq: 24, At: 9000, Kind: api.EventTransition, VMID: "slow", To: api.VMReady},
 				api.Event{Seq: 25, At: 10000, Kind: api.EventTransition, VMID: "slow", To: api.VMLost},
 				api.Event{Seq: 26, At: 12000, Kind: api.EventTransition, VMID: "slow", To: api.VMReady})
+			switch mode {
+			case "security":
+				final.Security.Succeeded = 1
+			case "hostile-blocked":
+				final.Security.Blocked = 5
+			case "not-ready":
+				final.VMs[0].State = api.VMBooting
+			case "no-generation":
+				final.VMs[0].Generation = 1
+			case "stale":
+				final.Hosts = []api.Host{{Stale: []api.InventoryItem{{VMID: "slow", Generation: 1}}}}
+			case "no-recovery":
+				final.Recent = final.Recent[:2]
+			case "slow-recovery":
+				final.Recent = final.Recent[:7]
+				final.Recent[6].At = 22000 // first Lost at 2000: p99 exactly 20000ms fails the strict scenario limit
+			}
 			if mode == "violation" {
 				final.Invariants[0].Violations = 4
 				final.Invariants[0].LastDetail = "capacity exceeded"
@@ -145,8 +173,29 @@ func TestDashboardPresetRecording(t *testing.T) {
 			if mode != "reset" {
 				src.frames = []api.Snapshot{final}
 			}
+			if mode == "speed-changed" || mode == "seed-changed" {
+				drift := initial
+				drift.At, drift.Seq, drift.Sim = 12000, 2, final.Sim
+				if mode == "speed-changed" {
+					drift.At = initial.At // speed can change while the simulation is paused
+					drift.Sim.Speed = 10
+				} else {
+					drift.Sim.Seed = 100
+				}
+				// Returning to the original conditions cannot erase the failure.
+				src.frames = []api.Snapshot{drift, final}
+			}
 			h := newHarness(t, func(o *Options) { o.Snapshots = src; o.Config.ChaosPerIP = 0 })
-			wantStatus(t, h.do("POST", "/v1/chaos/split-brain", `{}`), 200)
+			// The engine has changed but the published snapshot is still old.
+			_, err := h.fleet.Sim(context.Background(), "chaos", api.SimRequest{Seed: 99})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = h.fleet.Sim(context.Background(), "speed", api.SimRequest{Speed: 5})
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantStatus(t, h.do("POST", "/v1/chaos/"+action, `{}`), 200)
 			if mode == "reset" {
 				wantStatus(t, h.do("POST", "/v1/chaos/gray-failure", `{}`), 409)
 				wantStatus(t, h.do("POST", "/v1/chaos/reset", `{}`), 200)
@@ -163,16 +212,33 @@ func TestDashboardPresetRecording(t *testing.T) {
 				t.Fatalf("runs: %+v", list)
 			}
 			r := decodeBody[api.RunReport](t, h.do("GET", "/v1/runs/"+list[0].ID, ""))
-			if r.Scenario != "split-brain" || r.Seed != 42 || r.Passed != (mode == "pass") {
+			if r.Scenario != action || r.Seed != 99 || r.Speed != 5 || r.Passed != (mode == "pass" || mode == "hostile-blocked") {
 				t.Fatalf("report: %+v", r)
 			}
-			if mode == "violation" && (r.Violations != 1 || len(r.Markers) != 2 || r.Checks[3].Passed) {
+			if mode == "violation" && (r.Violations != 1 || len(r.Markers) != 2) {
 				t.Fatalf("new violation missing: %+v", r)
+			}
+			condition := slices.IndexFunc(r.Checks, func(c api.CheckResult) bool { return c.Name == "conditions unchanged" })
+			if condition < 0 {
+				t.Fatal("missing conditions unchanged check")
+			}
+			changed := mode == "speed-changed" || mode == "seed-changed"
+			if r.Checks[condition].Passed == changed {
+				t.Fatalf("conditions check: %+v", r.Checks[condition])
+			}
+			if changed {
+				want := "speed changed 5×→10× at 00:00:01"
+				if mode == "seed-changed" {
+					want = "seed changed 99→100 at 00:00:12"
+				}
+				if r.Checks[condition].Detail != want || r.Checks[condition].FirstBadSeq != 2 || r.Violations != 0 || list[0].Passed {
+					t.Fatalf("conditions failure must be distinct from a safety violation: %+v", r)
+				}
 			}
 			if mode != "reset" && (r.DurationMs != 51000 || r.Checks[0].Passed != true) {
 				t.Fatalf("horizon: %+v", r)
 			}
-			if mode != "reset" && (r.P99RecoverMs != 7000 || r.Metrics["recovery_samples"] != 3) {
+			if mode != "reset" && mode != "no-recovery" && mode != "slow-recovery" && (r.P99RecoverMs != 7000 || r.Metrics["recovery_samples"] != 3) {
 				t.Fatalf("per-run recovery durations should be 2500, 7000, 2000ms: %+v", r)
 			}
 			frames := h.do("GET", "/v1/runs/"+r.ID+"/snapshots", "")
@@ -337,10 +403,9 @@ func TestChaosCatalogAndAction(t *testing.T) {
 	wantStatus(t, h.do("POST", "/v1/chaos/kill-host", `{"target":"r9-h9"}`), http.StatusNotFound)
 }
 
-// One chaos action per ChaosPerIP of wall time for each client, and only for
-// POST /v1/chaos/*.
+// One mutation per ChaosPerIP of wall time, shared across route families.
 func TestChaosRateLimitPerIP(t *testing.T) {
-	h := newHarness(t, nil)
+	h := newHarness(t, func(o *Options) { o.Config.ChaosPerIP = config.Default().ChaosPerIP })
 	every := config.Default().ChaosPerIP
 	chaos := func(headers ...string) *httptest.ResponseRecorder {
 		return h.do("POST", "/v1/chaos/cordon", `{"target":"r1-h1"}`, headers...)
@@ -364,16 +429,13 @@ func TestChaosRateLimitPerIP(t *testing.T) {
 	wantStatus(t, chaos("X-Forwarded-For", "203.0.113.8, 10.0.0.1"), http.StatusOK)
 	wantStatus(t, chaos("X-Forwarded-For", "203.0.113.7, 10.0.0.2"), http.StatusTooManyRequests)
 
-	// The limit is for chaos only: the same client can read the catalogue,
-	// change the topology, drive the sim and use the VM API at once.
+	// Reads remain available, but a different mutation shares the budget.
 	h.clk.Advance(every)
 	wantStatus(t, chaos(), http.StatusOK)
 	wantStatus(t, h.do("GET", "/v1/chaos/actions", ""), http.StatusOK)
-	wantStatus(t, h.do("POST", "/v1/topology/add-host", `{"rack":"r1"}`), http.StatusOK)
-	wantStatus(t, h.do("POST", "/v1/topology/add-host", `{"rack":"r1"}`), http.StatusOK)
-	wantStatus(t, h.do("POST", "/v1/sim/pause", ``), http.StatusOK)
-	wantStatus(t, h.do("POST", "/v1/sim/play", ``), http.StatusOK)
-	wantStatus(t, h.do("DELETE", "/v1/vms/vm-0002", ""), http.StatusAccepted)
+	wantStatus(t, h.do("POST", "/v1/topology/add-host", `{"rack":"r1"}`), http.StatusTooManyRequests)
+	wantStatus(t, h.do("POST", "/v1/sim/pause", ``), http.StatusTooManyRequests)
+	wantStatus(t, h.do("DELETE", "/v1/vms/vm-0002", ""), http.StatusTooManyRequests)
 }
 
 func TestSimAndTopology(t *testing.T) {
@@ -411,6 +473,58 @@ func TestSimAndTopology(t *testing.T) {
 		t.Errorf("after add-rack: %d racks, %d hosts", len(snap.Racks), len(snap.Hosts))
 	}
 	wantStatus(t, h.do("POST", "/v1/topology/add-host", `{"rack":"r7"}`), http.StatusNotFound)
+}
+
+func TestMutationRoutesShareRateLimit(t *testing.T) {
+	for _, tc := range []struct{ method, path, body string }{
+		{"POST", "/v1/vms", `{"pool":"ios-xcode16-m"}`},
+		{"DELETE", "/v1/vms/vm-0001", ``},
+		{"POST", "/v1/queue/vm-0015/priority", `{"priority":"batch"}`},
+		{"POST", "/v1/sim/pause", ``},
+		{"POST", "/v1/topology/add-host", `{"rack":"r1"}`},
+		{"POST", "/v1/chaos/reset", ``},
+		{"POST", "/v1/chaos/wipe-store", ``},
+	} {
+		t.Run(tc.method+tc.path, func(t *testing.T) {
+			h := newHarness(t, func(o *Options) { o.Config.ChaosPerIP = config.Default().ChaosPerIP })
+			// Both ends of each route share the chaos budget. Reset and wipe
+			// remain public (no authentication), but cannot bypass the limit.
+			wantStatus(t, h.do("POST", "/v1/chaos/cordon", `{"target":"r1-h1"}`), 200)
+			wantStatus(t, h.do(tc.method, tc.path, tc.body, "Idempotency-Key", "request"), 429)
+			h.clk.Advance(config.Default().ChaosPerIP)
+			rec := h.do(tc.method, tc.path, tc.body, "Idempotency-Key", "request")
+			if rec.Code < 200 || rec.Code >= 300 {
+				t.Fatalf("mutation not available after limit: %d %s", rec.Code, rec.Body.String())
+			}
+			wantStatus(t, h.do("POST", "/v1/chaos/cordon", `{"target":"r1-h1"}`), 429)
+			wantStatus(t, h.do("GET", "/v1/snapshot", ``), 200)
+		})
+	}
+}
+
+func TestUnknownChaosDoesNotConsumeRateLimit(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.Config.ChaosPerIP = config.Default().ChaosPerIP })
+	wantStatus(t, h.do("POST", "/v1/chaos/typo", `{}`), 422)
+	wantStatus(t, h.do("POST", "/v1/chaos/cordon", `{"target":"r1-h1"}`), 200)
+	// Validation also wins over an already exhausted rate budget.
+	wantStatus(t, h.do("POST", "/v1/chaos/typo", `{}`), 422)
+	wantStatus(t, h.do("POST", "/v1/chaos/cordon", `{"target":"r1-h1"}`), 429)
+}
+
+func TestPublicSimStepBound(t *testing.T) {
+	h := newHarness(t, nil)
+	wantStatus(t, h.do("POST", "/v1/sim/pause", ``), 200)
+	before := decodeBody[api.Snapshot](t, h.do("GET", "/v1/snapshot", ``)).At
+	for _, body := range []string{`{"step_ms":-1}`, `{"step_ms":0}`, `{"step_ms":60001}`, `{"step_ms":9223372036854775807}`} {
+		wantStatus(t, h.do("POST", "/v1/sim/step", body), 422)
+	}
+	if after := decodeBody[api.Snapshot](t, h.do("GET", "/v1/snapshot", ``)).At; after != before {
+		t.Fatal("rejected step advanced simulation")
+	}
+	wantStatus(t, h.do("POST", "/v1/sim/step", `{"step_ms":60000}`), 200)
+	if after := decodeBody[api.Snapshot](t, h.do("GET", "/v1/snapshot", ``)).At; after-before != 60000 {
+		t.Fatalf("accepted step advanced %dms", after-before)
+	}
 }
 
 func TestUnwiredBackendsAre503(t *testing.T) {

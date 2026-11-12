@@ -18,10 +18,15 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 
+	"github.com/hami-sh/vm/internal/api"
+	"github.com/hami-sh/vm/internal/clock"
 	"github.com/hami-sh/vm/internal/config"
 	"github.com/hami-sh/vm/internal/fleet"
+	"github.com/hami-sh/vm/internal/scheduler"
+	"github.com/hami-sh/vm/internal/store"
 	"github.com/hami-sh/vm/internal/web"
 )
 
@@ -55,6 +60,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Fleet can replace its scheduler on restart or wipe. Publish the current
+	// actor, rather than retaining the first scheduler's metrics endpoint.
+	var metrics atomic.Pointer[scheduler.Scheduler]
 	f, err := fleet.New(ctx, fleet.Options{
 		Config:       cfg,
 		Racks:        *racks,
@@ -62,6 +70,23 @@ func main() {
 		Seed:         *seed,
 		Speed:        *speed,
 		StorePath:    *storePath,
+		SchedulerFactory: func(ctx context.Context, cfg config.Config, c clock.Clock, transport api.Transport, path string) (fleet.Scheduler, func(), error) {
+			db, err := store.Open(path)
+			if err != nil {
+				return nil, nil, err
+			}
+			s, err := scheduler.New(ctx, cfg, c, transport, db)
+			if err != nil {
+				db.Close()
+				return nil, nil, err
+			}
+			metrics.Store(s)
+			return s, func() {
+				metrics.CompareAndSwap(s, nil)
+				<-s.Done()
+				db.Close()
+			}, nil
+		},
 	})
 	if err != nil {
 		log.Fatalf("fleet: %v", err)
@@ -72,6 +97,20 @@ func main() {
 		Snapshots:    f,
 		Config:       cfg,
 		RunsDir:      *runsDir,
+		Metrics: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			s := metrics.Load()
+			if s == nil {
+				http.Error(w, "scheduler unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			text, err := s.Metrics(r.Context())
+			if err != nil {
+				http.Error(w, "scheduler unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+			w.Write([]byte(text))
+		}),
 	})
 	server := &http.Server{Addr: *addr, Handler: dashboard}
 

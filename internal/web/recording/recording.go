@@ -178,7 +178,7 @@ func (w *Writer) Follow(ctx context.Context, src api.SnapshotSource) error {
 
 // WriteReport writes dir/report.json atomically.
 func WriteReport(dir string, r api.RunReport) error {
-	if err := recordedMetrics(dir, &r); err != nil {
+	if err := DeriveMetrics(dir, &r); err != nil {
 		return err
 	}
 	b, err := json.MarshalIndent(r, "", "  ")
@@ -237,7 +237,7 @@ func Report(root, id string) (api.RunReport, error) {
 		r.ID = id
 	}
 	// Recompute legacy reports too; no migration or mutation on a GET.
-	err = recordedMetrics(dir, &r)
+	err = DeriveMetrics(dir, &r)
 	return r, err
 }
 

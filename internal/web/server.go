@@ -34,7 +34,7 @@ type Options struct {
 	Chaos        api.ChaosEngine
 	Snapshots    api.SnapshotSource
 	Config       config.Config
-	// Clock is wall time for SSE pacing and the per-IP chaos limit. Default
+	// Clock is wall time for SSE pacing and the per-IP mutation limit. Default
 	// clock.Real{}. (Sim time comes from snapshots.)
 	Clock clock.Clock
 	// RunsDir holds runs/<id>/ recordings. Default "runs".
@@ -114,13 +114,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.Serve
 
 func (s *Server) routes() {
 	m := s.mux
-	m.HandleFunc("POST /v1/vms", s.createVM)
+	m.HandleFunc("POST /v1/vms", s.limited(s.createVM))
 	m.HandleFunc("GET /v1/vms", s.listVMs)
 	m.HandleFunc("GET /v1/vms/{id}", s.getVM)
-	m.HandleFunc("DELETE /v1/vms/{id}", s.deleteVM)
+	m.HandleFunc("DELETE /v1/vms/{id}", s.limited(s.deleteVM))
 	m.HandleFunc("GET /v1/hosts", s.listHosts)
 	m.HandleFunc("GET /v1/queue", s.queue)
-	m.HandleFunc("POST /v1/queue/{vm_id}/priority", s.setPriority)
+	m.HandleFunc("POST /v1/queue/{vm_id}/priority", s.limited(s.setPriority))
 	m.HandleFunc("GET /v1/events", s.events)
 	m.HandleFunc("GET /v1/snapshot", s.snapshot)
 	m.HandleFunc("GET /v1/source", func(w http.ResponseWriter, _ *http.Request) {
@@ -131,9 +131,9 @@ func (s *Server) routes() {
 		writeJSON(w, http.StatusOK, map[string]string{"label": label})
 	})
 	m.HandleFunc("GET /v1/chaos/actions", s.chaosActions)
-	m.HandleFunc("POST /v1/chaos/{action}", s.limited(s.chaosDo))
-	m.HandleFunc("POST /v1/sim/{action}", s.sim)
-	m.HandleFunc("POST /v1/topology/{action}", s.topology)
+	m.HandleFunc("POST /v1/chaos/{action}", s.chaosDo)
+	m.HandleFunc("POST /v1/sim/{action}", s.limited(s.sim))
+	m.HandleFunc("POST /v1/topology/{action}", s.limited(s.topology))
 	m.HandleFunc("GET /v1/runs", s.listRuns)
 	m.HandleFunc("GET /v1/runs/{id}", s.getRun)
 	m.HandleFunc("GET /v1/runs/{id}/snapshots", s.runSnapshots)
@@ -317,6 +317,8 @@ func (s *Server) setPriority(w http.ResponseWriter, r *http.Request) {
 
 // ------------------------------------------------------- chaos, sim, topology
 
+const maxPublicStepMs = 60_000
+
 func (s *Server) chaosActions(w http.ResponseWriter, _ *http.Request) {
 	if s.o.Chaos == nil {
 		writeError(w, s.unavailable("chaos engine"))
@@ -343,7 +345,16 @@ func (s *Server) chaosDo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	action := r.PathValue("action")
-	if slices.ContainsFunc(s.o.Chaos.Catalog().Presets, func(p api.ChaosAction) bool { return p.Name == action }) {
+	cat := s.o.Chaos.Catalog()
+	preset := slices.ContainsFunc(cat.Presets, func(p api.ChaosAction) bool { return p.Name == action })
+	if !preset && !slices.ContainsFunc(cat.Actions, func(a api.ChaosAction) bool { return a.Name == action }) {
+		writeError(w, &api.Error{Status: http.StatusUnprocessableEntity, Msg: "unknown chaos action"})
+		return
+	}
+	if !s.allowMutation(w, r) {
+		return
+	}
+	if preset {
 		res, err := s.startPreset(r.Context(), action, req)
 		if err != nil {
 			writeError(w, err)
@@ -378,6 +389,11 @@ func (s *Server) sim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	action := r.PathValue("action")
+	// Bound public clock work, including integer-overflow-sized requests.
+	if action == "step" && (req.StepMs <= 0 || req.StepMs > maxPublicStepMs) {
+		writeError(w, &api.Error{Status: http.StatusUnprocessableEntity, Msg: fmt.Sprintf("step_ms must be in [1, %d]", maxPublicStepMs)})
+		return
+	}
 	if action == "speed" && (req.Speed <= 0 || req.Speed > s.o.Config.MaxSpeed) {
 		writeError(w, badRequest(fmt.Sprintf("speed must be in (0, %g]", s.o.Config.MaxSpeed)))
 		return
@@ -416,19 +432,23 @@ func (s *Server) topology(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
-// limited applies the per-IP chaos rate limit (config.ChaosPerIP, on wall
-// time) to POST /v1/chaos/{action} only. Sim controls, topology changes and
-// the VM API are not chaos and are not limited.
+// limited shares one per-IP wall-time budget across all mutating routes.
 func (s *Server) limited(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if wait := s.limiter.allow(clientIP(r), s.o.Clock.Now()); wait > 0 {
-			secs := int((wait + time.Second - 1) / time.Second)
-			writeError(w, &api.Error{Status: http.StatusTooManyRequests,
-				Msg: fmt.Sprintf("chaos rate limit: one action per %s per client", s.o.Config.ChaosPerIP), RetryAfterS: secs})
-			return
+		if s.allowMutation(w, r) {
+			h(w, r)
 		}
-		h(w, r)
 	}
+}
+
+func (s *Server) allowMutation(w http.ResponseWriter, r *http.Request) bool {
+	if wait := s.limiter.allow(clientIP(r), s.o.Clock.Now()); wait > 0 {
+		secs := int((wait + time.Second - 1) / time.Second)
+		writeError(w, &api.Error{Status: http.StatusTooManyRequests,
+			Msg: fmt.Sprintf("mutation rate limit: one action per %s per client", s.o.Config.ChaosPerIP), RetryAfterS: secs})
+		return false
+	}
+	return true
 }
 
 // clientIP prefers the first X-Forwarded-For hop (Railway's proxy sets it).
