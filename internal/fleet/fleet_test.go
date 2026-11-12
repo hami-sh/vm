@@ -18,7 +18,7 @@ func TestRealHostAssemblyFaultsTopologyAndSnapshots(t *testing.T) {
 	defer cancel()
 	c := clock.NewScaled(time.Unix(0, 0), 1)
 	c.Pause()
-	f, err := New(ctx, Options{Racks: 2, HostsPerRack: 2, Seed: 73, Clock: c})
+	f, err := New(ctx, Options{Racks: 2, HostsPerRack: 2, Seed: 73, Clock: c, SchedulerFactory: newStandIn})
 	if err != nil {
 		t.Fatal(err)
 	}

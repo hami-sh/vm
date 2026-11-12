@@ -56,13 +56,8 @@ func (r *runtime) events(ctx context.Context, after int64) ([]api.Event, bool, e
 		if r.down {
 			return eventBatch{}, nil
 		}
-		if source, ok := r.scheduler.(interface {
-			EventsSince(context.Context, int64) ([]api.Event, bool, error)
-		}); ok {
-			events, truncated, err := source.EventsSince(ctx, after)
-			return eventBatch{events, truncated}, err
-		}
-		return eventBatch{truncated: true}, nil
+		events, truncated, err := r.scheduler.EventsSince(ctx, after)
+		return eventBatch{events, truncated}, err
 	})
 	if err != nil {
 		return nil, false, err
@@ -97,7 +92,7 @@ type runtime struct {
 func newRuntime(ctx context.Context, cfg config.Config, c clock.Clock, o Options, emit func(api.Event)) (*runtime, error) {
 	r := &runtime{ctx: ctx, cfg: cfg, clock: c, options: o, inbox: make(chan operation), done: make(chan struct{}), hosts: map[string]*host{}, compromised: map[string]bool{}, success: api.SecurityStatus{ByAttack: map[string]int{}}, emit: emit}
 	if r.options.SchedulerFactory == nil {
-		r.options.SchedulerFactory = newStandIn
+		r.options.SchedulerFactory = newScheduler
 	}
 	if err := r.start(); err != nil {
 		r.stop()
@@ -302,7 +297,9 @@ func (r *runtime) read(ctx context.Context) (observed, error) {
 			}
 		}
 		sh, ok := leases[id]
-		connected := ok && sh.Lease == api.LeaseHealthy
+		connected := ok && sh.Lease == api.LeaseHealthy &&
+			!slices.Contains(h.faults, "kill-host") && !slices.Contains(h.faults, "one-way-partition") &&
+			!slices.ContainsFunc(r.racks, func(rack api.Rack) bool { return rack.ID == h.addr.Rack && rack.Partitioned })
 		a.Host.AdminState = h.admin
 		a.Host.Lease = sh.Lease
 		a.Host.Faults = slices.Clone(h.faults)
@@ -493,18 +490,13 @@ func (r *runtime) apply(ctx context.Context, a string, q api.ChaosRequest) error
 		if v.State != api.VMReady {
 			return &api.Error{Status: 422, Msg: "compromise requires a Ready VM"}
 		}
-		if d, ok := any(h.driver).(interface {
-			Compromise(string, func(context.Context, api.Endpoint)) error
-		}); ok {
-			err = d.Compromise(q.Target, func(guestCtx context.Context, ep api.Endpoint) {
-				chaos.RunAttacker(guestCtx, r.clock, r.cfg, ep, v.Generation, func(mb int) error { return h.driver.WriteDisk(v.ID, mb) }, func(out chaos.AttackOutcome) { r.attackOutcome(guestCtx, h, out) })
-			})
-			if err == nil {
-				r.compromised[q.Target] = true
-			}
-			return err
+		err = h.driver.Compromise(q.Target, func(guestCtx context.Context, ep api.Endpoint) {
+			chaos.RunAttacker(guestCtx, r.clock, r.cfg, ep, v.Generation, func(mb int) error { return h.driver.WriteDisk(v.ID, mb) }, func(out chaos.AttackOutcome) { r.attackOutcome(guestCtx, h, out) })
+		})
+		if err == nil {
+			r.compromised[q.Target] = true
 		}
-		return &api.Error{Status: 501, Msg: "Compromise awaits W2 integration"}
+		return err
 	default:
 		return &api.Error{Status: 422, Msg: "unknown component fault"}
 	}

@@ -7,8 +7,8 @@ import (
 	"github.com/hami-sh/vm/internal/config"
 )
 
-// This is deliberately not a second scheduler. Until W1 lands, writes fail
-// explicitly and hosts can still be assembled, observed and fault-injected.
+// A deliberately minimal scheduler for tests isolating host wiring. Production
+// always defaults to the real SQLite-backed scheduler.
 type standIn struct{}
 
 func newStandIn(ctx context.Context, cfg config.Config, c clock.Clock, n api.Transport, path string) (Scheduler, func(), error) {

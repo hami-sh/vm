@@ -13,13 +13,16 @@ import (
 	"github.com/hami-sh/vm/internal/clock"
 	"github.com/hami-sh/vm/internal/config"
 	"github.com/hami-sh/vm/internal/invariant"
+	"github.com/hami-sh/vm/internal/scheduler"
+	"github.com/hami-sh/vm/internal/store"
 )
 
-// Scheduler is W1's approved assembly surface. The factory is the only
-// temporary adapter; the host side is wired directly to W2's real packages.
+// Scheduler is the assembly surface; a factory override supports isolated
+// fault tests. The default uses the real SQLite-backed scheduler.
 type Scheduler interface {
 	api.ControlPlane
 	Snapshot(context.Context) (api.Snapshot, error)
+	EventsSince(context.Context, int64) ([]api.Event, bool, error)
 	SetDown(context.Context, bool) error
 	SetHostAdmin(context.Context, string, api.AdminState) error
 }
@@ -54,6 +57,19 @@ type publicationQuery struct {
 type subscription struct {
 	snapshots chan api.Snapshot
 	events    chan api.Event
+}
+
+func newScheduler(ctx context.Context, cfg config.Config, c clock.Clock, transport api.Transport, path string) (Scheduler, func(), error) {
+	db, err := store.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	s, err := scheduler.New(ctx, cfg, c, transport, db)
+	if err != nil {
+		db.Close()
+		return nil, nil, err
+	}
+	return s, func() { <-s.Done(); db.Close() }, nil
 }
 
 func New(ctx context.Context, o Options) (*Fleet, error) {
