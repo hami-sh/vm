@@ -263,7 +263,11 @@ func (p *planner) reconcile(hostID string, inventory []api.InventoryItem, strict
 				continue
 			}
 			stale = append(stale, i)
-			p.stop(hostID, i.VMID, i.Generation, "unknown VM")
+			if i.State == api.VMFailed {
+				p.removeCopy(hostID, i.VMID, i.Generation)
+			} else {
+				p.stop(hostID, i.VMID, i.Generation, "unknown VM")
+			}
 			continue
 		}
 		v := r.VM
@@ -313,6 +317,23 @@ func (p *planner) reconcile(hostID string, inventory []api.InventoryItem, strict
 		}
 		if i.Generation == v.Generation && wrongHost {
 			p.log(api.EventAlert, v.ID, hostID, "equal-generation copies on two hosts; existing owner retained")
+		}
+		if i.State == api.VMFailed {
+			// A quarantine tombstone means the driver has already cleaned this
+			// generation. Commit its outcome before acknowledging the exact copy.
+			stale = append(stale, i)
+			p.removeCopy(hostID, i.VMID, i.Generation)
+			if !wrongHost && p.current(hostID, i.VMID, i.Generation) {
+				seen[v.ID] = true
+				switch v.State {
+				case api.VMReady, api.VMUnhealthy, api.VMBooting:
+					p.move(v.ID, api.VMFailed, api.ReasonQuarantined)
+				case api.VMTerminating:
+					p.move(v.ID, api.VMTerminated, api.ReasonDeleted)
+				}
+				delete(p.reservations, v.ID)
+			}
+			continue
 		}
 		if i.Generation != v.Generation || wrongHost || v.Desired == api.DesiredDeleted || vm.Terminal(v.State) || v.State == api.VMPending || v.State == api.VMLost || v.State == api.VMTerminating {
 			stale = append(stale, i)

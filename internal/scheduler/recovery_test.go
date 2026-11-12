@@ -33,6 +33,90 @@ func TestQuarantinedStopCannotBecomeReplacement(t *testing.T) {
 	}
 }
 
+func TestQuarantineTombstoneSurvivesLostReports(t *testing.T) {
+	for _, initial := range []api.VMState{api.VMReady, api.VMBooting, api.VMUnhealthy, api.VMTerminating} {
+		t.Run(string(initial), func(t *testing.T) {
+			h := newHarness(t)
+			h.register("a", "r1", 1)
+			h.register("b", "r2", 1)
+			v := h.create("K", "interactive")
+			if initial != api.VMBooting {
+				h.ready(v)
+			}
+			if initial == api.VMUnhealthy {
+				r := h.s.state.data.VMs[v.ID]
+				r.VM.State = initial
+				h.s.state.data.VMs[v.ID] = r
+			}
+			if initial == api.VMTerminating {
+				h.step(request{op: "delete", id: v.ID})
+			}
+			item := api.InventoryItem{VMID: v.ID, Generation: v.Generation, State: api.VMFailed}
+			// Neither SecurityReport nor StoppedReport is delivered. Also lose
+			// the first ack: the tombstone must be safe to repeat.
+			for seq := uint64(1); seq <= 2; seq++ {
+				e := h.agent(v.HostID, v.Rack, api.HostHeartbeat{HostID: v.HostID, Seq: seq, Inventory: []api.InventoryItem{item}})
+				acked := false
+				for _, d := range e.sends {
+					if ack, ok := d.msg.(api.HeartbeatAck); ok {
+						for _, stale := range ack.Stale {
+							acked = acked || stale.VMID == v.ID && stale.Generation == v.Generation
+						}
+					}
+				}
+				if !acked {
+					t.Fatal("quarantine tombstone not acknowledged as stale")
+				}
+			}
+			// A tombstone is already-clean capacity, even before its ack
+			// reaches the agent. It must not block unrelated placement.
+			h.step(request{op: "admin", id: "b", arg: api.AdminCordoned})
+			other := h.create("other", "standard")
+			if other.HostID != v.HostID {
+				t.Fatalf("tombstone retained occupied capacity: %+v", other)
+			}
+			// Once the ack arrives the agent forgets only the tombstone.
+			h.agent(v.HostID, v.Rack, api.HostHeartbeat{HostID: v.HostID, Seq: 3, Inventory: []api.InventoryItem{{VMID: other.ID, Generation: other.Generation, State: api.VMBooting}}})
+			got := h.s.state.data.VMs[v.ID].VM
+			wantState, wantReason := api.VMFailed, api.ReasonQuarantined
+			if initial == api.VMTerminating {
+				wantState, wantReason = api.VMTerminated, api.ReasonDeleted
+			}
+			if got.State != wantState || got.LastReason != wantReason || got.Generation != v.Generation {
+				t.Fatalf("quarantined VM replaced or delete resurrected: %+v", got)
+			}
+			loaded, _, err := h.db.Start(context.Background())
+			if err != nil || loaded.VMs[v.ID].VM.State != wantState {
+				t.Fatalf("quarantine result not durable: %+v %v", loaded.VMs[v.ID], err)
+			}
+		})
+	}
+}
+
+func TestOlderQuarantineTombstoneCannotFailNewGeneration(t *testing.T) {
+	h := newHarness(t)
+	h.register("a", "r1", 2)
+	v := h.create("K", "standard")
+	h.ready(v)
+	h.agent("a", "r1", api.UnhealthyReport{HostID: "a", VMID: v.ID, Generation: v.Generation, Reason: api.ReasonGuestLease})
+	newVM := h.s.state.data.VMs[v.ID].VM
+	h.ready(newVM)
+	old := api.InventoryItem{VMID: v.ID, Generation: v.Generation, State: api.VMFailed}
+	e := h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: 1, Inventory: []api.InventoryItem{old, {VMID: v.ID, Generation: newVM.Generation, State: api.VMReady}}})
+	if got := h.s.state.data.VMs[v.ID].VM; got.State != api.VMReady || got.Generation != newVM.Generation {
+		t.Fatalf("old quarantine affected new copy: %+v", got)
+	}
+	acked := false
+	for _, d := range e.sends {
+		if ack, ok := d.msg.(api.HeartbeatAck); ok && len(ack.Stale) == 1 && ack.Stale[0] == old {
+			acked = true
+		}
+	}
+	if !acked || hasStop(e, v.ID, v.Generation) {
+		t.Fatal("old tombstone should only be acknowledged stale")
+	}
+}
+
 func TestLateWipeCopyCannotStealRetriedKey(t *testing.T) {
 	h := newHarness(t)
 	h.s.state.recoverUntil = h.c.Now().Add(h.s.cfg.HostLeaseTTL).UnixMilli()
