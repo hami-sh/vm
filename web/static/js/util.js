@@ -76,6 +76,20 @@ export const secs = (ms) => (ms == null ? '–' : `${(ms / 1000).toFixed(1)} s`)
 export const plural = (n, one, many = one + 's') => `${n} ${n === 1 ? one : many}`;
 export const title = (s) => String(s || '').replace(/[-_]/g, ' ').replace(/^\w/, (c) => c.toUpperCase());
 
+// vmName shortens a VM id for display. The scheduler's ids are
+// vm-<epoch>-<counter>-<uuid>; the counter and the start of the uuid are
+// enough to tell VMs apart on screen. The full id stays in titles and in the
+// detail panel.
+export function vmName(id) {
+  const s = String(id ?? '');
+  const m = /^vm-\d+-0*(\d+)-([0-9a-f]{4})/.exec(s);
+  if (m) return `vm-${m[1]}-${m[2]}`;
+  return s.length > 16 ? `${s.slice(0, 7)}…${s.slice(-4)}` : s;
+}
+
+// shorten replaces every long VM id inside free text (event details).
+export const shorten = (text) => String(text ?? '').replace(/vm-\d{6,}-\d+-[0-9a-f-]{36}/g, vmName);
+
 // badge renders a small coloured label.
 export const badge = (text, color, cls = '') =>
   `<span class="badge ${cls}" style="--c:${color}">${esc(text)}</span>`;

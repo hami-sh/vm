@@ -92,7 +92,11 @@ export function view() {
     const frame = run.frames[run.cursor];
     if (run.derivedFor !== run.frames) {
       run.history = run.frames.map(sample);
-      run.events = run.frames.flatMap((f) => f.recent || []);
+      // Each frame carries the last few events, so neighbours overlap.
+      const bySeq = new Map();
+      for (const f of run.frames) for (const e of f.recent || []) bySeq.set(e.seq, e);
+      for (const e of run.report?.markers || []) bySeq.set(e.seq, e);
+      run.events = [...bySeq.values()].sort((a, b) => a.at - b.at || a.seq - b.seq);
       run.derivedFor = run.frames;
     }
     const events = run.events.filter((e) => e.at <= frame.at);

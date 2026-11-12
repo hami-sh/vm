@@ -1,7 +1,7 @@
 // The rack / host / VM grid. It is the control surface: every rack head, host
 // card, VM chip and the scheduler box carries data-act="pick", which selects
 // it for the detail panel and (on the live fleet) opens its chaos menu.
-import { $, esc, mount, stateVar, prio, dur, plural } from './util.js';
+import { $, esc, mount, stateVar, prio, dur, plural, vmName } from './util.js';
 
 const LEASE = { healthy: 'var(--ok)', suspect: 'var(--warn)', lost: 'var(--bad)' };
 const SCHED = { up: 'var(--ok)', reconciling: 'var(--warn)', down: 'var(--bad)' };
@@ -24,7 +24,7 @@ export function vmChip(vm, st, slotState) {
       : '';
   return `<button class="${cls.join(' ')}" style="--c:${stateVar(vm.state)}" data-act="pick" data-kind="vm" data-id="${esc(vm.id)}"
     title="${esc(vm.id)} · ${esc(vm.state)} · gen ${vm.gen} · ${p.label}${note ? ' · ' + esc(note) : ''}">
-    <span class="vm-top"><span class="vm-id">${esc(vm.id)}</span><span class="vm-gen">g${vm.gen}</span><span class="vm-prio" style="--p:${p.color}">${p.short}</span></span>
+    <span class="vm-top"><span class="vm-id">${esc(vmName(vm.id))}</span><span class="vm-gen">g${vm.gen}</span><span class="vm-prio" style="--p:${p.color}">${p.short}</span></span>
     <span class="vm-bot"><span class="vm-state">${esc(vm.state)}</span>${note ? `<span class="vm-note">${esc(note)}</span>` : ''}</span>
   </button>`;
 }
@@ -34,7 +34,7 @@ function slot(sl, vms, st) {
   const vm = vms.get(sl.vm_id);
   if (vm) return vmChip(vm, st, sl.state);
   // The host holds a slot for a VM the scheduler no longer lists.
-  return `<span class="slot-free orphan" title="${esc(sl.state)}">${esc(sl.vm_id)} g${sl.gen ?? '?'}</span>`;
+  return `<span class="slot-free orphan" title="${esc(sl.vm_id)} · ${esc(sl.state)}">${esc(vmName(sl.vm_id))} g${sl.gen ?? '?'}</span>`;
 }
 
 function leaseText(h) {
@@ -49,7 +49,7 @@ function hostCard(h, vms, st) {
   if (h.admin_state !== 'active') tags.push(`<span class="tag admin">${esc(h.admin_state)}</span>`);
   for (const f of h.faults || []) tags.push(`<span class="tag fault">${esc(f)}</span>`);
   const stale = (h.stale || [])
-    .map((s) => `<span class="stale" title="A copy the scheduler has fenced: its generation is older than the authoritative one.">stale copy <b>${esc(s.vm_id)}</b> g${s.gen}</span>`)
+    .map((s) => `<span class="stale" title="A copy the scheduler has fenced: its generation is older than the authoritative one.">stale copy <b>${esc(vmName(s.vm_id))}</b> g${s.gen}</span>`)
     .join('');
   return `<div class="${cls.join(' ')}" style="--lease:${LEASE[h.lease] || 'var(--faint)'}" data-act="pick" data-kind="host" data-id="${esc(h.id)}">
     <div class="host-head">
