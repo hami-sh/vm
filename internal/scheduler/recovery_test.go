@@ -93,7 +93,7 @@ func TestQuarantineTombstoneSurvivesLostReports(t *testing.T) {
 	}
 }
 
-func TestOlderQuarantineTombstoneCannotFailNewGeneration(t *testing.T) {
+func TestOlderQuarantineTombstoneFailsNewGeneration(t *testing.T) {
 	h := newHarness(t)
 	h.register("a", "r1", 2)
 	v := h.create("K", "standard")
@@ -103,17 +103,87 @@ func TestOlderQuarantineTombstoneCannotFailNewGeneration(t *testing.T) {
 	h.ready(newVM)
 	old := api.InventoryItem{VMID: v.ID, Generation: v.Generation, State: api.VMFailed}
 	e := h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: 1, Inventory: []api.InventoryItem{old, {VMID: v.ID, Generation: newVM.Generation, State: api.VMReady}}})
-	if got := h.s.state.data.VMs[v.ID].VM; got.State != api.VMReady || got.Generation != newVM.Generation {
-		t.Fatalf("old quarantine affected new copy: %+v", got)
+	if got := h.s.state.data.VMs[v.ID].VM; got.State != api.VMFailed || got.LastReason != api.ReasonQuarantined || got.Generation != newVM.Generation {
+		t.Fatalf("old quarantine did not fail logical VM: %+v", got)
 	}
 	acked := false
 	for _, d := range e.sends {
-		if ack, ok := d.msg.(api.HeartbeatAck); ok && len(ack.Stale) == 1 && ack.Stale[0] == old {
-			acked = true
+		if ack, ok := d.msg.(api.HeartbeatAck); ok {
+			for _, i := range ack.Stale {
+				acked = acked || i == old
+			}
 		}
 	}
-	if !acked || hasStop(e, v.ID, v.Generation) {
-		t.Fatal("old tombstone should only be acknowledged stale")
+	if !acked || !hasStop(e, v.ID, newVM.Generation) {
+		t.Fatal("old tombstone must be acknowledged and stop the current copy")
+	}
+}
+
+func TestQuarantinedRecycleRefusalIsTerminal(t *testing.T) {
+	h := newHarness(t)
+	h.register("a", "r1", 2)
+	v := h.create("K", "standard")
+	h.ready(v)
+	// A lease-expiry report emitted before quarantine arrives before the
+	// tombstone and requests an in-place recycle at the next generation.
+	h.agent("a", "r1", api.UnhealthyReport{HostID: "a", VMID: v.ID, Generation: v.Generation, Reason: api.ReasonGuestLease})
+	next := h.s.state.data.VMs[v.ID].VM
+	if next.State != api.VMBooting || next.Generation != v.Generation+1 || next.HostID != v.HostID {
+		t.Fatalf("did not exercise in-place recycle: %+v", next)
+	}
+	h.agent("a", "r1", api.StartVMResult{HostID: "a", VMID: v.ID, Generation: next.Generation, Reason: api.ReasonQuarantined})
+	got := h.s.state.data.VMs[v.ID].VM
+	if got.State != api.VMFailed || got.LastReason != api.ReasonQuarantined || got.Attempts != next.Attempts || len(h.s.state.data.Queue) != 0 {
+		t.Fatalf("quarantine refusal retried or changed budget: %+v", got)
+	}
+	h.agent("a", "r1", api.ReadyReport{HostID: "a", VMID: v.ID, Generation: next.Generation})
+	if h.s.state.data.VMs[v.ID].VM.State != api.VMFailed {
+		t.Fatal("late Ready resurrected quarantined identity")
+	}
+}
+
+func TestOldQuarantineEvidenceStopsReplacementHost(t *testing.T) {
+	for _, evidence := range []string{"tombstone", "security", "stop"} {
+		t.Run(evidence, func(t *testing.T) {
+			h := newHarness(t)
+			h.register("a", "r1", 1)
+			h.register("b", "r2", 1)
+			v := h.create("K", "standard")
+			h.ready(v)
+			h.c.Advance(h.s.cfg.HostLeaseTTL)
+			h.step(tick{})
+			h.register("b", "r2", 1)
+			h.c.Advance(h.s.cfg.HostLostGrace)
+			h.agent("b", "r2", api.HostHeartbeat{HostID: "b", Seq: 1})
+			h.step(tick{})
+			next := h.s.state.data.VMs[v.ID].VM
+			if next.HostID != "b" || next.Generation != v.Generation+1 {
+				t.Fatalf("did not replace onto another host: %+v", next)
+			}
+			h.ready(next)
+			var e Effect
+			switch evidence {
+			case "tombstone":
+				e = h.register("a", "r1", 1, api.InventoryItem{VMID: v.ID, Generation: v.Generation, State: api.VMFailed})
+			case "security":
+				e = h.agent("a", "r1", api.SecurityReport{HostID: "a", VMID: v.ID, Generation: v.Generation, Quarantined: true, Attack: api.AttackReplay})
+			case "stop":
+				e = h.agent("a", "r1", api.StoppedReport{HostID: "a", VMID: v.ID, Generation: v.Generation, Reason: api.ReasonQuarantined})
+			}
+			got := h.s.state.data.VMs[v.ID].VM
+			if got.State != api.VMFailed || got.LastReason != api.ReasonQuarantined || got.Generation != next.Generation || len(h.s.state.data.Queue) != 0 {
+				t.Fatalf("old quarantine did not fail replacement: %+v", got)
+			}
+			stoppedCurrent := false
+			for _, d := range e.sends {
+				if stop, ok := d.msg.(api.StopVM); ok && d.to.ID == "b" && stop.VMID == v.ID && stop.Generation == next.Generation && stop.Reason == api.ReasonQuarantined {
+					stoppedCurrent = true
+				}
+			}
+			if !stoppedCurrent {
+				t.Fatal("did not stop current generation on its actual host")
+			}
+		})
 	}
 }
 
