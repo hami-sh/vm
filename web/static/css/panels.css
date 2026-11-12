@@ -5,10 +5,9 @@
 .ctl { display: grid; align-content: start; gap: 9px; padding: 12px; border-top: 1px solid var(--line); min-width: 0; flex: none; }
 .advanced-controls { overflow: auto; min-height: 80px; }
 .advanced-title { padding: 10px 12px; background: var(--panel-2); border-top: 1px solid var(--line); }
-.create-form { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
+.create-form { display: grid; gap: 10px; }
 .create-form label { display: grid; gap: 4px; color: var(--dim); font-size: 12px; }
 .create-form .input { width: 100%; min-width: 0; }
-.create-form .btn { grid-column: 1 / -1; }
 .ctl:first-child { border-left: 0; }
 .ctl-title { display: grid; gap: 4px; }
 .ctl-title .dim { font-size: 12px; }
@@ -39,7 +38,7 @@ body.playback .controls { display: none; }
 
 /* --------------------------------------------------------------- event log */
 .log-panel { display: flex; flex-direction: column; min-height: 0; }
-.log-panel .panel-head { flex-wrap: wrap; }
+.log-panel .panel-head { flex-wrap: wrap; flex: none; }
 .log-kinds { display: flex; flex-wrap: wrap; gap: 4px; flex: 1; min-width: 0; }
 .log-kinds .chip { height: 20px; padding: 0 7px; font-size: 11px; }
 .log-filter { width: 150px; }

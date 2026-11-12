@@ -1,7 +1,7 @@
 // Sim controls under the grid: load, topology, ambient chaos and presets.
 // Sliders and filters reflect the snapshot's sim status; the small form
 // fields (which pool, which rack) are the only values kept here.
-import { $, esc, mount, PRIORITIES } from './util.js';
+import { $, esc, mount } from './util.js';
 import { state, update, toast } from './store.js';
 import { api, attempt } from './api.js';
 
@@ -20,7 +20,7 @@ const LAYERS = [
   ['topology', 'Topology'],
 ];
 
-const form = { pool: '', priority: 'interactive', mix: 'mixed', rackHosts: 4, addTo: '', drain: '' };
+const form = { pool: '', priority: 'standard', mix: 'mixed', rackHosts: 4, addTo: '', drain: '' };
 
 const options = (list, selected) =>
   list.map(([value, label]) => `<option value="${esc(value)}"${value === selected ? ' selected' : ''}>${esc(label)}</option>`).join('');
@@ -29,26 +29,34 @@ const options = (list, selected) =>
 const keep = (value, list) => (list.includes(value) ? value : list[0] || '');
 
 function load(s) {
-  const rate = s.sim.load_rate || 0;
   const pools = (s.pools || []).map((p) => p.name);
   form.pool = keep(form.pool, pools);
   return `<div class="ctl">
-    <div class="ctl-title"><h2>VM requests</h2></div>
-    <div class="ctl-row"><span class="lbl">Automatic requests per sim-second</span>
+    <div class="ctl-title"><h2>Create a VM</h2><span class="dim">Starts a macOS VM. If there’s no space, it waits in the queue.</span></div>
+    <button class="btn primary" data-act="create-vm" title="Create one macOS VM. Environment and queue priority can be changed in Advanced controls.">Create VM</button>
+    <div class="ctl-row">
+      <button class="btn" data-act="flood" data-count="10" title="Send 10 VM requests at once">Create 10 VMs</button>
+      <button class="btn" data-act="flood" data-count="60" title="Send 60 requests at once to fill the fleet and test the queue limit of ${s.counters.queue_cap}. Excess requests may be refused.">Create 60 VMs</button></div>
+  </div>`;
+}
+
+function requestSettings(s) {
+  const rate = s.sim.load_rate || 0;
+  const pools = (s.pools || []).map((p) => [p.name, `${p.image.replace(/macos-(\d+)-xcode(\d+)/, 'macOS $1 · Xcode $2')} · ${p.cpus} CPU · ${p.memory_mb / 1024} GB`]);
+  return `<div class="ctl">
+    <div class="ctl-title"><h2>Single-VM settings</h2><span class="dim">Optional settings for the Create VM button.</span></div>
+    <div class="create-form">
+      <label>Environment · software and VM size<select class="input" data-change="form" data-key="pool" aria-label="VM environment">${options(pools, form.pool)}</select></label>
+      <label>When the fleet is full, serve this request<select class="input" data-change="form" data-key="priority" aria-label="Queue priority">${options([['interactive', 'First · urgent'], ['standard', 'Normally · default'], ['batch', 'Last · background work']], form.priority)}</select></label>
+    </div>
+    <div class="ctl-title"><h2>Automatic traffic</h2><span class="dim">Continuously creates VMs to test admission and recovery. Set to 0 to stop.</span></div>
+    <div class="ctl-row"><span class="lbl">New VMs per sim-second</span>
       <input type="range" min="0" max="${MAX_RATE}" step="0.1" value="${rate}" data-input="slide" data-unit="/s" data-digits="1" data-change="load-rate" aria-label="Sustained create rate">
       <output>${rate.toFixed(1)}/s</output></div>
-    <div class="ctl-row"><span class="lbl">Automatic request priorities</span>
+    <div class="ctl-row"><span class="lbl">Queue priority for automatic traffic</span>
       <div class="seg">${Object.entries(MIXES)
-        .map(([key, m]) => `<button data-act="mix" data-mix="${key}" class="${form.mix === key ? 'on' : ''}">${m.label}</button>`)
+        .map(([key, m]) => `<button data-act="mix" data-mix="${key}" title="${key === 'mixed' ? '20% urgent, 50% normal, 30% background work' : key === 'interactive' ? 'All requests served ahead of normal or background work' : 'All requests can wait behind other work'}" class="${form.mix === key ? 'on' : ''}">${key === 'interactive' ? 'Urgent' : key === 'batch' ? 'Background' : m.label}</button>`)
         .join('')}</div></div>
-    <div class="create-form">
-      <label>VM pool<select class="input" data-change="form" data-key="pool" aria-label="VM pool">${options(pools.map((p) => [p, p]), form.pool)}</select></label>
-      <label>Request priority<select class="input" data-change="form" data-key="priority" aria-label="Request priority">${options(PRIORITIES.slice(1).map((p) => [p.key, p.label]), form.priority)}</select></label>
-      <button class="btn primary" data-act="create-vm" title="Request one VM with the pool and priority above">Create VM</button>
-    </div>
-    <div class="ctl-row"><span class="lbl">Burst requests · tests queue admission</span>
-      <button class="btn" data-act="flood" data-count="60" title="Send 60 requests at once. Up to ${s.counters.queue_cap} wait; excess requests are refused.">Request 60</button>
-      <button class="btn" data-act="flood" data-count="10" title="Send 10 requests at once">Request 10</button></div>
   </div>`;
 }
 
@@ -123,7 +131,7 @@ export function render(st, v) {
     mount(el, '');
     return;
   }
-  mount(el, load(s) + presets(st.catalog) + '<h2 class="advanced-title">Advanced controls</h2><div class="advanced-controls" aria-label="Advanced controls">' + topology(s) + chaos(s, st.catalog) + '<div class="ctl"><button class="btn" data-act="open-menu" data-kind="global" title="Inject latency, packet loss, duplication or reordering">Network faults…</button></div></div>');
+  mount(el, load(s) + presets(st.catalog) + '<h2 class="advanced-title">Advanced controls</h2><div class="advanced-controls" aria-label="Advanced controls">' + requestSettings(s) + topology(s) + chaos(s, st.catalog) + '<div class="ctl"><button class="btn" data-act="open-menu" data-kind="global" title="Inject latency, packet loss, duplication or reordering">Network faults…</button></div></div>');
 }
 
 // After a slider request the panel is redrawn from the snapshot even if the
