@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>macOS VM control plane</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23151a23'/%3E%3Cpath d='M7 8h18v13H7z' fill='none' stroke='%236aa8ff' stroke-width='2'/%3E%3Cpath d='M12 25h8' stroke='%236aa8ff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/css/base.css">
+<link rel="stylesheet" href="/css/fleet.css">
+<link rel="stylesheet" href="/css/panels.css">
+<link rel="stylesheet" href="/css/runs.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#/"><span class="brand-mark"></span>macOS VM control plane</a>
+  <nav class="nav" id="nav"></nav>
+</header>
+
+<div id="runbar"></div>
+
+<main class="layout" id="dash">
+  <aside class="panel controls-rail">
+    <header class="panel-head"><h2>Controls</h2><span class="spacer"></span><button class="btn danger" data-act="reset" title="Remove all VMs, traffic and faults">Reset fleet</button></header>
+    <div class="sim" id="sim"></div>
+    <div class="controls" id="controls"></div>
+  </aside>
+  <div class="col-main">
+    <section class="panel statusbar" id="status" aria-label="Fleet statistics"></section>
+    <section class="panel fleet-panel" id="fleet"></section>
+    <section class="panel detail-panel" id="detail" hidden></section>
+    <section class="panel queue" id="queue"></section>
+    <section class="panel log-panel">
+        <header class="panel-head">
+          <h2>Events</h2>
+          <div class="log-kinds" id="log-kinds"></div>
+          <!-- Static so typing isn't interrupted by a re-render. -->
+          <input class="input log-filter" id="log-filter" type="search" placeholder="rack, host or VM id" spellcheck="false" autocomplete="off">
+        </header>
+        <div class="log" id="log"></div>
+    </section>
+  </div>
+  <aside class="col-side">
+    <section class="panel report-panel" id="report" hidden></section>
+    <section class="panel evidence" id="evidence"></section>
+  </aside>
+</main>
+
+<main class="runs-page" id="runs" hidden></main>
+
+<div id="menu"></div>
+<div class="hover-tip" id="hover-tip" role="tooltip" hidden></div>
+<div class="toasts" id="toasts"></div>
+<script type="module" src="/js/app.js"></script>
+</body>
+</html>

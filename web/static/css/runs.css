@@ -1,0 +1,60 @@
+/* The Runs list, the playback bar with its scrubber, and the report panel. */
+.runs-page { max-width: 1180px; margin: 0 auto; padding: 16px; }
+.runs-page code { padding: 1px 5px; font: 12px var(--mono); color: var(--text); background: var(--raise); border-radius: 4px; }
+.runs-table { width: 100%; border-collapse: collapse; }
+.runs-table th {
+  padding: 8px 12px; font-size: 10.5px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; text-align: left;
+  color: var(--faint); border-bottom: 1px solid var(--line); white-space: nowrap;
+}
+.runs-table td { padding: 10px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.runs-table tbody tr { cursor: pointer; }
+.runs-table tbody tr:hover { background: var(--panel-2); }
+.runs-table tbody tr:last-child td { border-bottom: 0; }
+.runs-table .num { text-align: right; font-family: var(--mono); }
+.runs-table a { font-weight: 600; }
+
+/* ----------------------------------------------------------------- run bar */
+.runbar {
+  position: sticky; top: 48px; z-index: 15; padding: 8px 16px 6px;
+  background: rgba(15, 19, 26, .96); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line);
+}
+.run-info { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.run-info .spacer { flex: 1; }
+.run-time { font-size: 14px; min-width: 70px; text-align: right; }
+.scrub { position: relative; margin-top: 6px; }
+.scrub input[type=range] { display: block; width: 100%; height: 16px; margin: 0; cursor: pointer; }
+/* The thumb's centre travels between 8px from each end of the track. */
+.marks { position: relative; height: 14px; margin: 0 8px; }
+.mark {
+  position: absolute; bottom: 0; width: 3px; height: 9px; padding: 0; margin-left: -1.5px;
+  background: #7a8496; border: 0; border-radius: 1px; cursor: pointer;
+}
+.mark:hover { background: #fff; height: 14px; }
+.mark.violation { width: 4px; height: 14px; margin-left: -2px; background: var(--bad); z-index: 1; box-shadow: 0 0 8px rgba(255, 93, 108, .8); }
+.scrub-ends { display: flex; justify-content: space-between; align-items: center; margin-top: 2px; font: 11px var(--mono); color: var(--faint); }
+.scrub-key { display: inline-flex; align-items: center; gap: 6px; font-family: var(--sans); }
+.mark-key { width: 3px; height: 9px; margin-left: 10px; background: #7a8496; border-radius: 1px; }
+.mark-key.violation { background: var(--bad); }
+
+/* ------------------------------------------------------------------ report */
+.report-panel .kv { margin: 10px 12px; }
+.checks { display: grid; }
+.check { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 8px; align-items: start; padding: 7px 12px; border-bottom: 1px solid rgba(30, 38, 50, .6); }
+.check:last-child { border-bottom: 0; }
+.check i { font-style: normal; font-weight: 700; text-align: center; }
+.check.pass i { color: var(--ok); }
+.check.fail i { color: var(--bad); }
+.check.fail { background: rgba(255, 93, 108, .07); }
+.check b { display: block; font-weight: 500; }
+.check span { display: block; color: var(--dim); font-size: 12px; overflow-wrap: anywhere; }
+.marker-list { max-height: 220px; overflow: auto; }
+.marker-row {
+  display: grid; grid-template-columns: 62px auto minmax(0, 1fr); gap: 8px; align-items: baseline; width: 100%; padding: 4px 12px;
+  font: inherit; font-size: 12px; color: var(--dim); text-align: left; cursor: pointer;
+  background: none; border: 0; border-bottom: 1px solid rgba(30, 38, 50, .6);
+}
+.marker-row:hover { background: var(--panel-2); color: var(--text); }
+.marker-row.past { color: var(--text); }
+.marker-row.violation { background: rgba(255, 93, 108, .07); }
+.marker-row .t { font: 11.5px var(--mono); color: var(--faint); }
+.marker-row .d { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
