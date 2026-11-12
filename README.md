@@ -16,16 +16,16 @@ For local development, install Go 1.27.4 and run `make run`. The binary listens 
 
 ## Verify and record
 
-`make verify` runs vet, race tests, every scenario 20 times and the real-server SSE/HTTP smoke test. **It is intentionally red while the server exposes only `/healthz`.** Fakes test harness semantics, never substitute for the real fleet at the verification gate.
+`make verify` runs vet, race tests and every scenario 20 times against isolated real fleets (scheduler, SQLite, agents, drivers, simnet and checker) in-process under the race detector. Fakes test harness semantics, never substitute for the real fleet at this gate. `make e2e` is the separate real-server SSE/HTTP gate; it remains required and is expected to fail until the HTTP server is wired to the fleet and web handler.
 
 ```sh
 make verify
 go run ./cmd/vmctl verify --scenario rack-partition --repeat 50 --speed 5
 go run ./cmd/vmctl verify --scenario rack-partition --repeat 50 --speed 1
-go run ./cmd/vmctl e2e
+make e2e
 ```
 
-The default runner calibrates the complete suite at 5× and 50× with the same seeds. Different per-scenario pass rates select 5×. A failed run is still a failure; failures at both speeds stop calibration. Use `--speed` for an explicit diagnostic override, `--seed` to choose the seed range, `--parallel` to cap isolated systems and `--output` to choose the recording directory. Seeds reproduce fault choices, not goroutine scheduling.
+The runner defaults to **5×**, including under `-race`. Explicit `--speed 0` calibrates the complete suite at 5× and 50× with the same seeds. Different liveness pass rates select 5×; this includes time-bounded invariants 2 (stale-copy stop deadline) and 8 (prompt placement). Any violation of invariant 1 or 3–7 at either speed fails calibration: reducing speed must never conceal those safety bugs. Failures at both speeds also stop calibration. Use `--speed` for an explicit diagnostic override, `--seed` to choose the seed range, `--parallel` to cap isolated systems and `--output` to choose the recording directory. Seeds reproduce fault choices, not goroutine scheduling. Recovery latency is measured from Lost/Unhealthy to Ready transition events, not snapshots, which can miss transient lifecycle states.
 
 Each `runs/<id>/` contains:
 

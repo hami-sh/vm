@@ -105,7 +105,7 @@ func TestSuiteSeedsAndCalibration(t *testing.T) {
 		mu.Unlock()
 		snap := snapshot(1000, api.VMReady)
 		if speed == 50 && seed == 12 {
-			snap.Invariants[0].Violations = 1
+			snap.Invariants[len(snap.Invariants)-1].Violations = 1
 		}
 		return &fakeFleet{initial: snapshot(0, api.VMReady), frames: []api.Snapshot{snap}}, func() {}, nil
 	}
@@ -121,6 +121,28 @@ func TestSuiteSeedsAndCalibration(t *testing.T) {
 	_, err = Suite(context.Background(), []Scenario{s}, f, Options{Repeat: 3, Parallel: 2, Seed: 11, Speed: 50, Output: t.TempDir()}, io.Discard)
 	if err == nil {
 		t.Fatal("partial failure must fail suite")
+	}
+	safetyFault := func(_ context.Context, _ Scenario, _ int64, speed float64) (System, func(), error) {
+		snap := snapshot(1000, api.VMReady)
+		if speed == 50 {
+			snap.Invariants[0].Violations = 1
+		}
+		return &fakeFleet{initial: snapshot(0, api.VMReady), frames: []api.Snapshot{snap}}, func() {}, nil
+	}
+	_, err = Calibrate(context.Background(), []Scenario{s}, safetyFault, Options{Repeat: 1, Parallel: 1, Output: t.TempDir()}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "cannot cap safety") {
+		t.Fatalf("suppressed high-speed fencing failure: %v", err)
+	}
+	boundedFault := func(_ context.Context, _ Scenario, _ int64, speed float64) (System, func(), error) {
+		snap := snapshot(1000, api.VMReady)
+		if speed == 50 {
+			snap.Invariants[1].Violations = 1
+		}
+		return &fakeFleet{initial: snapshot(0, api.VMReady), frames: []api.Snapshot{snap}}, func() {}, nil
+	}
+	speed, err = Calibrate(context.Background(), []Scenario{s}, boundedFault, Options{Repeat: 1, Parallel: 1, Output: t.TempDir()}, io.Discard)
+	if err != nil || speed != 5 {
+		t.Fatalf("time-bounded invariant 2 should cap speed: %g %v", speed, err)
 	}
 }
 

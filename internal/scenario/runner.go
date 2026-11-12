@@ -309,8 +309,15 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 				}
 			}
 			violations := 0
+			safety := 0
 			for _, v := range snap.Invariants {
 				violations += v.Violations
+				if v.Name != api.InvPendingPlaced && v.Name != api.InvStaleStopped {
+					safety += v.Violations
+				}
+			}
+			if float64(safety) > report.Metrics["safety_violations"] {
+				report.Metrics["safety_violations"] = float64(safety)
 			}
 			if violations > report.Violations {
 				report.Violations = violations
@@ -368,6 +375,13 @@ func Calibrate(ctx context.Context, scenarios []Scenario, f Factory, opt Options
 	slow, e1 := Suite(ctx, scenarios, f, opt, out)
 	opt.Speed = 50
 	fast, e2 := Suite(ctx, scenarios, f, opt, out)
+	for _, runs := range [][]api.RunReport{slow, fast} {
+		for _, r := range runs {
+			if r.Metrics["safety_violations"] > 0 {
+				return 5, fmt.Errorf("safety invariant failed at %gx in %s: calibration cannot cap safety failures", r.Speed, r.ID)
+			}
+		}
+	}
 	selected := float64(50)
 	for i := range scenarios {
 		a, b := 0, 0
