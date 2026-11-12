@@ -7,7 +7,7 @@ import { api, attempt } from './api.js';
 
 const MAX_RATE = 5; // creates per sim second
 const MIXES = {
-  mixed: { label: 'Mixed', interactive: 1, standard: 2, batch: 1 },
+  mixed: { label: 'Mixed', interactive: 2, standard: 5, batch: 3 }, // 20% / 50% / 30%
   interactive: { label: 'Interactive', interactive: 1, standard: 0, batch: 0 },
   batch: { label: 'Batch', interactive: 0, standard: 0, batch: 1 },
 };

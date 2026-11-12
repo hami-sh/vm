@@ -11,6 +11,9 @@
 .ctl-row input[type=range] { flex: 1; min-width: 80px; }
 .ctl-row output { width: 52px; text-align: right; font: 12px var(--mono); color: var(--text); }
 .ctl-row select.input { max-width: 100%; }
+.ctl.wide { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--line); padding: 9px 12px; }
+.ctl-row .spacer { flex: 1; }
+.input.num { width: 52px; text-align: right; font-family: var(--mono); }
 .chip {
   display: inline-flex; align-items: center; gap: 5px; height: 22px; padding: 0 8px;
   font: inherit; font-size: 12px; color: var(--dim); white-space: nowrap; cursor: pointer;
