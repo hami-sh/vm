@@ -25,6 +25,9 @@ type Config struct {
 	BackoffBase      time.Duration // exponential with full jitter
 	BackoffMax       time.Duration
 	ReservationTTL   time.Duration
+	// DrainGrace is how long VMs on a draining host keep running before they
+	// are replaced elsewhere (class 0, reason drained). Real: hours.
+	DrainGrace time.Duration
 
 	// Queue
 	QueueCap  int
@@ -80,6 +83,7 @@ func Default() Config {
 		BackoffBase:    time.Second,
 		BackoffMax:     8 * time.Second,
 		ReservationTTL: 10 * time.Second,
+		DrainGrace:     20 * time.Second,
 
 		QueueCap: 32, QueueScan: 8, AgingStep: 60 * time.Second,
 
