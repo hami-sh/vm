@@ -6,6 +6,15 @@ export const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ESC[c]);
 
 export const $ = (sel, root = document) => root.querySelector(sel);
 
+// VM-targeted actions are history, not ongoing host faults. Older playback
+// can lack the action catalog; live views use the server's target definitions.
+export function hostFaults(host, catalog, playback) {
+  const vmActions = catalog?.actions?.length
+    ? catalog.actions.filter((action) => action.target === 'vm').map((action) => action.name)
+    : playback ? ['kill-guestd', 'crash-vm', 'hang-next-boot', 'compromise', 'impostor-register', 'delete'] : [];
+  return (host.faults || []).filter((name) => !vmActions.includes(name));
+}
+
 // mount replaces el's content with html. Every panel is rebuilt from the
 // snapshot on each render; skipping an identical string keeps hover, scroll
 // and CSS animations steady when nothing changed.

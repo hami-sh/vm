@@ -1,6 +1,6 @@
 // The detail panel for whatever is selected: a VM (with its last 20
 // transitions), a host, a rack or the scheduler. Hidden until selected.
-import { $, esc, mount, clock, dur, badge, prio, stateVar, EVENT_KINDS, vmName, shorten } from './util.js';
+import { $, esc, mount, clock, dur, badge, prio, stateVar, EVENT_KINDS, vmName, shorten, hostFaults } from './util.js';
 import { update } from './store.js';
 const LEASE = { healthy: 'var(--ok)', suspect: 'var(--warn)', lost: 'var(--bad)' };
 const SCHED = { up: 'var(--ok)', reconciling: 'var(--warn)', down: 'var(--bad)' };
@@ -87,10 +87,11 @@ function vmDetail(id, s, v, guest) {
     ${title}${eventRows(history, 'None in the log window.')}</div>`;
 }
 
-function hostDetail(id, s, v, agent = false) {
+function hostDetail(id, s, v, catalog, agent = false) {
   const h = s.hosts.find((x) => x.id === id);
   if (!h) return `${head(id, badge('gone', 'var(--faint)'))}<div class="detail-body"><div class="empty">This host is no longer in the fleet.</div></div>`;
   const used = h.slots.filter((sl) => sl.vm_id).length;
+  const faults = hostFaults(h, catalog, v.playback);
   const stale = (h.stale || []).map((x) => `${esc(vmName(x.vm_id))} g${x.gen}`).join(', ');
   const events = last(v.events, 20, (e) => e.host_id === id);
   return `${head(agent ? 'Host agent' : `Host ${id}`, badge(`lease ${h.lease}`, LEASE[h.lease] || 'var(--faint)'), agent ? 'agent' : 'host', id, v.playback)}
@@ -102,7 +103,7 @@ function hostDetail(id, s, v, agent = false) {
       ['Admin state', esc(h.admin_state)],
       [h.lease === 'healthy' ? 'Last heartbeat' : 'Silent for', dur(h.lease_age_ms)],
       ['Slots', `${used} of ${h.slots.length} used`],
-      ['Faults', (h.faults || []).length ? `<span class="bad">${esc(h.faults.join(', '))}</span>` : '<span class="faint">none</span>', true],
+      ['Faults', faults.length ? `<span class="bad">${esc(faults.join(', '))}</span>` : '<span class="faint">none</span>', true],
       stale ? ['Stale copies (fenced)', `<span class="bad">${stale}</span>`, true] : null,
     ])}
     <div class="sub-head">Reported slots → logical VMs</div><div class="detail-links">${h.slots.filter((sl) => sl.vm_id).map((sl) => link('vm', sl.vm_id, `${vmName(sl.vm_id)} · slot g${sl.gen} → current VM`)).join('') || '<span class="dim">No VMs assigned.</span>'}</div>
@@ -163,7 +164,7 @@ export function render(st, v) {
   const active = el.__selection === sel && document.activeElement && el.contains(document.activeElement) ? document.activeElement : null;
   let html;
   if (sel.kind === 'vm' || sel.kind === 'guest') html = vmDetail(sel.id, s, v, sel.kind === 'guest' ? sel : null);
-  else if (sel.kind === 'host' || sel.kind === 'agent') html = hostDetail(sel.id, s, v, sel.kind === 'agent');
+  else if (sel.kind === 'host' || sel.kind === 'agent') html = hostDetail(sel.id, s, v, st.catalog, sel.kind === 'agent');
   else if (sel.kind === 'rack') html = rackDetail(sel.id, s, v);
   else html = schedulerDetail(s, v);
   mount(el, navigation(sel, s) + html + '<div class="detail-scroll-hint">Scroll inspector for properties and history ↓</div>');

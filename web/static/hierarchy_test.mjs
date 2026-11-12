@@ -32,6 +32,39 @@ function hostHTML(id) {
   return fleet.innerHTML.split(`aria-label="Host ${id}"`)[1].split('</section>')[0];
 }
 
+test('guest action history is not shown as a host fault, while persistent host faults remain visible', () => {
+  const s = snapshot();
+  const vmActions = ['kill-guestd', 'crash-vm', 'hang-next-boot', 'compromise', 'impostor-register', 'delete'];
+  const catalog = { actions: [
+    ...[...vmActions, 'future-vm-action'].map((name) => ({ name, target: 'vm', layer: 'guest' })),
+    { name: 'slow-boot', target: 'host', layer: 'guest' },
+    { name: 'fill-disk', target: 'host', layer: 'host' },
+  ] };
+  for (const mode of [{ catalog, playback: false }, { catalog, playback: true }, { playback: true }, { catalog: { actions: [] }, playback: true }]) {
+    s.hosts[0].faults = [...vmActions, 'future-vm-action', 'slow-boot', 'fill-disk'];
+    grid({ catalog: mode.catalog }, { snapshot: s, playback: mode.playback });
+    const results = [hostHTML('current')];
+    for (const kind of ['host', 'agent']) {
+      detail({ catalog: mode.catalog, selection: { kind, id: 'current' } }, { snapshot: s, events: [], playback: mode.playback });
+      results.push(inspector.innerHTML);
+    }
+    for (const html of results) {
+      for (const name of vmActions) assert.doesNotMatch(html, new RegExp(name));
+      assert.match(html, /slow-boot/);
+      assert.match(html, /fill-disk/);
+      if (mode.catalog === catalog) assert.doesNotMatch(html, /future-vm-action/);
+      else assert.match(html, /future-vm-action/);
+    }
+    s.hosts[0].faults = vmActions;
+    detail({ catalog: mode.catalog, selection: { kind: 'host', id: 'current' } }, { snapshot: s, events: [], playback: mode.playback });
+    assert.match(inspector.innerHTML, /Faults<\/span><span class="v"><span class="faint">none/);
+  }
+  // An available catalog overrides historical fallback names, even in playback.
+  s.hosts[0].faults = ['crash-vm'];
+  grid({ catalog: { actions: [{ name: 'crash-vm', target: 'host', layer: 'guest' }] } }, { snapshot: s, playback: true });
+  assert.match(hostHTML('current'), /crash-vm/);
+});
+
 test('host slots show their own generation and physical guest target, never another incarnation’s Ready state', () => {
   const s = snapshot();
   grid({}, { snapshot: s });

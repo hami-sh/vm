@@ -1,6 +1,6 @@
 // Physical containment, with the single scheduler above its host agents.
 // Every component selects an inspector; faults are explicit inspector actions.
-import { $, esc, mount, stateVar, stateMeaning, prio, dur, plural, vmName } from './util.js';
+import { $, esc, mount, stateVar, stateMeaning, prio, dur, plural, vmName, hostFaults } from './util.js';
 
 const LEASE = { healthy: 'var(--ok)', suspect: 'var(--warn)', lost: 'var(--bad)' };
 const SCHED = { up: 'var(--ok)', reconciling: 'var(--warn)', down: 'var(--bad)' };
@@ -46,12 +46,12 @@ function slot(sl, h, vms, st) {
   </div>`;
 }
 
-function hostCard(h, vms, st) {
+function hostCard(h, vms, st, playback) {
   const cls = ['host', `lease-${h.lease}`, `admin-${h.admin_state}`];
   if (isSel(st, 'host', h.id) || isSel(st, 'agent', h.id)) cls.push('sel');
   const tags = [];
   if (h.admin_state !== 'active') tags.push(`<span class="tag admin">${esc(h.admin_state)}</span>`);
-  for (const f of h.faults || []) tags.push(`<span class="tag fault">${esc(f)}</span>`);
+  for (const f of hostFaults(h, st.catalog, playback)) tags.push(`<span class="tag fault">${esc(f)}</span>`);
   const stale = (h.stale || [])
     .map((s) => `<span class="stale" title="A copy the scheduler has fenced: its generation is older than the authoritative one.">stale copy <b>${esc(vmName(s.vm_id))}</b> g${s.gen}</span>`)
     .join('');
@@ -66,7 +66,7 @@ function hostCard(h, vms, st) {
   </section>`;
 }
 
-function rackCol(r, hosts, vms, st) {
+function rackCol(r, hosts, vms, st, playback) {
   const mine = r.hosts.map((id) => hosts.get(id)).filter((h) => h && h.admin_state !== 'removed');
   const used = mine.reduce((n, h) => n + h.slots.filter((s) => s.vm_id).length, 0);
   const total = mine.reduce((n, h) => n + h.slots.length, 0);
@@ -80,7 +80,7 @@ function rackCol(r, hosts, vms, st) {
       <span class="rack-meta">${plural(mine.length, 'host')}<br>${used}/${total} slots${down ? ` · <span class="bad">${down} down</span>` : ''}</span>
       <span class="action-cue" aria-hidden="true">›</span>
     </button>
-    ${mine.map((h) => hostCard(h, vms, st)).join('') || '<div class="empty">No hosts</div>'}
+    ${mine.map((h) => hostCard(h, vms, st, playback)).join('') || '<div class="empty">No hosts</div>'}
   </section>`;
 }
 
@@ -128,7 +128,7 @@ export function render(st, v) {
       </button>
       <div class="fleet-relationship"><span>↓ commands to host agents</span><span>↑ host inventory &amp; heartbeats</span></div>
     </div>
-    <div class="racks">${s.racks.map((r) => rackCol(r, hosts, vms, st)).join('')}</div>
+    <div class="racks">${s.racks.map((r) => rackCol(r, hosts, vms, st, v.playback)).join('')}</div>
     ${unplaced(s, st)}`,
   );
   el.classList.toggle('has-overflow', el.scrollHeight > el.clientHeight + 8);
