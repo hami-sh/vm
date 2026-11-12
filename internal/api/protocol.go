@@ -118,6 +118,10 @@ type HeartbeatAck struct {
 	HostID string          `json:"host_id"`
 	Epoch  int64           `json:"epoch"`
 	Stale  []InventoryItem `json:"stale,omitempty"`
+	// Reregister asks the agent to send RegisterHost with its full inventory:
+	// the scheduler has no record of this host (wiped store, or a dropped
+	// RegisterHost). The host stays the authority on its own capacity.
+	Reregister bool `json:"reregister,omitempty"`
 }
 
 // --- guestd -> Agent (vsock in real life) ---
