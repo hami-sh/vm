@@ -3,7 +3,11 @@
 // COORDINATION.md: loosening a threshold is a decision, not a fix.
 package config
 
-import "time"
+import (
+	"time"
+
+	"github.com/hami-sh/vm/internal/api"
+)
 
 type Config struct {
 	// Fleet
@@ -71,6 +75,11 @@ type Config struct {
 	PresetHealAfter  time.Duration
 	PresetStepEvery  time.Duration
 	LoadPriorityMix  [3]float64 // interactive, standard, batch weights
+	// VM lifetimes (demo only; off unless the sim request sets them).
+	// DemoLifetime is the dashboard's suggested policy; LifetimeMin/Max
+	// bound any accepted policy.
+	DemoLifetime             api.Lifetime
+	LifetimeMin, LifetimeMax time.Duration
 }
 
 // Default is the configuration the demo and the scenarios use.
@@ -118,6 +127,9 @@ func Default() Config {
 		PresetHealAfter:  30 * time.Second,
 		PresetStepEvery:  15 * time.Second,
 		LoadPriorityMix:  [3]float64{.2, .5, .3},
+		DemoLifetime:     api.Lifetime{MinMs: 30000, MaxMs: 90000, IdleMs: 20000, ReleaseP: .6},
+		LifetimeMin:      5 * time.Second,
+		LifetimeMax:      30 * time.Minute,
 		ChaosBaseRates: map[string]float64{
 			"kill-guestd": .05, "crash-vm": .02, "hang-next-boot": .02, "slow-boot": .02, "compromise": .01,
 			"kill-host": .01, "pause-heartbeats": .01, "restart-host": .02, "clock-skew": .01, "fill-disk": .01, "cordon": .01,

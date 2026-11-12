@@ -15,6 +15,9 @@ const (
 	EventInvariant  EventKind = "invariant"
 	EventAlert      EventKind = "alert"
 	EventReconcile  EventKind = "reconcile"
+	// EventWorkload records the simulated tenant ending its own VM
+	// (lifetimes); the scheduler sees only an ordinary DeleteVM.
+	EventWorkload EventKind = "workload"
 )
 
 // Event is one row of the append-only event log, and one SSE "event" message.
@@ -118,8 +121,42 @@ type SimStatus struct {
 	Filters   []string `json:"filters"`         // enabled ambient fault types
 	Racks     []string `json:"racks,omitempty"` // ambient chaos scope; empty means all
 	LoadRate  float64  `json:"load_rate"`       // creates per sim second
+	// Lifetime is the simulated tenants' VM lifetime policy; zero is off.
+	Lifetime Lifetime `json:"lifetime"`
+	// Workloads lists the load-generated VMs whose lifetime has started.
+	Workloads []Workload `json:"workloads,omitempty"`
 	// Scenario is set while a scenario started from the dashboard runs.
 	Scenario string `json:"scenario,omitempty"`
+}
+
+// Lifetime is how long simulated tenants keep the VMs the load generator
+// creates. A job runs for a duration drawn from [MinMs, MaxMs] of sim time,
+// starting at the VM's first Ready. Then, with probability ReleaseP, the
+// tenant deletes the VM at once; otherwise it sits idle and is deleted after
+// IdleMs. MaxMs == 0 disables lifetimes. Endings use the public DeleteVM and
+// fire only while the VM is Ready, so they never hide a recovery.
+type Lifetime struct {
+	MinMs    int64   `json:"min_ms"`
+	MaxMs    int64   `json:"max_ms"`
+	IdleMs   int64   `json:"idle_ms"`
+	ReleaseP float64 `json:"release_p"`
+}
+
+// WorkloadPhase is a simulated tenant's view of its VM; it is not VM state.
+type WorkloadPhase string
+
+const (
+	WorkloadBusy WorkloadPhase = "busy"
+	WorkloadIdle WorkloadPhase = "idle"
+)
+
+// Workload is one load-generated VM with a running lifetime. EndsAt is the
+// sim-clock unix ms when the current phase ends; a due ending waits while the
+// VM is not Ready.
+type Workload struct {
+	VMID   string        `json:"vm_id"`
+	Phase  WorkloadPhase `json:"phase"`
+	EndsAt int64         `json:"ends_at"`
 }
 
 // Snapshot is the full state the dashboard renders. It is published every

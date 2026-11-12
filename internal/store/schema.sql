@@ -74,7 +74,7 @@ CREATE TABLE events (
   seq        INTEGER PRIMARY KEY AUTOINCREMENT,
   at         INTEGER NOT NULL,
   kind       TEXT NOT NULL
-             CHECK (kind IN ('transition','fencing','admission','chaos','topology','security','invariant','alert','reconcile')),
+             CHECK (kind IN ('transition','fencing','admission','chaos','topology','security','invariant','alert','reconcile','workload')),
   vm_id      TEXT,
   host_id    TEXT,
   rack       TEXT,

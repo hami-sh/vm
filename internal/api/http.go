@@ -95,6 +95,8 @@ type SimRequest struct {
 	Intensity *float64 `json:"intensity,omitempty"`
 	Filters   []string `json:"filters,omitempty"`
 	LoadRate  *float64 `json:"load_rate,omitempty"`
+	// Lifetime replaces the lifetime policy; MaxMs 0 turns it off.
+	Lifetime *Lifetime `json:"lifetime,omitempty"`
 	// Seed is used only by the "seed" action, where 0 is a valid seed.
 	Seed int64 `json:"seed,omitempty"`
 	// Racks limits ambient chaos to these racks; empty means all.
