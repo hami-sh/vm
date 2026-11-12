@@ -122,12 +122,12 @@ const SCENARIOS = {
   'bad-day': 'Combine random faults, network delay, a request burst and a scheduler restart',
 };
 
-function presets(catalog) {
+function presets(catalog, ready) {
   return `<div class="ctl wide">
     <div class="ctl-title"><h2>Scenarios</h2><span class="dim">Start a fault sequence and record it</span></div>
     <div class="ctl-row">
       <div class="presets">${catalog.presets
-        .map((p) => `<button class="btn" data-act="preset" data-name="${esc(p.name)}" title="${esc(SCENARIOS[p.name] || `Start ${p.label}`)}. Records a run for playback and inspection in Runs.">${esc(p.label)}</button>`)
+        .map((p) => `<button class="btn" data-act="preset" data-name="${esc(p.name)}" ${ready ? '' : 'disabled'} title="${ready ? `${esc(SCENARIOS[p.name] || `Start ${p.label}`)}. Records a run for playback and inspection in Runs.` : 'Scheduler is recovering; scenarios start once it accepts work'}">${esc(p.label)}</button>`)
         .join('')}</div>
       </div>
   </div>`;
@@ -140,7 +140,7 @@ export function render(st, v) {
     mount(el, '');
     return;
   }
-  mount(el, load(s) + presets(st.catalog) + '<h2 class="advanced-title">Advanced controls</h2><div class="advanced-controls" aria-label="Advanced controls">' + requestSettings(s) + topology(s) + chaos(s, st.catalog) + '<div class="ctl"><button class="btn" data-act="open-menu" data-kind="global" title="Inject latency, packet loss, duplication or reordering">Network faults…</button></div></div>');
+  mount(el, load(s) + presets(st.catalog, s.scheduler === 'up') + '<h2 class="advanced-title">Advanced controls</h2><div class="advanced-controls" aria-label="Advanced controls">' + requestSettings(s) + topology(s) + chaos(s, st.catalog) + '<div class="ctl"><button class="btn" data-act="open-menu" data-kind="global" title="Inject latency, packet loss, duplication or reordering">Network faults…</button></div></div>');
 }
 
 // After a slider request the panel is redrawn from the snapshot even if the
