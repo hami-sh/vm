@@ -24,6 +24,9 @@ type RegisterHost struct {
 	Slots     int             `json:"slots"`
 	DiskFull  bool            `json:"disk_full,omitempty"`
 	Inventory []InventoryItem `json:"inventory"`
+	// Epoch is the highest scheduler_epoch this agent has accepted. A
+	// scheduler whose store was wiped moves its epoch past it.
+	Epoch int64 `json:"epoch,omitempty"`
 }
 
 // HostHeartbeat renews the host lease and carries the inventory. One per host,
@@ -33,6 +36,7 @@ type HostHeartbeat struct {
 	Seq       uint64          `json:"seq"`
 	DiskFull  bool            `json:"disk_full,omitempty"`
 	Inventory []InventoryItem `json:"inventory"`
+	Epoch     int64           `json:"epoch,omitempty"` // as in RegisterHost
 }
 
 // StartVMResult answers a StartVM.
@@ -87,7 +91,7 @@ type StartVM struct {
 	Generation int64  `json:"gen"`
 	Token      string `json:"token"` // fresh per boot; the agent checks it when guestd registers
 	Spec       VMSpec `json:"spec"`
-	Epoch      int64  `json:"epoch"` // scheduler_epoch = max(stored+1, sim unix ms) at start; agents ignore older epochs
+	Epoch      int64  `json:"epoch"` // scheduler_epoch; agents ignore older epochs
 }
 
 // StopVM asks a host to stop vm at gen. Not running -> ack; running a higher

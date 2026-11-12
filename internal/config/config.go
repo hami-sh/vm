@@ -36,6 +36,8 @@ type Config struct {
 	SSEEvery           time.Duration // wall time between SSE snapshots
 	InvariantEvery     time.Duration
 	PendingPlaceWithin time.Duration // invariant 8
+	EventRetention     int           // events rows kept in SQLite
+	RecentEventLimit   int           // events carried per snapshot
 
 	// Security
 	QuarantineAttempts int
@@ -77,6 +79,8 @@ func Default() Config {
 		SSEEvery:           500 * time.Millisecond,
 		InvariantEvery:     100 * time.Millisecond,
 		PendingPlaceWithin: 2 * time.Second,
+		EventRetention:     10000,
+		RecentEventLimit:   50,
 
 		QuarantineAttempts: 5,
 		QuarantineWindow:   60 * time.Second,

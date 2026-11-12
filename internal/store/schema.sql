@@ -3,8 +3,8 @@ PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
 
--- schema_version, scheduler_epoch: on every scheduler start, max(stored + 1, sim-clock unix ms),
--- so it still increases after the store is wiped (agents ignore older epochs)
+-- schema_version, scheduler_epoch: +1 on every scheduler start, and raised past the
+-- highest epoch any host reports (so it still increases after the store is wiped)
 CREATE TABLE meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
