@@ -26,6 +26,12 @@ func (g *loop) handle(_ time.Time, _ any) []Effect {
 // Run sends Register once, then heartbeats until cancellation. The caller owns
 // the endpoint; cancelling Run never closes somebody else's connection.
 func Run(ctx context.Context, c clock.Clock, cfg config.Config, ep api.Endpoint, p api.BootParams) {
+	RunObserved(ctx, c, cfg, ep, p, nil)
+}
+
+// RunObserved also exposes replies received on the actual guest channel for
+// the simulator's independent security observer. It never changes verdicts.
+func RunObserved(ctx context.Context, c clock.Clock, cfg config.Config, ep api.Endpoint, p api.BootParams, observe func(api.Envelope)) {
 	g := loop{params: p}
 	host := api.Addr{Kind: api.KindAgent, ID: p.Host, Host: p.Host, Rack: p.Rack}
 	send := func() {
@@ -40,9 +46,12 @@ func Run(ctx context.Context, c clock.Clock, cfg config.Config, ep api.Endpoint,
 		select {
 		case <-ctx.Done():
 			return
-		case _, ok := <-ep.Inbox():
+		case e, ok := <-ep.Inbox():
 			if !ok {
 				return
+			}
+			if observe != nil {
+				observe(e)
 			}
 		case <-ticker.C():
 			send()

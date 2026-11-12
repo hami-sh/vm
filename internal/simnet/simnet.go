@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
+	"sort"
 	"sync"
 	"time"
 
@@ -37,6 +38,7 @@ type Network struct {
 	latency         time.Duration
 	loss, duplicate float64
 	reorder         bool
+	reorderWindow   time.Duration
 	pending         []delivery
 	wake            chan struct{}
 	stop            chan struct{}
@@ -46,7 +48,7 @@ type Network struct {
 }
 
 func New(c clock.Clock, cfg config.Config, seed int64) *Network {
-	n := &Network{clock: c, rng: rand.New(rand.NewSource(seed)), endpoints: make(map[api.Addr]*endpoint), policies: make(map[policy]bool), racks: make(map[string]bool), links: make(map[link]bool), egress: make(map[string]bool), wake: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{}), capacity: cfg.GuestMsgMaxBytes}
+	n := &Network{clock: c, rng: rand.New(rand.NewSource(seed)), endpoints: make(map[api.Addr]*endpoint), policies: make(map[policy]bool), racks: make(map[string]bool), links: make(map[link]bool), egress: make(map[string]bool), wake: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{}), capacity: cfg.GuestMsgMaxBytes, reorderWindow: cfg.InvariantEvery}
 	n.policies[policy{api.KindScheduler, api.KindAgent, api.PortControl}] = true
 	n.policies[policy{api.KindAgent, api.KindScheduler, api.PortControl}] = true
 	n.policies[policy{api.KindGuest, api.KindAgent, api.PortVsock}] = true
@@ -170,7 +172,7 @@ func (e *endpoint) Send(to api.Addr, port api.Port, msg any) error {
 	for range copies {
 		delay := n.latency
 		if n.reorder {
-			delay += time.Duration(n.rng.Int63n(int64(max(n.latency, time.Nanosecond))))
+			delay += time.Duration(n.rng.Int63n(int64(max(n.latency, n.reorderWindow))))
 		}
 		if delay == 0 {
 			n.deliver(target, env)
@@ -198,6 +200,7 @@ func (n *Network) run() {
 		n.mu.Lock()
 		now := n.clock.Now()
 		var next time.Time
+		sort.SliceStable(n.pending, func(i, j int) bool { return n.pending[i].at.Before(n.pending[j].at) })
 		keep := n.pending[:0]
 		for _, d := range n.pending {
 			if !d.at.After(now) {

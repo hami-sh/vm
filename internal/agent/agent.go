@@ -15,17 +15,18 @@ import (
 )
 
 type instance struct {
-	start    api.StartVM
-	slot     api.SlotState
-	state    api.VMState
-	last     time.Time
-	window   time.Time
-	count    int
-	blocked  []time.Time
-	cancel   context.CancelFunc
-	bootDone chan struct{}
-	pending  *api.StartVM
-	reason   string
+	start     api.StartVM
+	slot      api.SlotState
+	state     api.VMState
+	last      time.Time
+	window    time.Time
+	count     int
+	blocked   []time.Time
+	cancel    context.CancelFunc
+	bootDone  chan struct{}
+	recovered bool
+	pending   *api.StartVM
+	reason    string
 }
 type Effect struct {
 	To      api.Addr
@@ -34,18 +35,28 @@ type Effect struct {
 	Work    func(context.Context) any
 }
 type completion struct {
-	id   string
-	gen  int64
-	stop bool
-	err  error
+	revision uint64
+	id       string
+	gen      int64
+	stop     bool
+	err      error
 }
 type tick struct{}
+type recovered struct {
+	revision uint64
+	powerOff bool
+	reply    chan<- error
+	vms      []api.DriverVM
+	params   map[string]api.StartVM
+	err      error
+}
 type query struct{ reply chan<- Snapshot }
 type control struct {
 	paused, cordoned *bool
 	down             *bool
 	skew             *time.Duration
 	attack, vm       string
+	reply            chan<- error
 }
 type Snapshot struct {
 	Host      api.Host
@@ -74,6 +85,7 @@ type Agent struct {
 	down             bool
 	skew             time.Duration
 	security         api.SecurityStatus
+	revision         uint64
 }
 
 // New constructs the actor; call Run exactly once. Endpoint identity must be
@@ -88,7 +100,7 @@ func (a *Agent) Run(ctx context.Context) {
 	defer ticker.Stop()
 	leases := a.clock.NewTicker(a.cfg.InvariantEvery)
 	defer leases.Stop()
-	a.execute([]Effect{a.report(api.RegisterHost{HostID: a.ep.Addr().ID, Rack: a.ep.Addr().Rack, Slots: min(2, a.cfg.SlotsPerHost), DiskFull: a.diskFull(), Inventory: a.inventory()})})
+	a.execute([]Effect{a.report(api.RegisterHost{HostID: a.ep.Addr().ID, Rack: a.ep.Addr().Rack, Slots: min(2, a.cfg.SlotsPerHost), DiskFull: a.diskFull(), Inventory: a.inventory(), Epoch: a.epoch})})
 	for {
 		// Give deadlines priority even with a permanently readable guest inbox.
 		select {
@@ -134,11 +146,19 @@ func (a *Agent) Snapshot(ctx context.Context) (Snapshot, error) {
 }
 func (a *Agent) Kill(ctx context.Context) error {
 	on := true
-	return a.command(ctx, control{down: &on})
+	result, err := actor.Ask(ctx, a.inbox, func(reply chan<- error) any { return control{down: &on, reply: reply} })
+	if err != nil {
+		return err
+	}
+	return result
 }
 func (a *Agent) Restart(ctx context.Context) error {
 	on := false
-	return a.command(ctx, control{down: &on})
+	result, err := actor.Ask(ctx, a.inbox, func(reply chan<- error) any { return control{down: &on, reply: reply} })
+	if err != nil {
+		return err
+	}
+	return result
 }
 func (a *Agent) SetClockSkew(ctx context.Context, skew time.Duration) error {
 	return a.command(ctx, control{skew: &skew})
@@ -177,7 +197,7 @@ func (a *Agent) diskFull() bool {
 func (a *Agent) inventory() []api.InventoryItem {
 	out := make([]api.InventoryItem, 0, len(a.vms))
 	for id, v := range a.vms {
-		out = append(out, api.InventoryItem{VMID: id, Generation: v.start.Generation, State: v.state, Pool: v.start.Spec.Pool})
+		out = append(out, api.InventoryItem{VMID: id, Generation: v.start.Generation, State: v.state, Pool: v.start.Spec.Pool, IdempotencyKey: v.start.IdempotencyKey, RequestHash: v.start.RequestHash})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].VMID < out[j].VMID })
 	return out
@@ -187,14 +207,14 @@ func (a *Agent) heartbeat() []Effect {
 		return nil
 	}
 	a.seq++
-	return []Effect{a.report(api.HostHeartbeat{HostID: a.ep.Addr().ID, Seq: a.seq, DiskFull: a.diskFull(), Inventory: a.inventory()})}
+	return []Effect{a.report(api.HostHeartbeat{HostID: a.ep.Addr().ID, Seq: a.seq, DiskFull: a.diskFull(), Inventory: a.inventory(), Epoch: a.epoch})}
 }
 func (a *Agent) execute(effects []Effect) {
 	for _, e := range effects {
 		if e.Work != nil {
 			a.workers.Add(1)
 			actor.Work(a.ctx, a.inbox, func(ctx context.Context) any { defer a.workers.Done(); return e.Work(ctx) })
-		} else {
+		} else if !a.down {
 			_ = a.ep.Send(e.To, e.Port, e.Message)
 		}
 	}
@@ -233,10 +253,18 @@ func (a *Agent) start(now time.Time, m api.StartVM) []Effect {
 	a.vms[m.VMID] = v
 	a.highest[m.VMID] = m.Generation
 	p := api.BootParams{VMID: m.VMID, Generation: m.Generation, Token: m.Token, Host: a.ep.Addr().ID, Rack: a.ep.Addr().Rack}
+	revision := a.revision
 	return []Effect{a.result(m, true, ""), {Work: func(context.Context) any {
 		defer close(v.bootDone)
-		err := a.driver.Start(bootCtx, m.Spec, p)
-		return completion{id: m.VMID, gen: m.Generation, err: err}
+		var err error
+		if d, ok := a.driver.(interface {
+			StartCommand(context.Context, api.StartVM, api.BootParams) error
+		}); ok {
+			err = d.StartCommand(bootCtx, m, p)
+		} else {
+			err = a.driver.Start(bootCtx, m.Spec, p)
+		}
+		return completion{revision: revision, id: m.VMID, gen: m.Generation, err: err}
 	}}}
 }
 func (a *Agent) release(v *instance, reason string) []Effect {
@@ -248,10 +276,11 @@ func (a *Agent) release(v *instance, reason string) []Effect {
 	v.state = api.VMTerminating
 	v.reason = reason
 	id, gen, done := v.start.VMID, v.start.Generation, v.bootDone
+	revision := a.revision
 	return []Effect{{Work: func(ctx context.Context) any {
 		<-done
 		err := a.driver.Stop(ctx, id, gen)
-		return completion{id: id, gen: gen, stop: true, err: err}
+		return completion{revision: revision, id: id, gen: gen, stop: true, err: err}
 	}}}
 }
 func (a *Agent) unhealthy(v *instance, reason string) []Effect {
@@ -276,9 +305,23 @@ func (a *Agent) blocked(now time.Time, v *instance, attack string) []Effect {
 	}
 	return out
 }
-func (a *Agent) handle(now time.Time, msg any) []Effect {
+func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 	switch m := msg.(type) {
 	case api.Envelope:
+		if _, ok := m.Msg.(api.GuestRegister); ok && m.From.Kind == api.KindGuest && m.Port == api.PortVsock && !a.down {
+			defer func() {
+				reason := "unknown_or_releasing_guest"
+				for _, e := range effects {
+					if _, ok := e.Message.(api.GuestRegisterResult); ok {
+						return
+					}
+					if r, ok := e.Message.(api.SecurityReport); ok {
+						reason = r.Attack
+					}
+				}
+				effects = append(effects, Effect{To: m.From, Port: api.PortVsock, Message: api.GuestRegisterResult{Accepted: false, Reason: reason}})
+			}()
+		}
 		if a.down {
 			return nil
 		}
@@ -347,6 +390,9 @@ func (a *Agent) handle(now time.Time, msg any) []Effect {
 			if g.Generation != v.start.Generation || subtle.ConstantTimeCompare([]byte(g.Token), []byte(v.start.Token)) != 1 {
 				return a.blocked(now, v, api.AttackReplay)
 			}
+			if v.state == api.VMUnhealthy {
+				return nil
+			}
 			v.state = api.VMReady
 			v.slot = api.SlotOccupied
 			v.last = now
@@ -361,10 +407,19 @@ func (a *Agent) handle(now time.Time, msg any) []Effect {
 			if v.state == api.VMReady {
 				v.last = now
 			}
+			if v.recovered {
+				v.recovered = false
+				v.state = api.VMReady
+				v.last = now
+				return []Effect{a.report(api.ReadyReport{HostID: a.ep.Addr().ID, VMID: m.From.ID, Generation: v.start.Generation})}
+			}
 		default:
 			return a.blocked(now, v, api.AttackControl)
 		}
 	case completion:
+		if m.revision != a.revision {
+			return nil
+		}
 		v := a.vms[m.id]
 		if v == nil || v.start.Generation != m.gen {
 			return nil
@@ -405,16 +460,51 @@ func (a *Agent) handle(now time.Time, msg any) []Effect {
 			a.skew = *m.skew
 		}
 		if m.down != nil {
-			a.down = *m.down
-			if a.down {
-				var out []Effect
+			powerOff, reply := *m.down, m.reply
+			var boots []<-chan struct{}
+			if powerOff {
 				for _, v := range a.vms {
-					v.pending = nil
-					out = append(out, a.release(v, api.ReasonHostLost)...)
+					v.cancel()
+					boots = append(boots, v.bootDone)
 				}
-				return out
 			}
-			return []Effect{a.report(api.RegisterHost{HostID: a.ep.Addr().ID, Rack: a.ep.Addr().Rack, Slots: min(2, a.cfg.SlotsPerHost), DiskFull: a.diskFull(), Inventory: a.inventory()})}
+			// Lose actor memory, but never cancel an incarnation on process
+			// restart. The driver, not scheduler memory, supplies recovery data.
+			a.down = true
+			a.revision++
+			revision := a.revision
+			clear(a.vms)
+			clear(a.highest)
+			a.epoch = 0
+			a.seq = 0
+			a.paused = false
+			a.cordoned = false
+			return []Effect{{Work: func(ctx context.Context) any {
+				for _, done := range boots {
+					<-done
+				}
+				vms, err := a.driver.List(ctx)
+				if powerOff && err == nil {
+					for _, v := range vms {
+						if stopErr := a.driver.Stop(ctx, v.VMID, v.Generation); stopErr != nil {
+							err = stopErr
+							break
+						}
+					}
+					vms = nil
+				}
+				params := make(map[string]api.StartVM)
+				if source, ok := a.driver.(interface {
+					LaunchInfo(string, int64) (api.StartVM, bool)
+				}); ok {
+					for _, v := range vms {
+						if cmd, ok := source.LaunchInfo(v.VMID, v.Generation); ok {
+							params[v.VMID] = cmd
+						}
+					}
+				}
+				return recovered{revision: revision, powerOff: powerOff, reply: reply, vms: vms, params: params, err: err}
+			}}}
 		}
 		if m.paused != nil {
 			a.paused = *m.paused
@@ -425,6 +515,32 @@ func (a *Agent) handle(now time.Time, msg any) []Effect {
 		if v := a.vms[m.vm]; v != nil && m.attack != "" && v.slot != api.SlotReleasing {
 			return a.blocked(now, v, m.attack)
 		}
+	case recovered:
+		if m.revision != a.revision {
+			m.reply <- context.Canceled
+			return nil
+		}
+		if m.err != nil {
+			m.reply <- m.err
+			return nil
+		}
+		if m.powerOff {
+			m.reply <- nil
+			return nil
+		}
+		for _, actual := range m.vms {
+			cmd, ok := m.params[actual.VMID]
+			if !ok {
+				cmd = api.StartVM{VMID: actual.VMID, Generation: actual.Generation}
+			}
+			done := make(chan struct{})
+			close(done)
+			a.vms[actual.VMID] = &instance{start: cmd, slot: api.SlotOccupied, state: api.VMBooting, last: now, cancel: func() {}, bootDone: done, recovered: actual.Running}
+			a.highest[actual.VMID] = actual.Generation
+		}
+		a.down = false
+		m.reply <- nil
+		return []Effect{a.report(api.RegisterHost{HostID: a.ep.Addr().ID, Rack: a.ep.Addr().Rack, Slots: min(2, a.cfg.SlotsPerHost), DiskFull: a.diskFull(), Inventory: a.inventory(), Epoch: a.epoch})}
 	case query:
 		h := api.Host{ID: a.ep.Addr().ID, Rack: a.ep.Addr().Rack, SlotCount: min(2, a.cfg.SlotsPerHost), AdminState: api.AdminActive, Lease: api.LeaseHealthy}
 		if a.cordoned {
