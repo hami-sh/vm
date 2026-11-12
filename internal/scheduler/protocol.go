@@ -68,9 +68,12 @@ func (p *planner) receive(from api.Addr, msg any) {
 		p.reconcile(id, m.Inventory, rejoin)
 		// Missing/older inventory cannot acknowledge a command that was
 		// dropped. Retry its exact incarnation until admission is observed.
-		for _, res := range p.reservations {
+		for vmID, res := range p.reservations {
 			if res.host == id && !res.admitted {
+				res.command.Epoch = p.epoch
 				p.send(id, res.command)
+				res.retryAt = p.now.Add(p.cfg.CommandRetryEvery).UnixMilli()
+				p.reservations[vmID] = res
 			}
 		}
 	case api.StartVMResult:
@@ -148,6 +151,7 @@ func (p *planner) receive(from api.Addr, msg any) {
 		if m.HostID != id {
 			return
 		}
+		delete(p.stops, stoppedCopy{id, m.VMID, m.Generation})
 		p.removeCopy(id, m.VMID, m.Generation)
 		if m.Reason == api.ReasonQuarantined {
 			p.quarantine(m.VMID)
@@ -262,6 +266,21 @@ func (p *planner) reconcile(hostID string, inventory []api.InventoryItem, strict
 	h := p.hosts[hostID]
 	h.inventory = append([]api.InventoryItem(nil), inventory...)
 	p.hosts[hostID] = h
+	for copy := range p.stops {
+		if copy.host != hostID {
+			continue
+		}
+		found := false
+		for _, item := range inventory {
+			if item.VMID == copy.id && item.Generation == copy.gen {
+				found = true
+				break
+			}
+		}
+		if !found {
+			delete(p.stops, copy)
+		}
+	}
 	seen := map[string]bool{}
 	stale := []api.InventoryItem{}
 	for _, i := range inventory {
