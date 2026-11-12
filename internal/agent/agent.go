@@ -245,7 +245,15 @@ func (a *Agent) result(m api.StartVM, admitted bool, reason string) Effect {
 	return a.report(api.StartVMResult{VMID: m.VMID, Generation: m.Generation, HostID: a.ep.Addr().ID, Admitted: admitted, Reason: reason})
 }
 func (a *Agent) start(now time.Time, m api.StartVM) []Effect {
+	for key := range a.quarantined {
+		if key.id == m.VMID {
+			return []Effect{a.result(m, false, api.ReasonQuarantined)}
+		}
+	}
 	if v := a.vms[m.VMID]; v != nil {
+		if v.reason == api.ReasonQuarantined {
+			return []Effect{a.result(m, false, api.ReasonQuarantined)}
+		}
 		if m.Generation < v.start.Generation {
 			return []Effect{a.result(m, false, api.ReasonStale)}
 		}
