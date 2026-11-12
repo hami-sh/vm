@@ -19,6 +19,16 @@ type Checker struct {
 	seq            int64
 }
 
+// Observation comes from the agent actor and its independent driver.List, not
+// from the scheduler's cached inventory. Connected is the scheduler's lease
+// observation; a disconnected host is allowed to retain fenced stale copies.
+type Observation struct {
+	Host      api.Host
+	Actual    []api.DriverVM
+	Connected bool
+	Security  api.SecurityStatus
+}
+
 func New(c config.Config) *Checker {
 	return &Checker{cfg: c, gen: map[string]int64{}, stale: map[string]int64{}, pending: map[string]int64{}, status: map[api.InvariantName]api.InvariantStatus{}}
 }
@@ -31,7 +41,7 @@ func (c *Checker) Status() []api.InvariantStatus {
 	}
 	return out
 }
-func (c *Checker) Check(s api.Snapshot) []api.Event {
+func (c *Checker) Check(s api.Snapshot, observations ...Observation) []api.Event {
 	var out []api.Event
 	bad := func(n api.InvariantName, detail string) {
 		v := c.status[n]
@@ -59,25 +69,31 @@ func (c *Checker) Check(s api.Snapshot) []api.Event {
 	auth := map[string]int{}
 	staleNow := map[string]int64{}
 	free := false
-	for _, h := range s.Hosts {
+	for _, o := range observations {
+		h := o.Host
 		used := 0
+		counted := map[string]bool{}
 		for _, slot := range h.Slots {
 			if slot.State != api.SlotFree {
 				used++
+				counted[fmt.Sprintf("%s/%d", slot.VMID, slot.Generation)] = true
 			} else if h.Lease == api.LeaseHealthy && h.AdminState == api.AdminActive {
 				free = true
 			}
-			v, ok := byID[slot.VMID]
-			if ok && v.State == api.VMReady && slot.Generation == v.Generation && slot.State == api.SlotOccupied {
+		}
+		for _, actual := range o.Actual {
+			if !actual.Running {
+				continue
+			}
+			if !counted[fmt.Sprintf("%s/%d", actual.VMID, actual.Generation)] {
+				used++
+			}
+			v, ok := byID[actual.VMID]
+			if ok && v.State == api.VMReady && actual.Generation == v.Generation {
 				auth[v.ID]++
 			}
-		}
-		if used > h.SlotCount {
-			bad(api.InvSlotCapacity, h.ID)
-		}
-		if h.Lease == api.LeaseHealthy {
-			for _, v := range h.Stale {
-				key := fmt.Sprintf("%s/%s/%d", h.ID, v.VMID, v.Generation)
+			if ok && actual.Generation < v.Generation && o.Connected {
+				key := fmt.Sprintf("%s/%s/%d", h.ID, actual.VMID, actual.Generation)
 				at, ok := c.stale[key]
 				if !ok {
 					at = s.At
@@ -87,6 +103,12 @@ func (c *Checker) Check(s api.Snapshot) []api.Event {
 					bad(api.InvStaleStopped, key)
 				}
 			}
+		}
+		if used > h.SlotCount {
+			bad(api.InvSlotCapacity, h.ID)
+		}
+		if o.Security.Succeeded > 0 {
+			bad(api.InvNoAttackSuccess, "successful guest attack on "+h.ID)
 		}
 	}
 	c.stale = staleNow

@@ -51,6 +51,14 @@ type Config struct {
 	// Demo
 	DefaultSpeed float64
 	MaxSpeed     float64
+
+	// Chaos rates are attempts per simulation second at intensity 1.
+	AmbientEvery    time.Duration
+	ChaosBaseRates  map[string]float64
+	AttackerEvery   time.Duration
+	PresetHealAfter time.Duration
+	PresetStepEvery time.Duration
+	LoadPriorityMix [3]float64 // interactive, standard, batch weights
 }
 
 // Default is the configuration the demo and the scenarios use.
@@ -86,6 +94,18 @@ func Default() Config {
 		MaxVMs: 60, ChaosPerIP: 500 * time.Millisecond, IdleResetAfter: 15 * time.Minute,
 
 		DefaultSpeed: 2, MaxSpeed: 50,
+		AmbientEvery:    100 * time.Millisecond,
+		AttackerEvery:   2 * time.Second,
+		PresetHealAfter: 30 * time.Second,
+		PresetStepEvery: 15 * time.Second,
+		LoadPriorityMix: [3]float64{.2, .5, .3},
+		ChaosBaseRates: map[string]float64{
+			"kill-guestd": .05, "crash-vm": .02, "hang-next-boot": .02, "slow-boot": .02, "compromise": .01,
+			"kill-host": .01, "pause-heartbeats": .01, "restart-host": .02, "clock-skew": .01, "fill-disk": .01, "cordon": .01,
+			"partition-rack": .005, "one-way-partition": .01, "latency-spike": .02, "packet-loss": .02, "duplicate-messages": .02, "reorder-messages": .02,
+			"kill-scheduler": .005, "wipe-store": .001, "slow-store": .01, "flood": .01, "sustained-load": .01, "burst-after-rack-loss": .005,
+			"add-rack": .001, "remove-rack": .001,
+		},
 	}
 }
 
