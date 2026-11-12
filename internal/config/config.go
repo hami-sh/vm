@@ -41,7 +41,7 @@ type Config struct {
 	PendingPlaceWithin time.Duration // invariant 8
 	// TimeToReadyTarget is the p99 time-to-Ready target drawn on the chart
 	// (api.LatencyStats.TargetMs). Plan: 2x the 0%-chaos interactive p99
-	// baseline. Placeholder until W5 measures that baseline.
+	// baseline. Measured at 5x under -race; see COORDINATION.md.
 	TimeToReadyTarget time.Duration
 	EventRetention    int // events rows kept in SQLite
 	RecentEventLimit  int // events carried per snapshot
@@ -95,7 +95,7 @@ func Default() Config {
 		SSEEvery:           500 * time.Millisecond,
 		InvariantEvery:     100 * time.Millisecond,
 		PendingPlaceWithin: 2 * time.Second,
-		TimeToReadyTarget:  12 * time.Second,
+		TimeToReadyTarget:  12034 * time.Millisecond,
 		EventRetention:     10000,
 		RecentEventLimit:   50,
 

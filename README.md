@@ -29,7 +29,7 @@ The default is four concurrent isolated fleets. On the 16-vCPU / 31-GiB verifica
 
 The runner defaults to **5×**, including under `-race`. Explicit `--speed 0` calibrates the complete suite at 5× and 50× with the same seeds. Different liveness pass rates select 5×; this includes time-bounded invariants 2 (stale-copy stop deadline) and 8 (prompt placement). Any violation of invariant 1 or 3–7 at either speed fails calibration: reducing speed must never conceal those safety bugs. Failures at both speeds also stop calibration. Use `--speed` for an explicit diagnostic override, `--seed` to choose the seed range, `--parallel` to cap isolated systems and `--output` to choose the recording directory. Seeds reproduce fault choices, not goroutine scheduling. Recovery latency is measured from Lost/Unhealthy to Ready transition events, not snapshots, which can miss transient lifecycle states.
 
-Each `runs/<id>/` contains:
+Each recorded run contains the following files. `vmctl verify` writes `runs/<id>/` by default; `make verify` keeps each batch under `runs/verify-*/` and copies the latest successful batch to `runs/latest/` for the release image. Failed batches remain available and never replace that image evidence.
 
 | File | Contents |
 | --- | --- |
@@ -111,6 +111,10 @@ Railway runs a Linux container, **not macOS VMs**. The fake hypervisor models bo
 ## Deployment
 
 The multi-stage Dockerfile builds a static `CGO_ENABLED=0` binary with `golang:1.27`, then runs it as non-root in `gcr.io/distroless/static`. Railway serves `$PORT`, checks `/healthz`, runs one replica and has sleep disabled. SQLite and recordings live on ephemeral local disk, without a volume: redeploys lose demo state. This is deliberate and not a production durability design. Deploy credentials stay outside the repository and container.
+
+Run `make verify` in the deployment build context before building or uploading the image. The Dockerfile embeds `runs/latest/` at `/runs` and sets `RUNS_DIR=/runs`; `.dockerignore` excludes earlier/failed batches and Git metadata. The files are owned by the non-root runtime user so dashboard-started recordings can share that directory. A source-only build still works but has no bundled evidence; a Git-only deploy cannot include ignored local recordings. For an approved release, upload the verified workspace with `railway up --no-gitignore --service controlplane`; `.railwayignore` includes only the latest batch while excluding historical runs, databases and local scratch files. Without `--no-gitignore`, the CLI's normal Git-ignore handling excludes the recordings.
+
+The 0%-chaos interactive baseline at 5× under `-race` is p99 **6017 ms** (340 boots, 20 seeds, 17/24 slots per seed). The configured chart target is twice that, **12034 ms** of simulation time. This is a measured baseline and target, not a claim that the 50%-chaos readiness SLA has already been verified.
 
 ## What's next
 

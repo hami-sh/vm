@@ -1,0 +1,9 @@
+.git
+.amp
+bin
+*.db
+*.db-wal
+*.db-shm
+runs/*
+!runs/latest
+!runs/latest/**
