@@ -44,3 +44,57 @@ Append-only. Each entry: time (AEDT), author (workstream), and one of STATUS / B
   - The same VM reported by two hosts: keep the highest generation and stop the others (fencing). Equal generations on two hosts: keep the first report, stop the second, alert.
   - New VM IDs must never collide with adopted ones: the ID allocator moves past every adopted ID, or IDs are random.
 - 2026-11-12, lead, DECISION: scheduler surface for fleet assembly is approved: `store.Open(path)`, `scheduler.New(ctx, cfg, clock, transport, store)` implementing `api.ControlPlane`, plus `Snapshot(ctx)`, `SetDown(ctx, bool)` and `SetHostAdmin(ctx, id, state)`. "Kill scheduler" must drop in-memory state: W3's fleet cancels the scheduler's ctx and restart builds a new scheduler from the same store file, so restarts really read SQLite. "Wipe store" deletes the file before the restart. `SetDown` is only the 503 window between the two.
+
+### W2 surface — 2026-11-12 AEDT, W2, STATUS (early assembly surface)
+
+```go
+// internal/simnet
+func New(c clock.Clock, cfg config.Config, seed int64) *Network
+func (*Network) Attach(api.Addr) (api.Endpoint, error)
+func (*Network) SetLatency(time.Duration)
+func (*Network) SetPacketLoss(float64) // fraction 0..1
+func (*Network) SetDuplicate(float64)  // fraction 0..1
+func (*Network) SetReorder(bool)
+func (*Network) PartitionRack(rack string, on bool) // false heals
+func (*Network) PartitionOneWay(from, to api.Addr, on bool) // false heals
+func (*Network) SetPolicy(from, to api.AddrKind, port api.Port, allow bool)
+func (*Network) AllowEgress(host string, allow bool) // exact proxy destination
+func (*Network) Close()
+
+// internal/agent
+func New(cfg config.Config, c clock.Clock, ep api.Endpoint, scheduler api.Addr, d api.Driver) *Agent
+func (*Agent) Run(context.Context) // caller starts goroutine, once per instance
+func (*Agent) Done() <-chan struct{}
+func (*Agent) Kill(context.Context) error // disables commands/HBs, cancels guests, cleans disks
+func (*Agent) Restart(context.Context) error // re-registers, preserves generation fences
+func (*Agent) PauseHeartbeats(context.Context, bool) error // false resumes; guests continue
+func (*Agent) Cordon(context.Context, bool) error
+func (*Agent) SetClockSkew(context.Context, time.Duration) error
+func (*Agent) RecordBlocked(ctx context.Context, vm, attack string) error
+func (*Agent) Snapshot(context.Context) (Snapshot, error)
+type Snapshot struct {
+    Host api.Host // actual actor-owned slots, including Releasing
+    Inventory []api.InventoryItem // includes Spec.Pool
+    Actual []api.DriverVM // Driver.List independent of scheduler; Running identifies live VMs
+    Security api.SecurityStatus // Blocked, Succeeded, ByAttack
+    Epoch int64
+    ClockSkew time.Duration // lease durations stay monotonic despite wall-clock skew
+}
+
+// internal/driver
+func NewFake(c clock.Clock, cfg config.Config, n api.Transport, seed int64) *Fake
+// *Fake implements api.Driver (Start, Stop, List, Exits).
+func (*Fake) KillGuest(vm string)
+func (*Fake) Crash(vm string)
+func (*Fake) HangNextBoot()
+func (*Fake) SlowBoot(factor float64) // persistent per-host factor; 1 resets
+func (*Fake) FillDisk(full bool) // host admission refusal; false heals
+func (*Fake) DiskFull() bool
+func (*Fake) WriteDisk(vm string, mb int) error // per-VM quota
+func (*Fake) GuestSend(vm string, to api.Addr, port api.Port, msg any) error
+func (*Fake) Close()
+```
+
+Fleet wiring: attach scheduler at `api.Addr{Kind: api.KindScheduler, ID: "scheduler"}`. Agent addresses must use `api.Addr{Kind: api.KindAgent, ID: hostID, Host: hostID, Rack: rackID}`. Guest addresses are created by Fake from BootParams. For a one-way host partition call PartitionOneWay(agentAddr,schedulerAddr,true) or its reverse; latency/loss/duplicate/reorder are global. For compromise, W3 cycles attacks through GuestSend: it uses the VM's existing real endpoint and cannot spoof Envelope.From. Report ErrDenied network attempts and WriteDisk quota errors with Agent.RecordBlocked; do not count successful attacks as blocked. Guest-protocol attacks are counted by the agent itself. Snapshot's actor/driver reads are separate observations (allow one heartbeat of cross-component slack). Cancel Run and await Done before Network.Close. Kill/Restart are physical-host faults; PauseHeartbeats is the gray failure retaining live VMs.
+
+Implementation is compiling under Go 1.27.4; security/lifecycle regression tests and Tart/guestd are still in progress. No done-when claim yet.
