@@ -85,6 +85,18 @@ func Catalog() []Scenario {
 	return s
 }
 
+// TargetScenario is an opt-in measurement, not a quieter replacement for the
+// bad-day preset. Fixed offered load isolates the 70%-load readiness target.
+func TargetScenario() Scenario {
+	cfg := config.Default()
+	return Scenario{
+		Name: "target-50pct-chaos", Topology: Topology{cfg.Racks, cfg.HostsPerRack, cfg.SlotsPerHost},
+		Load: Load{17, "interactive"}, Duration: 90 * time.Second,
+		Timeline: []Step{{0, ambientTarget}},
+		Expect:   []Check{Always("invariants", NoInvariantViolations)},
+	}
+}
+
 // Observe the exact victims before power-off; unrelated recoveries, skipped
 // generations, normal-priority retries and a reversed queue must not pass.
 func hostReplacement(host string) Predicate {
@@ -197,5 +209,17 @@ func compromiseThree(ctx context.Context, f System) error {
 func ambient(ctx context.Context, f System) error {
 	intensity := 0.5
 	_, err := f.Sim(ctx, "chaos", api.SimRequest{Intensity: &intensity})
+	return err
+}
+
+func ambientTarget(ctx context.Context, f System) error {
+	intensity := 0.5
+	filters := []string{}
+	for _, action := range f.Catalog().Actions {
+		if action.Ambient && action.Layer != "load" && action.Layer != "topology" {
+			filters = append(filters, action.Name)
+		}
+	}
+	_, err := f.Sim(ctx, "chaos", api.SimRequest{Intensity: &intensity, Filters: filters})
 	return err
 }
