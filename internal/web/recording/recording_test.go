@@ -31,6 +31,73 @@ func readLines[T any](t *testing.T, path string) []T {
 	return out
 }
 
+func TestRecordedLatencyMetrics(t *testing.T) {
+	root := t.TempDir()
+	w, err := Create(filepath.Join(root, "known-times"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := api.Snapshot{At: 1000, VMs: []api.VM{{ID: "slow", CreatedAt: 150}, {ID: "fast", CreatedAt: 300}},
+		Recent: []api.Event{{Seq: 1, At: 900, Kind: api.EventTransition, VMID: "slow", To: api.VMReady}}}
+	final := initial
+	final.At = 52000
+	final.Latency = map[string]api.LatencyStats{"interactive": {P99Ms: 120000, Samples: 99}}
+	final.Recent = []api.Event{
+		{Seq: 2, At: 2000, Kind: api.EventTransition, VMID: "slow", To: api.VMLost},
+		{Seq: 3, At: 3000, Kind: api.EventTransition, VMID: "slow", To: api.VMUnhealthy},
+		{Seq: 4, At: 3500, Kind: api.EventTransition, VMID: "fast", To: api.VMUnhealthy},
+		{Seq: 5, At: 6000, Kind: api.EventTransition, VMID: "fast", To: api.VMReady},
+		{Seq: 6, At: 9000, Kind: api.EventTransition, VMID: "slow", To: api.VMReady},
+		{Seq: 7, At: 10000, Kind: api.EventTransition, VMID: "slow", To: api.VMLost},
+		{Seq: 8, At: 12000, Kind: api.EventTransition, VMID: "slow", To: api.VMReady},
+	}
+	// Both sources overlap, and a repeated snapshot must not count recovery twice.
+	for _, s := range []api.Snapshot{initial, final, final} {
+		if err := w.Snapshot(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, e := range final.Recent {
+		if err := w.Event(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacy := api.RunReport{RunSummary: api.RunSummary{ID: "known-times"}, Metrics: map[string]float64{"p99_ready_ms": 120000}}
+	if err := w.WriteReport(legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assert := func(r api.RunReport) {
+		t.Helper()
+		// Recovery samples: 2500, 7000, 2000. First Ready: 5700, 8850.
+		if r.P99RecoverMs != 7000 || r.Metrics["p99_recover_ms"] != 7000 || r.Metrics["p99_ready_ms"] != 8850 || r.Metrics["recovery_samples"] != 3 || r.Metrics["ready_samples"] != 2 {
+			t.Fatalf("recorded metrics: %+v", r)
+		}
+	}
+	var stored api.RunReport
+	b, err := os.ReadFile(filepath.Join(w.Dir(), ReportFile))
+	if err != nil || json.Unmarshal(b, &stored) != nil {
+		t.Fatalf("read report: %v", err)
+	}
+	assert(stored)
+	// Reads of an old report must compute the same values without migrating it.
+	b, _ = json.Marshal(legacy)
+	if err := os.WriteFile(filepath.Join(w.Dir(), ReportFile), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Report(root, "known-times")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert(r)
+	list, err := List(root)
+	if err != nil || len(list) != 1 || list[0].P99RecoverMs != 7000 {
+		t.Fatalf("summary: %+v, %v", list, err)
+	}
+}
+
 func TestWriterRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	w, err := Create(filepath.Join(root, "run-a"))

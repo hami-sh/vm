@@ -134,7 +134,12 @@ func (w *Writer) Close() error {
 
 // WriteReport writes report.json atomically (write to a temp file, then
 // rename), so the Runs page never reads a half-written report.
-func (w *Writer) WriteReport(r api.RunReport) error { return WriteReport(w.dir, r) }
+func (w *Writer) WriteReport(r api.RunReport) error {
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	return WriteReport(w.dir, r)
+}
 
 // Follow records every snapshot and event src publishes until ctx is done,
 // then flushes. Run it in its own goroutine; Close the writer afterwards.
@@ -173,6 +178,9 @@ func (w *Writer) Follow(ctx context.Context, src api.SnapshotSource) error {
 
 // WriteReport writes dir/report.json atomically.
 func WriteReport(dir string, r api.RunReport) error {
+	if err := recordedMetrics(dir, &r); err != nil {
+		return err
+	}
 	b, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
 		return err
@@ -228,7 +236,9 @@ func Report(root, id string) (api.RunReport, error) {
 	if r.ID == "" {
 		r.ID = id
 	}
-	return r, nil
+	// Recompute legacy reports too; no migration or mutation on a GET.
+	err = recordedMetrics(dir, &r)
+	return r, err
 }
 
 // List returns the summary of every run under root that has a report,

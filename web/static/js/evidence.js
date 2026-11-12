@@ -160,8 +160,8 @@ function chart(s, st, v) {
       <text x="${X0}" y="${H - 6}">${span[0]}</text><text x="${X1}" y="${H - 6}" text-anchor="end">${span[1]}</text>
     </svg>
     <div class="chart-legend">
-      <span><i style="--c:var(--booting)"></i>p50 <b>${now.samples ? secs(now.p50_ms) : '–'}</b></span>
-      <span><i style="--c:#e8edf4"></i>p99 <b class="${over ? 'over' : ''}">${now.samples ? secs(now.p99_ms) : '–'}</b></span>
+      <span title="Live scheduler histogram; the top bucket is a lower bound, not an exact latency"><i style="--c:var(--booting)"></i>p50 <b>${now.samples ? (now.p50_ms >= 120000 ? '≥120 s' : secs(now.p50_ms)) : '–'}</b></span>
+      <span title="Live scheduler histogram; the top bucket is a lower bound, not an exact latency"><i style="--c:#e8edf4"></i>p99 <b class="${over ? 'over' : ''}">${now.samples ? (now.p99_ms >= 120000 ? '≥120 s' : secs(now.p99_ms)) : '–'}</b></span>
       <span><i class="box" style="--c:var(--terminating)"></i>queue history</span>
       <span><i class="box" style="--c:var(--warn)"></i>chaos intensity</span>
       <span class="faint">${now.samples} sample${now.samples === 1 ? '' : 's'}</span>

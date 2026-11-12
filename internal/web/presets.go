@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -82,24 +81,11 @@ func (s *Server) recordPreset(ctx context.Context, w *recording.Writer, id, acti
 	for _, inv := range initial.Invariants {
 		baseline[inv.Name] = inv.Violations
 	}
-	lost := map[string]int64{}
-	var recoveries []int64
 	addEvent := func(e api.Event) error {
 		if e.At < initial.At || seen[e.Seq] {
 			return nil
 		}
 		seen[e.Seq] = true
-		if e.Kind == api.EventTransition {
-			if e.To == api.VMLost || e.To == api.VMUnhealthy {
-				if _, ok := lost[e.VMID]; !ok {
-					lost[e.VMID] = e.At
-				}
-			}
-			if at, ok := lost[e.VMID]; ok && e.To == api.VMReady && e.At >= at {
-				recoveries = append(recoveries, e.At-at)
-				delete(lost, e.VMID)
-			}
-		}
 		if e.Kind == api.EventChaos || e.Kind == api.EventInvariant {
 			report.Markers = append(report.Markers, e)
 		}
@@ -169,13 +155,6 @@ loop:
 	report.Violations = max(report.Violations, violations)
 	report.Checks = append(report.Checks, api.CheckResult{Name: "zero invariant violations during recording", Passed: report.Violations == 0})
 	report.Passed = completed && report.Violations == 0
-	// Recoveries belong to this recording, not the scheduler's lifetime histogram.
-	report.Metrics["recovery_samples"] = float64(len(recoveries))
-	if len(recoveries) > 0 {
-		slices.Sort(recoveries)
-		report.P99RecoverMs = recoveries[(len(recoveries)*99-1)/100]
-		report.Metrics["p99_recover_ms"] = float64(report.P99RecoverMs)
-	}
 	if err = w.Flush(); err != nil {
 		return err
 	}
