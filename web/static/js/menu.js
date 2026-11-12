@@ -1,7 +1,7 @@
 // Explicit fault menus for inspected components. Nothing here knows the action names in advance
 // except the small tables of defaults below.
 import { $, esc, mount, vmName, plural } from './util.js';
-import { state, update } from './store.js';
+import { state, update, view } from './store.js';
 import { api, attempt } from './api.js';
 
 const LAYERS = [
@@ -156,10 +156,14 @@ function build(m, s, catalog) {
   </div>`;
 }
 
+function guestCurrent(m, s) {
+  return m.layer !== 'guest' || (s.vms.some((vm) => vm.id === m.id && vm.host === m.host && vm.gen === m.gen) && s.hosts.some((h) => h.id === m.host && h.lease === 'healthy'));
+}
+
 export function render(st, v) {
   const el = $('#menu');
   const m = st.menu;
-  if (!m || v.playback || !v.snapshot) {
+  if (!m || v.playback || !v.snapshot || !guestCurrent(m, v.snapshot)) {
     mount(el, '');
     return;
   }
@@ -184,18 +188,22 @@ export const actions = {
   pick(el) {
     const { kind, id } = el.dataset;
     update((st) => {
-      st.selection = { kind, id };
+      st.selection = kind === 'guest' ? { kind, id, host: el.dataset.host, gen: Number(el.dataset.gen) } : { kind, id };
       st.menu = null;
     });
   },
   'open-menu'(el, e) {
-    const { kind, id = '', layer } = el.dataset;
-    update((st) => (st.menu = { kind, id, layer, ...anchor(el, e) }));
+    const { kind, id = '', layer, host, gen } = el.dataset;
+    update((st) => (st.menu = { kind, id, layer, host, gen: Number(gen), ...anchor(el, e) }));
   },
   'menu-close': () => update((st) => (st.menu = null)),
   chaos(el) {
     const m = state.menu;
     if (!m) return;
+    if (!guestCurrent(m, view().snapshot)) {
+      update((st) => (st.menu = null));
+      return;
+    }
     const name = el.dataset.action;
     let params;
     if (el.dataset.off) {

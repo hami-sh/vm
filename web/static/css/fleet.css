@@ -3,6 +3,10 @@
 
 .fleet-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; padding: 8px 12px; font-size: 11px; }
 .fleet-heading > :last-child { margin-left: auto; }
+.fleet-scroll-hint { display: none; color: var(--accent); }
+.has-overflow .fleet-scroll-hint { display: inline; }
+.has-overflow .fleet-heading { position: sticky; top: 0; z-index: 2; background: var(--panel); }
+.fleet-panel { scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: var(--line-2) var(--panel); }
 .control-plane { display: grid; justify-items: center; padding: 2px 12px 0; }
 .sched {
   display: flex; align-items: center; gap: 12px; width: min(390px, 100%); padding: 8px 12px;
@@ -72,7 +76,10 @@
   display: grid; place-items: center; min-height: 50px; border: 1px dashed var(--line-2); border-radius: 5px;
   color: var(--faint); font-size: 10px; text-align: center;
 }
-.slot-free.orphan { color: var(--warn); border-color: var(--warn); text-transform: none; font-family: var(--mono); }
+.slot-copy { display: grid; align-content: start; gap: 3px; padding: 6px; border: 1px dashed var(--line-2); border-radius: 5px; color: var(--warn); font-size: 10px; overflow-wrap: anywhere; }
+.copy-note { color: var(--dim); line-height: 1.4; }
+.copy-current, .copy-guest { padding: 3px 0; background: none; border: 0; color: var(--accent); font: inherit; text-align: left; cursor: pointer; }
+.copy-current:hover, .copy-guest:hover { text-decoration: underline; }
 
 .vm {
   display: grid; align-content: center; gap: 1px; height: 40px; min-width: 0; padding: 3px 7px 3px 6px;

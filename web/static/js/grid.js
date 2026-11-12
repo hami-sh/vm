@@ -28,15 +28,22 @@ export function vmChip(vm, st, slotState) {
   </button>`;
 }
 
-function slot(sl, vms, st) {
+function slot(sl, h, vms, st) {
   if (!sl.vm_id) return `<span class="slot-free" title="An available VM slot on this physical host">Empty VM slot</span>`;
   const vm = vms.get(sl.vm_id);
-  if (vm) return `<div class="vm-instance${isSel(st, 'guest', vm.id) ? ' guest-selected' : ''}">
+  if (vm && vm.host === h.id && vm.gen === sl.gen && h.lease === 'healthy') return `<div class="vm-instance${isSel(st, 'guest', vm.id) && st.selection.host === h.id && st.selection.gen === sl.gen ? ' guest-selected' : ''}">
     ${vmChip(vm, st, sl.state)}
-    <button class="guest-node" data-act="pick" data-kind="guest" data-id="${esc(vm.id)}" title="Inspect guestd inside ${esc(vmName(vm.id))}. It reports readiness and heartbeats to this host’s agent, not the scheduler."><span aria-hidden="true">↳</span> guestd <span aria-hidden="true">›</span></button>
+    <button class="guest-node" data-act="pick" data-kind="guest" data-id="${esc(vm.id)}" data-host="${esc(h.id)}" data-gen="${sl.gen}" title="Inspect guestd inside ${esc(vmName(vm.id))}. It reports readiness and heartbeats to this host’s agent, not the scheduler."><span aria-hidden="true">↳</span> guestd <span aria-hidden="true">›</span></button>
   </div>`;
-  // The host holds a slot for a VM the scheduler no longer lists.
-  return `<span class="slot-free orphan" title="${esc(sl.vm_id)} · ${esc(sl.state)}">${esc(vmName(sl.vm_id))} g${sl.gen ?? '?'}</span>`;
+  // Slot inventory is host-local evidence, not the logical VM's current incarnation.
+  const stale = (vm && sl.gen < vm.gen) || (h.stale || []).some((x) => x.vm_id === sl.vm_id && x.gen === sl.gen);
+  return `<div class="slot-copy${isSel(st, 'guest', sl.vm_id) && st.selection.host === h.id && st.selection.gen === sl.gen ? ' guest-selected' : ''}">
+    <span class="mono">${esc(vmName(sl.vm_id))} · g${sl.gen ?? '?'}</span>
+    <span>${stale ? 'Stale copy' : 'Unverified copy'}</span>
+    <span class="copy-note">${h.lease !== 'healthy' ? `Host lease ${esc(h.lease)}; last reported slot` : 'Host-reported slot; not current placement'}</span>
+    <button class="copy-guest" data-act="pick" data-kind="guest" data-id="${esc(sl.vm_id)}" data-host="${esc(h.id)}" data-gen="${sl.gen}" title="Inspect this host-local guestd observation, not a replacement process">guestd · g${sl.gen} →</button>
+    ${vm ? `<button class="copy-current" data-act="pick" data-kind="vm" data-id="${esc(vm.id)}" title="Inspect the current logical VM, not this host-local copy: generation ${vm.gen}, ${esc(vm.host || 'unplaced')}">Current VM g${vm.gen} →</button>` : ''}
+  </div>`;
 }
 
 function hostCard(h, vms, st) {
@@ -54,7 +61,7 @@ function hostCard(h, vms, st) {
       <button class="agent-node${isSel(st, 'agent', h.id) ? ' sel' : ''}" data-act="pick" data-kind="agent" data-id="${esc(h.id)}" title="Inspect the host agent on ${esc(h.id)} · lease ${esc(h.lease)} · last accepted heartbeat ${dur(h.lease_age_ms)} ago. Admits VMs, owns the driver and receives guestd reports."><i></i>Host agent${h.lease !== 'healthy' ? ` · ${esc(h.lease)}` : ''}<span aria-hidden="true">›</span></button>
     </div>
     ${tags.length ? `<div class="tags">${tags.join('')}</div>` : ''}
-    <div class="slots" style="--n:${Math.max(1, h.slots.length)}">${h.slots.map((sl) => slot(sl, vms, st)).join('')}</div>
+    <div class="slots" style="--n:${Math.max(1, h.slots.length)}">${h.slots.map((sl) => slot(sl, h, vms, st)).join('')}</div>
     ${stale ? `<div class="stales">${stale}</div>` : ''}
   </section>`;
 }
@@ -113,7 +120,7 @@ export function render(st, v) {
     `<header class="fleet-heading">
       <h2>${st.source?.startsWith('Fixture') ? 'Fixture fleet' : 'Fleet topology'}</h2>
       <span class="dim">${plural(s.racks.length, 'rack')} · ${plural(s.hosts.filter((h) => h.admin_state !== 'removed').length, 'host')}</span>
-      <span class="dim">Click any component to inspect</span>
+      <span class="dim">Click any component to inspect<span class="fleet-scroll-hint"> · Scroll inside topology for more hosts ↓</span></span>
     </header>
     <div class="control-plane">
       <button class="sched${isSel(st, 'scheduler', 'scheduler') ? ' sel' : ''}" style="--c:${SCHED[sched] || 'var(--faint)'}" data-act="pick" data-kind="scheduler" data-id="scheduler" title="Inspect scheduler status, authority epoch and recent history">
@@ -124,4 +131,5 @@ export function render(st, v) {
     <div class="racks">${s.racks.map((r) => rackCol(r, hosts, vms, st)).join('')}</div>
     ${unplaced(s, st)}`,
   );
+  el.classList.toggle('has-overflow', el.scrollHeight > el.clientHeight + 8);
 }
