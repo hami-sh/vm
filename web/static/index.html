@@ -1,1 +1,53 @@
-<!doctype html><title>vm control plane</title><p>Dashboard not built yet.
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>macOS VM control plane</title>
+<link rel="stylesheet" href="/css/base.css">
+<link rel="stylesheet" href="/css/fleet.css">
+<link rel="stylesheet" href="/css/panels.css">
+<link rel="stylesheet" href="/css/runs.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#/"><span class="brand-mark"></span>macOS VM control plane</a>
+  <nav class="nav" id="nav"></nav>
+  <div class="sim" id="sim"></div>
+  <div class="topbar-right" id="topright"></div>
+</header>
+
+<div class="statusbar" id="status"></div>
+<div id="runbar"></div>
+
+<main class="layout" id="dash">
+  <div class="col-main">
+    <section class="panel fleet-panel" id="fleet"></section>
+    <section class="panel controls" id="controls"></section>
+    <div class="row-bottom">
+      <section class="panel log-panel">
+        <header class="panel-head">
+          <h2>Events</h2>
+          <div class="log-kinds" id="log-kinds"></div>
+          <!-- Static so typing isn't interrupted by a re-render. -->
+          <input class="input log-filter" id="log-filter" type="search" placeholder="rack, host or VM id" spellcheck="false" autocomplete="off">
+        </header>
+        <div class="log" id="log"></div>
+      </section>
+      <section class="panel detail-panel" id="detail"></section>
+    </div>
+  </div>
+  <aside class="col-side">
+    <section class="panel report-panel" id="report" hidden></section>
+    <section class="panel evidence" id="evidence"></section>
+    <section class="panel queue" id="queue"></section>
+  </aside>
+</main>
+
+<main class="runs-page" id="runs" hidden></main>
+
+<div id="menu"></div>
+<div class="toasts" id="toasts"></div>
+<script type="module" src="/js/app.js"></script>
+</body>
+</html>
