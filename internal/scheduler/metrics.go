@@ -165,6 +165,9 @@ func (p *planner) snapshot() api.Snapshot {
 	for c := api.PriorityInteractive; c <= api.PriorityBatch; c++ {
 		h := p.metrics.hist["vm_time_to_ready_seconds"][c]
 		l := api.LatencyStats{Samples: int(h.count)}
+		if c != api.PriorityBatch {
+			l.TargetMs = p.cfg.TimeToReadyTarget.Milliseconds()
+		}
 		if h.count > 0 {
 			l.P50Ms = quantile(h, .5)
 			l.P99Ms = quantile(h, .99)

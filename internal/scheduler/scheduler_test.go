@@ -117,6 +117,9 @@ func TestPlacementSpreadsEachPoolAndBoundsCapacity(t *testing.T) {
 		}
 	}
 	s := h.step(request{op: "snapshot"}).response.value.(api.Snapshot)
+	if s.Latency["interactive"].TargetMs != h.s.cfg.TimeToReadyTarget.Milliseconds() || s.Latency["standard"].TargetMs != h.s.cfg.TimeToReadyTarget.Milliseconds() || s.Latency["batch"].TargetMs != 0 {
+		t.Fatal("incorrect latency targets")
+	}
 	if s.Counters.ByState[api.VMReady] != 24 || len(s.Queue) != 6 {
 		t.Fatalf("ready=%d queued=%d", s.Counters.ByState[api.VMReady], len(s.Queue))
 	}
