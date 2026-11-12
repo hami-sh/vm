@@ -331,6 +331,9 @@ func restartProgress(base Scenario, create bool) Scenario {
 			return true
 		}
 		run.Expect = append(append([]Check(nil), base.Expect...), observe, check)
+		if !create {
+			run = badDayProgress(run)
+		}
 		return run
 	}
 	return base

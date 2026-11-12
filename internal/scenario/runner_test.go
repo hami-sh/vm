@@ -19,6 +19,80 @@ import (
 	"github.com/hami-sh/vm/internal/config"
 )
 
+func TestBadDayPostRestartAdmission(t *testing.T) {
+	for _, fault := range []string{"", "late placement", "lower class", "wrong host", "no final Ready", "unrelated loss"} {
+		t.Run(fault, func(t *testing.T) {
+			initial := snapshot(0, api.VMReady)
+			initial.Hosts[0].Lease, initial.Hosts[0].AdminState = api.LeaseHealthy, api.AdminActive
+			initial.VMs = []api.VM{
+				{ID: "delete-a", HostID: "r1-h1", State: api.VMReady, Desired: api.DesiredRunning},
+				{ID: "delete-b", HostID: "r1-h1", State: api.VMReady, Desired: api.DesiredRunning},
+				{ID: "serving", HostID: "r1-h2", State: api.VMReady, Desired: api.DesiredRunning},
+			}
+			initial.Hosts = append(initial.Hosts, api.Host{ID: "r1-h2", SlotCount: 2, Lease: api.LeaseHealthy, AdminState: api.AdminActive})
+			for i, id := range []string{"interactive", "standard", "batch"} {
+				v := api.VM{ID: id, State: api.VMPending, Desired: api.DesiredRunning, Priority: api.Priority(i + 1), CreatedAt: int64(i+1) * 1000}
+				initial.VMs = append(initial.VMs, v)
+				initial.Queue = append(initial.Queue, api.QueueEntry{VMID: id, Priority: v.Priority, EffectivePriority: v.Priority, EnqueuedAt: v.CreatedAt})
+			}
+			final := initial
+			final.At, final.VMs = 90000, append([]api.VM(nil), initial.VMs...)
+			final.Queue = initial.Queue[2:]
+			final.VMs[0].State, final.VMs[0].Desired = api.VMTerminated, api.DesiredDeleted
+			final.VMs[1].State, final.VMs[1].Desired = api.VMTerminated, api.DesiredDeleted
+			final.VMs[3].State, final.VMs[4].State = api.VMReady, api.VMReady
+			if fault == "unrelated loss" {
+				final.VMs[2].State = api.VMPending
+			}
+			if fault == "no final Ready" {
+				final.VMs[3].State, final.VMs[4].State = api.VMBooting, api.VMBooting
+			}
+			events := []api.Event{
+				{Kind: api.EventAdmission, VMID: "interactive", At: 1000, Detail: "queued"},
+				{Kind: api.EventAdmission, VMID: "standard", At: 2000, Detail: "queued"},
+				{Kind: api.EventAdmission, VMID: "batch", At: 3000, Detail: "queued"},
+				{Kind: api.EventChaos, At: 12000, Detail: "clock-skew r1-h2"},
+				{Kind: api.EventTransition, VMID: "delete-a", HostID: "r1-h1", At: 45000, To: api.VMTerminating},
+				{Kind: api.EventTransition, VMID: "delete-b", HostID: "r1-h1", At: 45000, To: api.VMTerminating},
+				{Kind: api.EventTransition, VMID: "delete-a", HostID: "r1-h1", At: 45001, To: api.VMTerminated},
+				{Kind: api.EventTransition, VMID: "delete-b", HostID: "r1-h1", At: 45001, To: api.VMTerminated},
+				{Kind: api.EventTransition, VMID: "interactive", HostID: "r1-h1", At: 50000, From: api.VMPending, To: api.VMBooting},
+				{Kind: api.EventTransition, VMID: "standard", HostID: "r1-h1", At: 60000, From: api.VMPending, To: api.VMBooting},
+			}
+			switch fault {
+			case "late placement":
+				events[9].At++ // The exact BootDeadline boundary above must pass.
+			case "lower class":
+				events[8].VMID = "batch"
+			case "wrong host":
+				events[9].HostID = "r1-h2"
+			}
+			f := &overloadFleet{fakeFleet: &fakeFleet{initial: initial, frames: []api.Snapshot{initial, final}, events: events}}
+			run := Catalog()[13].NewRun()
+			// Populate shared action state before buffered event delivery, as the
+			// real Timeline does. This fixture emits no unrelated chaos actions.
+			for _, at := range []time.Duration{40 * time.Second, 45 * time.Second} {
+				f.initial.At = at.Milliseconds()
+				for _, step := range run.Timeline {
+					if step.At == at {
+						if err := step.Do(context.Background(), f); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+			}
+			f.initial.At = 0
+			run.Timeline, run.Topology, run.Load.Count = nil, Topology{1, 2, 2}, 0
+			r, err := Run(context.Background(), run, func(context.Context, Scenario, int64, float64) (System, func(), error) {
+				return f, func() {}, nil
+			}, 1, 5, t.TempDir())
+			if err != nil || r.Passed != (fault == "") || f.deleted != 2 {
+				t.Fatalf("fault=%s deleted=%d checks=%+v err=%v", fault, f.deleted, r.Checks, err)
+			}
+		})
+	}
+}
+
 func TestOverloadPriorityAfterCapacityRelease(t *testing.T) {
 	for _, fault := range []string{"", "aging respected", "lower class placed", "FIFO bypass", "interactive shed", "wrong class shed", "queue inverted", "unintended loss", "no 429", "queue not refilled"} {
 		t.Run(fault, func(t *testing.T) {
