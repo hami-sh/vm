@@ -1,6 +1,6 @@
 # macOS VM control plane
 
-A Go control plane for macOS VMs across three racks, four hosts per rack and two VM slots per host. Readiness comes from a checked guest registration, placement is persisted before commands are sent, and generations fence stale copies. The [live deployment](https://controlplane-production-0652d599.up.railway.app) serves the real dashboard, assembled simulated fleet, SSE and recorded-run playback, not the initial health stub. The current release candidate has two green full gates, but has not met the three-consecutive-green rule: see the verification status below. Built as five parallel workstreams; see [COORDINATION.md](COORDINATION.md).
+A Go control plane for macOS VMs across three racks, four hosts per rack and two VM slots per host. Readiness comes from a checked guest registration, placement is persisted before commands are sent, and generations fence stale copies. The [live deployment](https://controlplane-production-0652d599.up.railway.app) serves the real dashboard, assembled simulated fleet, SSE and recorded-run playback, not the initial health stub. Release candidate adbff52 has passed three consecutive full gates; this is verification evidence, not a claim that the candidate is deployed. See the verification status below. Built as five parallel workstreams; see [COORDINATION.md](COORDINATION.md).
 
 ## Try this: a 60-second tour
 
@@ -25,7 +25,7 @@ go run ./cmd/vmctl verify --scenario rack-partition --repeat 50 --speed 1
 make e2e
 ```
 
-The default is four concurrent isolated fleets. On the 16-vCPU / 31-GiB verification orb, use `make verify VERIFY_PARALLEL=8`; this changes concurrency only, not speeds, repeats or thresholds.
+The default is four concurrent isolated fleets. The three release gates used `make verify VERIFY_PARALLEL=4` on the 16-vCPU / 31-GiB verification orb with a 1 Hz CPU/load/steal sampler and no competing workload; concurrency does not change speeds, repeats or thresholds.
 
 The runner defaults to **5×**, including under `-race`. Explicit `--speed 0` compares the complete suite at 5× and 50× with the same seeds. Any failed 5× baseline returns an error. Only a green baseline with high-speed-only liveness failures can select 5×; invariants 2 and 8 are time-bounded, but every other invariant (including idempotency uniqueness) is safety and can never be calibrated away. Use `--speed` for a diagnostic override, `--seed` to choose the seed range, `--parallel` to cap isolated systems and `--output` to choose the recording directory. Seeds reproduce fault choices, not goroutine scheduling. Eventually is evaluated at the final frame, not latched from an earlier good state. Recovery metrics use Lost/Unhealthy → Ready events; unrecovered VMs are counted separately as `recovery_failures`, not zero-latency samples. Any source event-sequence gap fails the recording.
 
@@ -132,21 +132,25 @@ The stale-copy bound (one heartbeat) is checked only while the host is `Connecte
 
 ### Verification status and remaining fixes
 
-The original 14×20 green gate is historical, not proof of recovery. The integrated recovery fixes and stronger checks are in backend [b4d1895](https://github.com/hami-sh/vm/commit/b4d18950c40ac8b2e43ebabecfc8bd1b2561ba93). It passed two consecutive full gates at 5× under `-race`, including uncached vet/package tests and HTTP/SSE e2e: `runs/verify-tfrtVO` and `runs/verify-NVgCT3`, each **300/300** (all 15 scenarios 20/20), in **798.00 s** and **798.12 s** respectively. Main [5d3493c](https://github.com/hami-sh/vm/commit/5d3493c45dfd18637cc1f873f163a28edb6d7ae6) adds the QA-approved dashboard only; its backend is identical, but that dashboard revision was not part of these full gates.
+Exact integrated main [adbff52](https://github.com/hami-sh/vm/commit/adbff5212395d06f9c9d6ada8c8d9aea47347e15), including the QA-approved dashboard, timer-driven command retry, registration ordering and causal inventory floors, passed three consecutive full gates. Every gate ran uncached vet/all-package race tests, real HTTP/SSE e2e and all 15 scenarios at 5× under `-race`, seeds 1–20, parallel 4, with 1 Hz telemetry and no competing workload.
 
-Gate 3 on b4d1895, `runs/verify-YAnYel`, finished **291/300 in 804.36 s**. Host-dies seeds 1–8 failed after spurious guest lease expiries on healthy hosts caused extra clean recycles beyond gen+1; the cause remains under investigation. Isolated `-race` controls subsequently passed seeds 1–8 at 5× with parallel 8 and parallel 1, and seed 1 at 1×, with no guest lease expiries. No CPU/load telemetry was logged during the original failing wave, so contention is not established as its cause. Bad-day seed 14 had two invariant-2 stale-copy stop deadline events after a scripted delete under packet loss: a lost StopVM is resent only when the next heartbeat round trip arrives; W1 is adding independent resends. All other scenarios were 20/20. No invariant 1 or 3–9 failure was recorded; the time-bounded invariant-2 failure remains a failed gate, not a waived assertion.
+| Gate | Batch | Result | Elapsed |
+| --- | --- | --- | --- |
+| 1 | `runs/verify-9saIuL` | 300/300; every scenario 20/20 | 1513.69 s |
+| 2 | `runs/verify-wD4leB` | 300/300; every scenario 20/20 | 1513.21 s |
+| 3 | `runs/verify-0rbZAF` | 300/300; every scenario 20/20 | 1512.76 s |
 
-**The three-consecutive-green rule is not yet met.** No check, lease, speed or bound has been relaxed. The lead explicitly approved releasing the integrated backend and QA-approved dashboard with evidence from the latest green gate, `verify-NVgCT3`, while these timing failures are fixed. The release bundle is evidence for that backend gate, not a claim that gate 3 or the new dashboard passed a full gate. Herd's documented never-Ready loss remains visible as `recovery_failures=1` per run; bad-day's Ready-cohort recovery passed with zero unrecovered VMs.
+**The three-consecutive-green rule is met for adbff52.** All 900 reports and source streams were audited; no invariant violations or source gaps were recorded. The release bundle comes only from gate 3, `verify-0rbZAF`. Herd's documented never-Ready loss remains visible as `recovery_failures=1` per run; bad-day's Ready-cohort recovery passed with zero unrecovered VMs. Store-wipe absences of previously Ready rows remain a separate gate-failing condition, not a waived metric or a claim that the six-second adoption window recovers unreachable hosts. Historical red gates remain red; this result does not prove the cause of every earlier timing failure or certify the separate target-50pct-chaos measurement above.
 
 The strengthened W5 checks require attributed blocked attacks to end in quarantine without later Ready, and every compromised generation to stop in raw driver observations. They also exercise partition at 10 s → wipe at 12 s → retry at 30 s → heal at 40 s, with further retries at 60/80 s. Reachable keys retain their IDs; late keys may receive new IDs, but subsequent retries must remain bound to those IDs, with no duplicate desired-running VM and no adoption of the late original. Physical stale-copy assertions require raw checker observations, never the scheduler's cached `Host.Stale`. Final-frame assertions, every-victim recovery, post-restart placement, event-gap rejection, honest missing-recovery counts and plan-faithful preset timelines remain enforced.
 
 ### Release sequence (approval required)
 
-The normal release rule requires three consecutive passing `make verify` runs (including e2e). For the explicitly approved exception documented above, regenerate evidence from `verify-NVgCT3`, not the failed gate 3. Use a production-scoped project token in `RAILWAY_TOKEN`, not the workspace `RAILWAY_API_TOKEN`; do not paste either into the repository or a thread. Run this sequence in the release workspace containing the ignored recordings, not a fresh Git-only checkout. When transferring the release archive, verify its published SHA256 and extract its `runs/latest/` tree instead of regenerating from an unavailable full batch.
+The three consecutive passing gates above authorize preparing evidence, not deployment. Use exact adbff52 plus this README-only status update. The verified evidence archive is `w5-adbff52-evidence.tar.gz`, built from `verify-0rbZAF`. Verify the archive against the SHA256 published with the release handoff, extract its `runs/latest/` tree into the release workspace and check its per-file manifest; the archive also contains all three gates' logs, audits and telemetry. Do not regenerate from an unavailable full batch or use a fresh Git-only checkout without the ignored recordings. If the full gate-3 batch is present, the first command below can regenerate the same bundle. Use a production-scoped project token in `RAILWAY_TOKEN`, not the workspace `RAILWAY_API_TOKEN`; do not paste either into the repository or a thread. Deployment still requires explicit approval.
 
 ```sh
 set -e
-go run ./cmd/vmctl bundle --input runs/verify-NVgCT3 --output runs/latest
+go run ./cmd/vmctl bundle --input runs/verify-0rbZAF --output runs/latest
 test "$(find runs/latest -mindepth 2 -maxdepth 2 -name report.json | wc -l)" -eq 15
 docker build -t vm-controlplane:verified .
 : "${RAILWAY_TOKEN:?Set the production project token securely before uploading}"
