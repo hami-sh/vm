@@ -85,7 +85,7 @@ drained:
 			case api.AttackEastWest:
 				err = ep.Send(api.Addr{Kind: api.KindGuest, ID: "neighbour", Host: host.ID, Rack: host.Rack}, api.PortGuest, []byte("attack"))
 			case api.AttackControl:
-				err = ep.Send(schedulerAddrForAttack(), api.PortControl, api.HostHeartbeat{HostID: host.ID})
+				err = ep.Send(api.Addr{Kind: api.KindScheduler, ID: "scheduler"}, api.PortControl, api.HostHeartbeat{HostID: host.ID})
 			case api.AttackEgress:
 				err = ep.Send(api.Addr{Kind: api.KindInternet, ID: "attacker.invalid"}, api.PortHTTPS, []byte("exfiltrate"))
 			case api.AttackDiskFill:
@@ -94,6 +94,11 @@ drained:
 			if a == api.AttackImpersonate || a == api.AttackReplay || a == api.AttackFlood {
 				if err == nil {
 					pending = a
+					timeout.Stop()
+					select {
+					case <-timeout.C():
+					default:
+					}
 					timeout.Reset(cfg.GuestLeaseTTL)
 					continue
 				}
@@ -109,4 +114,3 @@ drained:
 		}
 	}
 }
-func schedulerAddrForAttack() api.Addr { return api.Addr{Kind: api.KindScheduler, ID: "scheduler"} }

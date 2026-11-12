@@ -4,6 +4,7 @@ package invariant
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/hami-sh/vm/internal/api"
@@ -12,11 +13,13 @@ import (
 )
 
 type Checker struct {
-	cfg            config.Config
-	gen            map[string]int64
-	stale, pending map[string]int64
-	status         map[api.InvariantName]api.InvariantStatus
-	seq            int64
+	cfg                  config.Config
+	gen                  map[string]int64
+	stale, pending       map[string]int64
+	duplicates, capacity map[string]int64
+	replacements         map[string]bool
+	status               map[api.InvariantName]api.InvariantStatus
+	seq                  int64
 }
 
 // Observation comes from the agent actor and its independent driver.List, not
@@ -30,7 +33,7 @@ type Observation struct {
 }
 
 func New(c config.Config) *Checker {
-	return &Checker{cfg: c, gen: map[string]int64{}, stale: map[string]int64{}, pending: map[string]int64{}, status: map[api.InvariantName]api.InvariantStatus{}}
+	return &Checker{cfg: c, gen: map[string]int64{}, stale: map[string]int64{}, pending: map[string]int64{}, duplicates: map[string]int64{}, capacity: map[string]int64{}, replacements: map[string]bool{}, status: map[api.InvariantName]api.InvariantStatus{}}
 }
 func (c *Checker) Status() []api.InvariantStatus {
 	out := make([]api.InvariantStatus, 0, 8)
@@ -41,16 +44,25 @@ func (c *Checker) Status() []api.InvariantStatus {
 	}
 	return out
 }
+func (c *Checker) violation(n api.InvariantName, at int64, detail string) api.Event {
+	v := c.status[n]
+	v.Name = n
+	v.Violations++
+	v.LastAt = at
+	v.LastDetail = detail
+	c.status[n] = v
+	return api.Event{At: at, Kind: api.EventInvariant, Detail: string(n) + ": " + detail}
+}
+
+// EventsLost makes retention gaps visible instead of silently declaring an
+// incomplete transition log legal.
+func (c *Checker) EventsLost(at int64) api.Event {
+	return c.violation(api.InvLegalTransitions, at, "events lost")
+}
 func (c *Checker) Check(s api.Snapshot, observations ...Observation) []api.Event {
 	var out []api.Event
 	bad := func(n api.InvariantName, detail string) {
-		v := c.status[n]
-		v.Name = n
-		v.Violations++
-		v.LastAt = s.At
-		v.LastDetail = detail
-		c.status[n] = v
-		out = append(out, api.Event{At: s.At, Kind: api.EventInvariant, Detail: string(n) + ": " + detail})
+		out = append(out, c.violation(n, s.At, detail))
 	}
 	byID := map[string]api.VM{}
 	for _, v := range s.VMs {
@@ -62,13 +74,14 @@ func (c *Checker) Check(s api.Snapshot, observations ...Observation) []api.Event
 			bad(api.InvGenMonotonic, v.ID)
 		}
 		c.gen[v.ID] = max(c.gen[v.ID], v.Generation)
-		if v.Priority == api.PriorityReplacement && v.LastReason == api.ReasonShed {
+		if (v.Priority == api.PriorityReplacement || c.replacements[v.ID]) && v.LastReason == api.ReasonShed {
 			bad(api.InvQueueBounded, "replacement shed: "+v.ID)
 		}
 	}
 	auth := map[string]int{}
 	staleNow := map[string]int64{}
 	free := false
+	capacityNow := map[string]int64{}
 	for _, o := range observations {
 		h := o.Host
 		used := 0
@@ -77,10 +90,11 @@ func (c *Checker) Check(s api.Snapshot, observations ...Observation) []api.Event
 			if slot.State != api.SlotFree {
 				used++
 				counted[fmt.Sprintf("%s/%d", slot.VMID, slot.Generation)] = true
-			} else if h.Lease == api.LeaseHealthy && h.AdminState == api.AdminActive {
+			} else if h.Lease == api.LeaseHealthy && h.AdminState == api.AdminActive && !slices.Contains(h.Faults, "fill-disk") {
 				free = true
 			}
 		}
+		slotUsed := used
 		for _, actual := range o.Actual {
 			if !actual.Running {
 				continue
@@ -104,17 +118,41 @@ func (c *Checker) Check(s api.Snapshot, observations ...Observation) []api.Event
 				}
 			}
 		}
-		if used > h.SlotCount {
+		if slotUsed > h.SlotCount {
 			bad(api.InvSlotCapacity, h.ID)
+		} else if used > h.SlotCount {
+			at, ok := c.capacity[h.ID]
+			if !ok {
+				at = s.At
+			}
+			capacityNow[h.ID] = at
+			if s.At-at > c.cfg.HostHeartbeat.Milliseconds() {
+				bad(api.InvSlotCapacity, h.ID)
+			}
 		}
 		if o.Security.Succeeded > 0 {
 			bad(api.InvNoAttackSuccess, "successful guest attack on "+h.ID)
 		}
 	}
 	c.stale = staleNow
+	c.capacity = capacityNow
+	duplicateNow := map[string]int64{}
 	for id, n := range auth {
 		if n > 1 {
-			bad(api.InvOneAuthoritative, id)
+			at, ok := c.duplicates[id]
+			if !ok {
+				at = s.At
+			}
+			duplicateNow[id] = at
+			if s.At-at > c.cfg.HostHeartbeat.Milliseconds() {
+				bad(api.InvOneAuthoritative, id)
+			}
+		}
+	}
+	c.duplicates = duplicateNow
+	for _, q := range s.Queue {
+		if q.Reason == api.QueueReplace {
+			c.replacements[q.VMID] = true
 		}
 	}
 	if len(s.Queue) > c.cfg.QueueCap {
@@ -142,18 +180,21 @@ func (c *Checker) Check(s api.Snapshot, observations ...Observation) []api.Event
 		bad(api.InvNoAttackSuccess, "successful guest attack")
 	}
 	pendingNow := map[string]int64{}
+	queue := map[string]api.QueueEntry{}
 	for _, q := range s.Queue {
-		v, ok := byID[q.VMID]
-		if !ok || v.State != api.VMPending || q.NotBefore > s.At || !free || s.Scheduler != api.SchedulerUp {
+		queue[q.VMID] = q
+	}
+	for _, v := range s.VMs {
+		if v.State != api.VMPending || queue[v.ID].NotBefore > s.At || !free || s.Scheduler != api.SchedulerUp {
 			continue
 		}
-		at, ok := c.pending[q.VMID]
+		at, ok := c.pending[v.ID]
 		if !ok {
 			at = s.At
 		}
-		pendingNow[q.VMID] = at
+		pendingNow[v.ID] = at
 		if time.Duration(s.At-at)*time.Millisecond > c.cfg.PendingPlaceWithin+c.cfg.HostHeartbeat {
-			bad(api.InvPendingPlaced, q.VMID)
+			bad(api.InvPendingPlaced, v.ID)
 		}
 	}
 	c.pending = pendingNow

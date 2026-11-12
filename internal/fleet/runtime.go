@@ -12,6 +12,7 @@ import (
 	"github.com/hami-sh/vm/internal/actor"
 	"github.com/hami-sh/vm/internal/agent"
 	"github.com/hami-sh/vm/internal/api"
+	"github.com/hami-sh/vm/internal/chaos"
 	"github.com/hami-sh/vm/internal/clock"
 	"github.com/hami-sh/vm/internal/config"
 	"github.com/hami-sh/vm/internal/driver"
@@ -43,6 +44,33 @@ type observed struct {
 	raw      []invariant.Observation
 	epoch    int64
 }
+type eventBatch struct {
+	events    []api.Event
+	truncated bool
+}
+
+// Complete event reads are independent of lossy UI subscriptions and snapshot
+// Recent limits. The cursor belongs to the invariant/publisher actor.
+func (r *runtime) events(ctx context.Context, after int64) ([]api.Event, bool, error) {
+	v, err := r.call(ctx, func(ctx context.Context) (any, error) {
+		if r.down {
+			return eventBatch{}, nil
+		}
+		if source, ok := r.scheduler.(interface {
+			EventsSince(context.Context, int64) ([]api.Event, bool, error)
+		}); ok {
+			events, truncated, err := source.EventsSince(ctx, after)
+			return eventBatch{events, truncated}, err
+		}
+		return eventBatch{truncated: true}, nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	batch := v.(eventBatch)
+	return batch.events, batch.truncated, nil
+}
+
 type runtime struct {
 	ctx                context.Context
 	cfg                config.Config
@@ -59,13 +87,15 @@ type runtime struct {
 	schedulerCancel    context.CancelFunc
 	schedulerClose     func()
 	down               bool
-	epoch              int64
+	logIncarnation     int64
 	compromised        map[string]bool
 	success            api.SecurityStatus
+	cached             api.Snapshot
+	emit               func(api.Event)
 }
 
-func newRuntime(ctx context.Context, cfg config.Config, c clock.Clock, o Options) (*runtime, error) {
-	r := &runtime{ctx: ctx, cfg: cfg, clock: c, options: o, inbox: make(chan operation), done: make(chan struct{}), hosts: map[string]*host{}, compromised: map[string]bool{}, success: api.SecurityStatus{ByAttack: map[string]int{}}}
+func newRuntime(ctx context.Context, cfg config.Config, c clock.Clock, o Options, emit func(api.Event)) (*runtime, error) {
+	r := &runtime{ctx: ctx, cfg: cfg, clock: c, options: o, inbox: make(chan operation), done: make(chan struct{}), hosts: map[string]*host{}, compromised: map[string]bool{}, success: api.SecurityStatus{ByAttack: map[string]int{}}, emit: emit}
 	if r.options.SchedulerFactory == nil {
 		r.options.SchedulerFactory = newStandIn
 	}
@@ -137,6 +167,7 @@ func (r *runtime) restart(wipe bool) error {
 	}
 	r.down = true
 	if wipe {
+		r.logIncarnation++
 		for _, suffix := range []string{"", "-wal", "-shm"} {
 			if err := os.Remove(r.options.StorePath + suffix); err != nil && !os.IsNotExist(err) {
 				return err
@@ -153,7 +184,6 @@ func (r *runtime) restart(wipe bool) error {
 	r.scheduler = s
 	r.schedulerClose = close
 	r.down = false
-	r.epoch++
 	return nil
 }
 func (r *runtime) addRack(id string, n int) error {
@@ -184,9 +214,8 @@ func (r *runtime) addHost(rack, id string) error {
 		return &api.Error{Status: 429, Msg: "topology cap reached"}
 	}
 	if id == "" {
-		for {
-			r.nextHost++
-			id = fmt.Sprintf("%s-h%d", rack, r.nextHost)
+		for ordinal := 1; ; ordinal++ {
+			id = fmt.Sprintf("%s-h%d", rack, ordinal)
 			if r.hosts[id] == nil {
 				break
 			}
@@ -195,6 +224,7 @@ func (r *runtime) addHost(rack, id string) error {
 	if r.hosts[id] != nil {
 		return &api.Error{Status: 422, Msg: "host exists"}
 	}
+	r.nextHost++
 	addr := api.Addr{Kind: api.KindAgent, ID: id, Host: id, Rack: rack}
 	ep, err := r.transport.Attach(addr)
 	if err != nil {
@@ -222,13 +252,14 @@ func (r *runtime) observe(ctx context.Context) (api.Snapshot, []invariant.Observ
 	return o.snapshot, o.raw, o.epoch, nil
 }
 func (r *runtime) read(ctx context.Context) (observed, error) {
-	s := api.Snapshot{}
+	s := clone(r.cached)
 	if r.scheduler != nil && !r.down {
 		var err error
 		s, err = r.scheduler.Snapshot(ctx)
 		if err != nil {
 			return observed{}, err
 		}
+		r.cached = clone(s)
 	} else {
 		s.Scheduler = api.SchedulerDown
 	}
@@ -274,7 +305,7 @@ func (r *runtime) read(ctx context.Context) (observed, error) {
 	for i := range s.VMs {
 		s.VMs[i].Compromised = r.compromised[s.VMs[i].ID]
 	}
-	return observed{snapshot: s, raw: raw, epoch: r.epoch}, nil
+	return observed{snapshot: s, raw: raw, epoch: r.logIncarnation}, nil
 }
 func (r *runtime) Apply(ctx context.Context, action string, req api.ChaosRequest) error {
 	_, err := r.call(ctx, func(ctx context.Context) (any, error) { return nil, r.apply(ctx, action, req) })
@@ -296,6 +327,9 @@ func (r *runtime) apply(ctx context.Context, a string, q api.ChaosRequest) error
 	switch a {
 	case "kill-scheduler":
 		if r.scheduler != nil && !r.down {
+			if s, err := r.scheduler.Snapshot(ctx); err == nil {
+				r.cached = clone(s)
+			}
 			_ = r.scheduler.SetDown(ctx, true)
 			r.schedulerCancel()
 			r.schedulerClose()
@@ -345,7 +379,7 @@ func (r *runtime) apply(ctx context.Context, a string, q api.ChaosRequest) error
 		}
 		if a == "power-off-rack" {
 			for _, id := range r.racks[i].Hosts {
-				if err := r.hosts[id].agent.Kill(ctx); err != nil {
+				if err := r.apply(ctx, "kill-host", api.ChaosRequest{Target: id}); err != nil {
 					return err
 				}
 			}
@@ -355,6 +389,19 @@ func (r *runtime) apply(ctx context.Context, a string, q api.ChaosRequest) error
 			r.racks[i].Partitioned = on
 		}
 		return nil
+	}
+	if h == nil && (a == "cordon" || a == "uncordon") {
+		for _, rack := range r.racks {
+			if rack.ID != q.Target {
+				continue
+			}
+			for _, id := range rack.Hosts {
+				if err := r.apply(ctx, a, api.ChaosRequest{Target: id}); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 	}
 	if h == nil {
 		return &api.Error{Status: 404, Msg: "host or placed VM not found"}
@@ -413,11 +460,52 @@ func (r *runtime) apply(ctx context.Context, a string, q api.ChaosRequest) error
 	case "crash-vm":
 		h.driver.Crash(q.Target)
 	case "compromise":
-		r.compromised[q.Target] = true
+		v, err := r.scheduler.GetVM(ctx, q.Target)
+		if err != nil {
+			return err
+		}
+		if v.State != api.VMReady {
+			return &api.Error{Status: 422, Msg: "compromise requires a Ready VM"}
+		}
+		if d, ok := any(h.driver).(interface {
+			Compromise(string, func(context.Context, api.Endpoint)) error
+		}); ok {
+			err = d.Compromise(q.Target, func(guestCtx context.Context, ep api.Endpoint) {
+				chaos.RunAttacker(guestCtx, r.clock, r.cfg, ep, v.Generation, func(mb int) error { return h.driver.WriteDisk(v.ID, mb) }, func(out chaos.AttackOutcome) { r.attackOutcome(guestCtx, h, out) })
+			})
+			if err == nil {
+				r.compromised[q.Target] = true
+			}
+			return err
+		}
+		return &api.Error{Status: 501, Msg: "Compromise awaits W2 integration"}
 	default:
 		return &api.Error{Status: 422, Msg: "unknown component fault"}
 	}
 	return nil
+}
+func (r *runtime) attackOutcome(ctx context.Context, h *host, out chaos.AttackOutcome) {
+	_, err := r.call(ctx, func(ctx context.Context) (any, error) {
+		if out.Succeeded {
+			r.success.Succeeded++
+			r.success.ByAttack[out.Attack]++
+		}
+		if out.Blocked && !out.AgentCounted {
+			return nil, h.agent.RecordBlocked(ctx, out.VMID, out.Attack)
+		}
+		return nil, nil
+	})
+	if err != nil {
+		return
+	}
+	verdict := "unknown"
+	if out.Blocked {
+		verdict = "blocked"
+	}
+	if out.Succeeded {
+		verdict = "SUCCEEDED"
+	}
+	r.emit(api.Event{At: r.clock.Now().UnixMilli(), Kind: api.EventSecurity, VMID: out.VMID, HostID: h.addr.ID, Rack: h.addr.Rack, Detail: verdict + " " + out.Attack})
 }
 func (r *runtime) Topology(ctx context.Context, a string, q api.TopologyRequest) error {
 	_, err := r.call(ctx, func(ctx context.Context) (any, error) {
@@ -435,6 +523,9 @@ func (r *runtime) Topology(ctx context.Context, a string, q api.TopologyRequest)
 			return nil, r.addHost(q.Rack, q.Host)
 		case "drain", "remove-rack":
 			var ids []string
+			if q.Host == "" && r.hosts[q.Rack] != nil {
+				q.Host = q.Rack
+			}
 			if r.hosts[q.Host] != nil {
 				ids = []string{q.Host}
 			} else {
@@ -471,6 +562,8 @@ func (r *runtime) Reset(ctx context.Context) error {
 		r.racks = nil
 		r.nextRack = 0
 		r.nextHost = 0
+		r.logIncarnation++
+		r.cached = api.Snapshot{}
 		r.compromised = map[string]bool{}
 		r.success = api.SecurityStatus{ByAttack: map[string]int{}}
 		for _, suffix := range []string{"", "-wal", "-shm"} {
@@ -541,14 +634,24 @@ func (r *runtime) CreateVM(ctx context.Context, key string, q api.CreateVMReques
 	return v.(api.CreateVMResponse), nil
 }
 func (r *runtime) GetVM(ctx context.Context, id string) (api.VM, error) {
-	v, err := r.call(ctx, func(ctx context.Context) (any, error) { return r.scheduler.GetVM(ctx, id) })
+	v, err := r.call(ctx, func(ctx context.Context) (any, error) {
+		if r.down {
+			return nil, &api.Error{Status: 503, Msg: "scheduler down"}
+		}
+		return r.scheduler.GetVM(ctx, id)
+	})
 	if err != nil {
 		return api.VM{}, err
 	}
 	return v.(api.VM), nil
 }
 func (r *runtime) ListVMs(ctx context.Context) ([]api.VM, error) {
-	v, err := r.call(ctx, func(ctx context.Context) (any, error) { return r.scheduler.ListVMs(ctx) })
+	v, err := r.call(ctx, func(ctx context.Context) (any, error) {
+		if r.down {
+			return nil, &api.Error{Status: 503, Msg: "scheduler down"}
+		}
+		return r.scheduler.ListVMs(ctx)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -571,7 +674,12 @@ func (r *runtime) ListHosts(ctx context.Context) ([]api.Host, error) {
 	return s.Hosts, err
 }
 func (r *runtime) Queue(ctx context.Context) ([]api.QueueEntry, error) {
-	v, err := r.call(ctx, func(ctx context.Context) (any, error) { return r.scheduler.Queue(ctx) })
+	v, err := r.call(ctx, func(ctx context.Context) (any, error) {
+		if r.down {
+			return nil, &api.Error{Status: 503, Msg: "scheduler down"}
+		}
+		return r.scheduler.Queue(ctx)
+	})
 	if err != nil {
 		return nil, err
 	}

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
-	"net"
 	"slices"
 	"time"
 
@@ -31,7 +30,6 @@ type request struct {
 	chaos        api.ChaosRequest
 	sim          api.SimRequest
 	topology     api.TopologyRequest
-	ip           string
 	reply        chan<- response
 }
 type response struct {
@@ -44,42 +42,36 @@ type scheduled struct {
 	action string
 	req    api.ChaosRequest
 }
-type attacker struct {
-	index int
-	next  time.Time
-}
 type Engine struct {
 	ctx   context.Context
 	inbox chan request
 	done  chan struct{}
 }
 type state struct {
-	cfg       config.Config
-	clock     clock.Controllable
-	wall      clock.Clock
-	backend   Backend
-	emit      func(api.Event)
-	status    api.SimStatus
-	rng       *rand.Rand
-	last      map[string]time.Time
-	idle      time.Time
-	mix       [3]float64
-	credit    float64
-	previous  time.Time
-	tasks     []scheduled
-	attackers map[string]attacker
-	serial    uint64
+	cfg      config.Config
+	clock    clock.Controllable
+	wall     clock.Clock
+	backend  Backend
+	emit     func(api.Event)
+	status   api.SimStatus
+	rng      *rand.Rand
+	idle     time.Time
+	mix      [3]float64
+	credit   float64
+	previous time.Time
+	tasks    []scheduled
+	serial   uint64
 }
 
 func New(ctx context.Context, cfg config.Config, c clock.Controllable, b Backend, seed int64, emit func(api.Event)) *Engine {
 	e := &Engine{ctx: ctx, inbox: make(chan request), done: make(chan struct{})}
-	s := &state{cfg: cfg, clock: c, wall: clock.Real{}, backend: b, emit: emit, status: api.SimStatus{Seed: seed}, rng: rand.New(rand.NewSource(seed)), last: map[string]time.Time{}, mix: cfg.LoadPriorityMix, attackers: map[string]attacker{}, previous: c.Now()}
+	s := &state{cfg: cfg, clock: c, wall: clock.Real{}, backend: b, emit: emit, status: api.SimStatus{Seed: seed}, rng: rand.New(rand.NewSource(seed)), mix: cfg.LoadPriorityMix, previous: c.Now()}
 	s.idle = s.wall.Now()
 	go func() {
 		defer close(e.done)
 		tick := c.NewTicker(cfg.AmbientEvery)
 		defer tick.Stop()
-		idle := s.wall.NewTicker(cfg.ChaosPerIP)
+		idle := s.wall.NewTimer(cfg.IdleResetAfter)
 		defer idle.Stop()
 		for {
 			select {
@@ -90,11 +82,14 @@ func New(ctx context.Context, cfg config.Config, c clock.Controllable, b Backend
 			case <-tick.C():
 				s.tick(ctx, c.Now())
 			case <-idle.C():
-				if s.wall.Now().Sub(s.idle) >= cfg.IdleResetAfter {
+				remaining := cfg.IdleResetAfter - s.wall.Now().Sub(s.idle)
+				if remaining <= 0 {
 					if err := s.reset(ctx); err != nil {
 						s.event("reset failed: "+err.Error(), "")
 					}
+					remaining = cfg.IdleResetAfter
 				}
+				idle.Reset(remaining)
 			}
 		}
 	}()
@@ -110,6 +105,10 @@ func (e *Engine) Catalog() api.ChaosCatalog {
 	return api.ChaosCatalog{Actions: a, Presets: slices.Clone(presets)}
 }
 func (e *Engine) ask(ctx context.Context, r request) (response, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(e.ctx, cancel)
+	defer stop()
+	defer cancel()
 	r.ctx = ctx
 	select {
 	case <-e.done:
@@ -126,18 +125,6 @@ func (e *Engine) Do(ctx context.Context, a string, r api.ChaosRequest) (api.Chao
 	return v.result, v.err
 }
 
-// DoFromIP rate-limits the HTTP caller by its remote IP, on wall time. Internal
-// scenarios use Do without inheriting a public client's rate bucket.
-func (e *Engine) DoFromIP(ctx context.Context, ip, a string, r api.ChaosRequest) (api.ChaosResult, error) {
-	if host, _, err := net.SplitHostPort(ip); err == nil {
-		ip = host
-	}
-	v, err := e.ask(ctx, request{kind: "do", ip: ip, action: a, chaos: r})
-	if err != nil {
-		return v.result, err
-	}
-	return v.result, v.err
-}
 func (e *Engine) Sim(ctx context.Context, a string, r api.SimRequest) (api.SimStatus, error) {
 	v, err := e.ask(ctx, request{kind: "sim", action: a, sim: r})
 	if err != nil {
@@ -159,18 +146,6 @@ func invalid(msg string) error { return &api.Error{Status: 422, Msg: msg} }
 func finite(x float64) bool    { return !math.IsNaN(x) && !math.IsInf(x, 0) }
 func (s *state) handle(now time.Time, r request) response {
 	var err error
-	if r.ip != "" {
-		wall := s.wall.Now()
-		if at, ok := s.last[r.ip]; ok && wall.Sub(at) < s.cfg.ChaosPerIP {
-			return response{err: &api.Error{Status: 429, Msg: "chaos rate limited", RetryAfterS: 1}}
-		}
-		for ip, at := range s.last {
-			if wall.Sub(at) >= s.cfg.ChaosPerIP {
-				delete(s.last, ip)
-			}
-		}
-		s.last[r.ip] = wall
-	}
 	switch r.kind {
 	case "do":
 		err = s.do(r.ctx, now, r.action, r.chaos)
@@ -189,11 +164,15 @@ func (s *state) handle(now time.Time, r request) response {
 	s.status.Paused = s.clock.Paused()
 	status := s.status
 	status.Filters = slices.Clone(status.Filters)
+	status.Racks = slices.Clone(status.Racks)
 	return response{result: api.ChaosResult{Action: r.action, Target: r.chaos.Target, Detail: "applied"}, status: status, err: err}
 }
 func (s *state) sim(action string, r api.SimRequest) error {
 	switch action {
 	case "status":
+	case "seed":
+		s.status.Seed = r.Seed
+		s.rng = rand.New(rand.NewSource(r.Seed))
 	case "pause":
 		s.clock.Pause()
 	case "play":
@@ -235,9 +214,8 @@ func (s *state) sim(action string, r api.SimRequest) error {
 		if r.Filters != nil {
 			s.status.Filters = slices.Clone(r.Filters)
 		}
-		if r.Seed != 0 {
-			s.status.Seed = r.Seed
-			s.rng = rand.New(rand.NewSource(r.Seed))
+		if r.Racks != nil {
+			s.status.Racks = slices.Clone(r.Racks)
 		}
 	default:
 		return invalid("unknown sim action")
@@ -254,7 +232,6 @@ func (s *state) reset(ctx context.Context) error {
 		return err
 	}
 	s.tasks = nil
-	s.attackers = map[string]attacker{}
 	s.credit = 0
 	s.status.Intensity = 0
 	s.status.LoadRate = 0
@@ -299,11 +276,6 @@ func (s *state) do(ctx context.Context, now time.Time, action string, r api.Chao
 		_, err = s.backend.ControlPlane().DeleteVM(ctx, r.Target)
 	case "impostor-register":
 		err = s.backend.Attack(ctx, r.Target, api.AttackImpersonate)
-	case "compromise":
-		err = s.backend.Apply(ctx, action, r)
-		if err == nil {
-			s.attackers[r.Target] = attacker{next: now}
-		}
 	case "add-rack", "add-host", "remove-rack", "drain":
 		err = s.backend.Topology(ctx, action, api.TopologyRequest{Rack: r.Target, Hosts: int(r.Params["hosts"])})
 	case "split-brain", "gray-failure", "thundering-herd", "rolling-maintenance", "hostile-tenant", "bad-day":
@@ -330,6 +302,11 @@ func (s *state) flood(ctx context.Context, r api.ChaosRequest) error {
 	if n < 0 || n > float64(s.cfg.MaxVMs) || n != math.Trunc(n) {
 		return invalid("count outside fleet request cap")
 	}
+	oldMix := s.mix
+	if r.Params["interactive"] > 0 {
+		s.mix = [3]float64{1, 0, 0}
+	}
+	defer func() { s.mix = oldMix }()
 	for i := 0; i < int(n); i++ {
 		if err := s.create(ctx); err != nil {
 			if e, ok := err.(*api.Error); !ok || (e.Status != 429 && e.Status != 503) {
@@ -372,29 +349,16 @@ func (s *state) tick(ctx context.Context, now time.Time) {
 			s.event("load: "+err.Error(), "")
 		}
 	}
-	attacks := []string{api.AttackImpersonate, api.AttackReplay, api.AttackFlood, api.AttackEastWest, api.AttackControl, api.AttackEgress, api.AttackDiskFill}
-	ids := make([]string, 0, len(s.attackers))
-	for id := range s.attackers {
-		ids = append(ids, id)
-	}
-	slices.Sort(ids)
-	for _, id := range ids {
-		a := s.attackers[id]
-		if !a.next.After(now) {
-			if err := s.backend.Attack(ctx, id, attacks[a.index%len(attacks)]); err != nil {
-				delete(s.attackers, id)
-				continue
-			}
-			a.index++
-			a.next = now.Add(s.cfg.AttackerEvery)
-			s.attackers[id] = a
-		}
-	}
 	if s.status.Intensity > 0 {
 		choices := []api.ChaosAction{}
 		total := 0.0
 		for _, a := range catalogue {
 			if a.Ambient && (len(s.status.Filters) == 0 || slices.Contains(s.status.Filters, a.Name)) {
+				// Global faults cannot honor a rack scope; do not silently
+				// inject them outside the selected failure domains.
+				if len(s.status.Racks) > 0 && (a.Target == api.TargetGlobal || a.Target == api.TargetScheduler) {
+					continue
+				}
 				choices = append(choices, a)
 				total += s.cfg.ChaosBaseRates[a.Name]
 			}
@@ -412,6 +376,11 @@ func (s *state) tick(ctx context.Context, now time.Time) {
 			snap, err := s.backend.Snapshot(ctx)
 			if err != nil {
 				return
+			}
+			if len(s.status.Racks) > 0 {
+				snap.VMs = slices.DeleteFunc(slices.Clone(snap.VMs), func(v api.VM) bool { return !slices.Contains(s.status.Racks, v.Rack) })
+				snap.Hosts = slices.DeleteFunc(slices.Clone(snap.Hosts), func(h api.Host) bool { return !slices.Contains(s.status.Racks, h.Rack) })
+				snap.Racks = slices.DeleteFunc(slices.Clone(snap.Racks), func(r api.Rack) bool { return !slices.Contains(s.status.Racks, r.ID) })
 			}
 			target := ""
 			switch a.Target {

@@ -86,7 +86,14 @@ func New(ctx context.Context, o Options) (*Fleet, error) {
 		f.temp = dir
 		o.StorePath = dir + "/fleet.db"
 	}
-	r, err := newRuntime(ctx, cfg, c, o)
+	events := make(chan api.Event, cfg.EventRetention)
+	emit := func(e api.Event) {
+		select {
+		case events <- e:
+		case <-ctx.Done():
+		}
+	}
+	r, err := newRuntime(ctx, cfg, c, o, emit)
 	if err != nil {
 		cancel()
 		os.RemoveAll(f.temp)
@@ -94,13 +101,7 @@ func New(ctx context.Context, o Options) (*Fleet, error) {
 	}
 	f.runtime = r
 	f.Control = r
-	events := make(chan api.Event, cfg.MaxVMs*cfg.QueueCap)
-	f.Chaos = chaos.New(ctx, cfg, c, r, o.Seed, func(e api.Event) {
-		select {
-		case events <- e:
-		case <-ctx.Done():
-		}
-	})
+	f.Chaos = chaos.New(ctx, cfg, c, r, o.Seed, emit)
 	go f.publish(cfg, events)
 	return f, nil
 }
@@ -167,8 +168,12 @@ func (f *Fleet) publish(cfg config.Config, events <-chan api.Event) {
 	var latest api.Snapshot
 	var recent []api.Event
 	var eventSeq, snapshotSeq, schedulerSeq int64
+	var logIncarnation int64
 	var next time.Time
 	appendEvent := func(e api.Event) {
+		if e.Kind == api.EventChaos && e.Detail == "reset " {
+			check = invariant.New(cfg)
+		}
 		eventSeq++
 		e.Seq = eventSeq
 		recent = append(recent, e)
@@ -184,10 +189,18 @@ func (f *Fleet) publish(cfg config.Config, events <-chan api.Event) {
 		if err != nil {
 			return
 		}
-		if epoch != latest.Epoch {
+		if epoch != logIncarnation {
 			schedulerSeq = 0
+			logIncarnation = epoch
 		}
-		for _, e := range s.Recent {
+		batch, truncated, err := f.runtime.events(f.ctx, schedulerSeq)
+		if err != nil {
+			return
+		}
+		if truncated {
+			appendEvent(check.EventsLost(s.At))
+		}
+		for _, e := range batch {
 			if e.Seq > schedulerSeq {
 				schedulerSeq = e.Seq
 				appendEvent(e)
@@ -211,13 +224,12 @@ func (f *Fleet) publish(cfg config.Config, events <-chan api.Event) {
 			s.Sim = sim
 		}
 		s.Invariants = check.Status()
-		s.Epoch = epoch
 		if next.IsZero() || !f.Clock.Now().Before(next) {
 			snapshotSeq++
 			s.Seq = snapshotSeq
 			s.Recent = recent
-			if len(s.Recent) > 50 {
-				s.Recent = s.Recent[len(s.Recent)-50:]
+			if len(s.Recent) > cfg.RecentEventLimit {
+				s.Recent = s.Recent[len(s.Recent)-cfg.RecentEventLimit:]
 			}
 			latest = clone(s)
 			recent = nil

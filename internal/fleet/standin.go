@@ -51,5 +51,6 @@ func (standIn) SetPriority(context.Context, string, api.Priority) error {
 func (standIn) Snapshot(context.Context) (api.Snapshot, error) {
 	return api.Snapshot{Scheduler: api.SchedulerDown}, nil
 }
-func (standIn) SetDown(context.Context, bool) error                        { return nil }
-func (standIn) SetHostAdmin(context.Context, string, api.AdminState) error { return nil }
+func (standIn) SetDown(context.Context, bool) error                           { return nil }
+func (standIn) SetHostAdmin(context.Context, string, api.AdminState) error    { return nil }
+func (standIn) EventsSince(context.Context, int64) ([]api.Event, bool, error) { return nil, false, nil }

@@ -20,6 +20,8 @@ func TestEachInvariantDetectsBrokenState(t *testing.T) {
 			switch name {
 			case api.InvOneAuthoritative:
 				raw = append(raw, raw[0])
+				c.Check(s, raw...)
+				s.At += cfg.HostHeartbeat.Milliseconds() + 1
 			case api.InvStaleStopped:
 				raw[0].Actual[0].Generation = 1
 				raw[0].Host.Slots[0].Generation = 1
