@@ -1,0 +1,6 @@
+/runs/
+/bin/
+*.db
+*.db-wal
+*.db-shm
+.amp/in/

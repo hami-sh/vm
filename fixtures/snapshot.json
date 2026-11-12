@@ -1,0 +1,749 @@
+{
+  "seq": 1234,
+  "at": 1767225695000,
+  "scheduler": "up",
+  "epoch": 3,
+  "sim": {
+    "speed": 5,
+    "paused": false,
+    "seed": 42,
+    "intensity": 0.3,
+    "filters": [
+      "kill-guestd",
+      "kill-host",
+      "latency-spike",
+      "compromise"
+    ],
+    "load_rate": 1.5
+  },
+  "pools": [
+    {
+      "name": "ios-xcode16-m",
+      "image": "macos-15-xcode16",
+      "cpus": 4,
+      "memory_mb": 8192
+    },
+    {
+      "name": "ios-xcode15-s",
+      "image": "macos-14-xcode15",
+      "cpus": 2,
+      "memory_mb": 4096
+    }
+  ],
+  "racks": [
+    {
+      "id": "r1",
+      "partitioned": false,
+      "hosts": [
+        "r1-h1",
+        "r1-h2",
+        "r1-h3",
+        "r1-h4"
+      ]
+    },
+    {
+      "id": "r2",
+      "partitioned": false,
+      "hosts": [
+        "r2-h1",
+        "r2-h2",
+        "r2-h3",
+        "r2-h4"
+      ]
+    },
+    {
+      "id": "r3",
+      "partitioned": false,
+      "hosts": [
+        "r3-h1",
+        "r3-h2",
+        "r3-h3",
+        "r3-h4"
+      ]
+    }
+  ],
+  "hosts": [
+    {
+      "id": "r1-h1",
+      "rack": "r1",
+      "slot_count": 2,
+      "admin_state": "active",
+      "lease": "healthy",
+      "lease_age_ms": 800,
+      "slots": [
+        {
+          "index": 0,
+          "state": "occupied",
+          "vm_id": "vm-0001",
+          "gen": 1
+        },
+        {
+          "index": 1,
+          "state": "occupied",
+          "vm_id": "vm-0002",
+          "gen": 2
+        }
+      ]
+    },
+    {
+      "id": "r1-h2",
+      "rack": "r1",
+      "slot_count": 2,
+      "admin_state": "active",
+      "lease": "healthy",
+      "lease_age_ms": 800,
+      "slots": [
+        {
+          "index": 0,
+          "state": "reserved",
+          "vm_id": "vm-0003",
+          "gen": 1
+        },
+        {
+          "index": 1,
+          "state": "free"
+        }
+      ]
+    },
+    {
+      "id": "r1-h3",
+      "rack": "r1",
+      "slot_count": 2,
+      "admin_state": "cordoned",
+      "lease": "healthy",
+      "lease_age_ms": 800,
+      "slots": [
+        {
+          "index": 0,
+          "state": "occupied",
+          "vm_id": "vm-0004",
+          "gen": 1
+        },
+        {
+          "index": 1,
+          "state": "free"
+        }
+      ]
+    },
+    {
+      "id": "r1-h4",
+      "rack": "r1",
+      "slot_count": 2,
+      "admin_state": "active",
+      "lease": "healthy",
+      "lease_age_ms": 800,
+      "slots": [
+        {
+          "index": 0,
+          "state": "occupied",
+          "vm_id": "vm-0005",
+          "gen": 3
+        },
+        {
+          "index": 1,
+          "state": "free"
+        }
+      ]
+    },
+    {
+      "id": "r2-h1",
+      "rack": "r2",
+      "slot_count": 2,
+      "admin_state": "active",
+      "lease": "healthy",
+      "lease_age_ms": 800,
+      "slots": [
+        {
+          "index": 0,
+          "state": "occupied",
+          "vm_id": "vm-0006",
+          "gen": 1
+        },
+        {
+          "index": 1,
+          "state": "occupied",
+          "vm_id": "vm-0007",
+          "gen": 1
+        }
+      ]
+    },
+    {
+      "id": "r2-h2",
+      "rack": "r2",
+      "slot_count": 2,
+      "admin_state": "active",
+      "lease": "healthy",
+      "lease_age_ms": 800,
+      "slots": [
+        {
+          "index": 0,
+          "state": "occupied",
+          "vm_id": "vm-0008",
+          "gen": 4
+        },
+        {
+          "index": 1,
+          "state": "free"
+        }
+      ]
+    },
+    {
+      "id": "r2-h3",
+      "rack": "r2",
+      "slot_count": 2,
+      "admin_state": "active",
+      "lease": "healthy",
+      "lease_age_ms": 800,
+      "slots": [
+        {
+          "index": 0,
+          "state": "free"
+        },
+        {
+          "index": 1,
+          "state": "releasing",
+          "vm_id": "vm-0009",
+          "gen": 1
+        }
+      ]
+    },
+    {
+      "id": "r2-h4",
+      "rack": "r2",
+      "slot_count": 2,
+      "admin_state": "active",
+      "lease": "lost",
+      "lease_age_ms": 14000,
+      "slots": [
+        {
+          "index": 0,
+          "state": "occupied",
+          "vm_id": "vm-0010",
+          "gen": 2
+        },
+        {
+          "index": 1,
+          "state": "free"
+        }
+      ],
+      "faults": [
+        "killed"
+      ]
+    },
+    {
+      "id": "r3-h1",
+      "rack": "r3",
+      "slot_count": 2,
+      "admin_state": "active",
+      "lease": "healthy",
+      "lease_age_ms": 800,
+      "slots": [
+        {
+          "index": 0,
+          "state": "occupied",
+          "vm_id": "vm-0011",
+          "gen": 1
+        },
+        {
+          "index": 1,
+          "state": "free"
+        }
+      ]
+    },
+    {
+      "id": "r3-h2",
+      "rack": "r3",
+      "slot_count": 2,
+      "admin_state": "draining",
+      "lease": "healthy",
+      "lease_age_ms": 800,
+      "slots": [
+        {
+          "index": 0,
+          "state": "occupied",
+          "vm_id": "vm-0012",
+          "gen": 1
+        },
+        {
+          "index": 1,
+          "state": "free"
+        }
+      ]
+    },
+    {
+      "id": "r3-h3",
+      "rack": "r3",
+      "slot_count": 2,
+      "admin_state": "active",
+      "lease": "healthy",
+      "lease_age_ms": 800,
+      "slots": [
+        {
+          "index": 0,
+          "state": "reserved",
+          "vm_id": "vm-0013",
+          "gen": 2
+        },
+        {
+          "index": 1,
+          "state": "free"
+        }
+      ]
+    },
+    {
+      "id": "r3-h4",
+      "rack": "r3",
+      "slot_count": 2,
+      "admin_state": "active",
+      "lease": "suspect",
+      "lease_age_ms": 7100,
+      "slots": [
+        {
+          "index": 0,
+          "state": "free"
+        },
+        {
+          "index": 1,
+          "state": "free"
+        }
+      ],
+      "stale": [
+        {
+          "vm_id": "vm-0008",
+          "gen": 3,
+          "state": "Ready"
+        }
+      ],
+      "faults": [
+        "paused-heartbeats"
+      ]
+    }
+  ],
+  "vms": [
+    {
+      "id": "vm-0001",
+      "pool": "ios-xcode16-m",
+      "state": "Ready",
+      "desired": "running",
+      "gen": 1,
+      "host": "r1-h1",
+      "rack": "r1",
+      "priority": 1,
+      "attempts": 1,
+      "created_at": 1767225600000,
+      "updated_at": 1767225690000,
+      "ready_at": 1767225605000
+    },
+    {
+      "id": "vm-0002",
+      "pool": "ios-xcode15-s",
+      "state": "Ready",
+      "desired": "running",
+      "gen": 2,
+      "host": "r1-h1",
+      "rack": "r1",
+      "priority": 2,
+      "attempts": 2,
+      "created_at": 1767225601000,
+      "updated_at": 1767225690000,
+      "ready_at": 1767225606000
+    },
+    {
+      "id": "vm-0003",
+      "pool": "ios-xcode16-m",
+      "state": "Booting",
+      "desired": "running",
+      "gen": 1,
+      "host": "r1-h2",
+      "rack": "r1",
+      "priority": 3,
+      "attempts": 1,
+      "created_at": 1767225602000,
+      "updated_at": 1767225690000
+    },
+    {
+      "id": "vm-0004",
+      "pool": "ios-xcode15-s",
+      "state": "Ready",
+      "desired": "running",
+      "gen": 1,
+      "host": "r1-h3",
+      "rack": "r1",
+      "priority": 1,
+      "attempts": 1,
+      "created_at": 1767225603000,
+      "updated_at": 1767225690000,
+      "ready_at": 1767225608000
+    },
+    {
+      "id": "vm-0005",
+      "pool": "ios-xcode16-m",
+      "state": "Unhealthy",
+      "desired": "running",
+      "gen": 3,
+      "host": "r1-h4",
+      "rack": "r1",
+      "priority": 2,
+      "attempts": 3,
+      "last_reason": "guest_lease_expired",
+      "created_at": 1767225604000,
+      "updated_at": 1767225690000
+    },
+    {
+      "id": "vm-0006",
+      "pool": "ios-xcode15-s",
+      "state": "Ready",
+      "desired": "running",
+      "gen": 1,
+      "host": "r2-h1",
+      "rack": "r2",
+      "priority": 3,
+      "attempts": 1,
+      "created_at": 1767225605000,
+      "updated_at": 1767225690000,
+      "ready_at": 1767225610000
+    },
+    {
+      "id": "vm-0007",
+      "pool": "ios-xcode16-m",
+      "state": "Ready",
+      "desired": "running",
+      "gen": 1,
+      "host": "r2-h1",
+      "rack": "r2",
+      "priority": 1,
+      "attempts": 1,
+      "compromised": true,
+      "created_at": 1767225606000,
+      "updated_at": 1767225690000,
+      "ready_at": 1767225611000
+    },
+    {
+      "id": "vm-0008",
+      "pool": "ios-xcode15-s",
+      "state": "Ready",
+      "desired": "running",
+      "gen": 4,
+      "host": "r2-h2",
+      "rack": "r2",
+      "priority": 2,
+      "attempts": 4,
+      "created_at": 1767225607000,
+      "updated_at": 1767225690000,
+      "ready_at": 1767225612000
+    },
+    {
+      "id": "vm-0009",
+      "pool": "ios-xcode16-m",
+      "state": "Terminating",
+      "desired": "deleted",
+      "gen": 1,
+      "host": "r2-h3",
+      "rack": "r2",
+      "priority": 3,
+      "attempts": 1,
+      "last_reason": "deleted",
+      "created_at": 1767225608000,
+      "updated_at": 1767225690000
+    },
+    {
+      "id": "vm-0010",
+      "pool": "ios-xcode15-s",
+      "state": "Lost",
+      "desired": "running",
+      "gen": 2,
+      "host": "r2-h4",
+      "rack": "r2",
+      "priority": 1,
+      "attempts": 2,
+      "last_reason": "host_lost",
+      "created_at": 1767225609000,
+      "updated_at": 1767225690000
+    },
+    {
+      "id": "vm-0011",
+      "pool": "ios-xcode16-m",
+      "state": "Ready",
+      "desired": "running",
+      "gen": 1,
+      "host": "r3-h1",
+      "rack": "r3",
+      "priority": 2,
+      "attempts": 1,
+      "created_at": 1767225610000,
+      "updated_at": 1767225690000,
+      "ready_at": 1767225615000
+    },
+    {
+      "id": "vm-0012",
+      "pool": "ios-xcode15-s",
+      "state": "Ready",
+      "desired": "running",
+      "gen": 1,
+      "host": "r3-h2",
+      "rack": "r3",
+      "priority": 3,
+      "attempts": 1,
+      "created_at": 1767225611000,
+      "updated_at": 1767225690000,
+      "ready_at": 1767225616000
+    },
+    {
+      "id": "vm-0013",
+      "pool": "ios-xcode16-m",
+      "state": "Booting",
+      "desired": "running",
+      "gen": 2,
+      "host": "r3-h3",
+      "rack": "r3",
+      "priority": 1,
+      "attempts": 2,
+      "created_at": 1767225612000,
+      "updated_at": 1767225690000
+    },
+    {
+      "id": "vm-0014",
+      "pool": "ios-xcode15-s",
+      "state": "Pending",
+      "desired": "running",
+      "gen": 0,
+      "priority": 2,
+      "attempts": 0,
+      "created_at": 1767225613000,
+      "updated_at": 1767225690000
+    },
+    {
+      "id": "vm-0015",
+      "pool": "ios-xcode16-m",
+      "state": "Pending",
+      "desired": "running",
+      "gen": 0,
+      "priority": 3,
+      "attempts": 0,
+      "created_at": 1767225614000,
+      "updated_at": 1767225690000
+    },
+    {
+      "id": "vm-0016",
+      "pool": "ios-xcode15-s",
+      "state": "Pending",
+      "desired": "running",
+      "gen": 2,
+      "priority": 1,
+      "attempts": 2,
+      "last_reason": "host_lost",
+      "created_at": 1767225615000,
+      "updated_at": 1767225690000
+    },
+    {
+      "id": "vm-0017",
+      "pool": "ios-xcode16-m",
+      "state": "Failed",
+      "desired": "running",
+      "gen": 3,
+      "priority": 2,
+      "attempts": 3,
+      "last_reason": "boot_deadline",
+      "created_at": 1767225616000,
+      "updated_at": 1767225690000
+    },
+    {
+      "id": "vm-0018",
+      "pool": "ios-xcode15-s",
+      "state": "Failed",
+      "desired": "running",
+      "gen": 0,
+      "priority": 3,
+      "attempts": 1,
+      "last_reason": "shed",
+      "created_at": 1767225617000,
+      "updated_at": 1767225690000
+    },
+    {
+      "id": "vm-0019",
+      "pool": "ios-xcode16-m",
+      "state": "Terminated",
+      "desired": "deleted",
+      "gen": 1,
+      "priority": 1,
+      "attempts": 1,
+      "last_reason": "deleted",
+      "created_at": 1767225618000,
+      "updated_at": 1767225690000
+    }
+  ],
+  "queue": [
+    {
+      "vm_id": "vm-0016",
+      "priority": 0,
+      "effective_priority": 0,
+      "reason": "replace",
+      "enqueued_at": 1767225688000,
+      "not_before": 1767225688000
+    },
+    {
+      "vm_id": "vm-0014",
+      "priority": 1,
+      "effective_priority": 1,
+      "reason": "new",
+      "enqueued_at": 1767225613000,
+      "not_before": 1767225613000
+    },
+    {
+      "vm_id": "vm-0015",
+      "priority": 3,
+      "effective_priority": 2,
+      "reason": "retry",
+      "enqueued_at": 1767225614000,
+      "not_before": 1767225697000
+    }
+  ],
+  "counters": {
+    "by_state": {
+      "Booting": 2,
+      "Failed": 2,
+      "Lost": 1,
+      "Pending": 3,
+      "Ready": 8,
+      "Terminated": 1,
+      "Terminating": 1,
+      "Unhealthy": 1
+    },
+    "queue_depth": 3,
+    "queue_cap": 32,
+    "placed": 61,
+    "queued": 19,
+    "rejected_429": 4,
+    "shed": 1,
+    "recoveries": {
+      "recycle": 3,
+      "replace": 2,
+      "retry": 5
+    },
+    "headroom": 2
+  },
+  "latency": {
+    "batch": {
+      "p50_ms": 21000,
+      "p99_ms": 58000,
+      "target_ms": 0,
+      "samples": 31
+    },
+    "interactive": {
+      "p50_ms": 4800,
+      "p99_ms": 9100,
+      "target_ms": 12000,
+      "samples": 40
+    },
+    "standard": {
+      "p50_ms": 5200,
+      "p99_ms": 14200,
+      "target_ms": 12000,
+      "samples": 77
+    }
+  },
+  "invariants": [
+    {
+      "name": "one_authoritative_copy",
+      "violations": 0
+    },
+    {
+      "name": "stale_copy_stopped",
+      "violations": 0
+    },
+    {
+      "name": "slot_capacity",
+      "violations": 0
+    },
+    {
+      "name": "generation_monotonic",
+      "violations": 0
+    },
+    {
+      "name": "legal_transitions",
+      "violations": 0
+    },
+    {
+      "name": "queue_bounded",
+      "violations": 0
+    },
+    {
+      "name": "no_successful_attack",
+      "violations": 0
+    },
+    {
+      "name": "pending_placed_promptly",
+      "violations": 0
+    }
+  ],
+  "security": {
+    "blocked": 7,
+    "succeeded": 0,
+    "by_attack": {
+      "east_west": 3,
+      "egress": 2,
+      "impersonate": 2
+    }
+  },
+  "recent": [
+    {
+      "seq": 900,
+      "at": 1767225680000,
+      "kind": "chaos",
+      "host_id": "r2-h4",
+      "rack": "r2",
+      "detail": "kill-host"
+    },
+    {
+      "seq": 901,
+      "at": 1767225688000,
+      "kind": "transition",
+      "vm_id": "vm-0010",
+      "host_id": "r2-h4",
+      "gen": 2,
+      "from": "Ready",
+      "to": "Lost",
+      "detail": "host_lost"
+    },
+    {
+      "seq": 902,
+      "at": 1767225688000,
+      "kind": "admission",
+      "vm_id": "vm-0016",
+      "detail": "queued class 0 (replace)"
+    },
+    {
+      "seq": 903,
+      "at": 1767225689500,
+      "kind": "fencing",
+      "vm_id": "vm-0008",
+      "host_id": "r3-h4",
+      "gen": 3,
+      "detail": "stale gen 3 \u003c 4: heartbeat rejected, StopVM queued"
+    },
+    {
+      "seq": 904,
+      "at": 1767225691000,
+      "kind": "security",
+      "vm_id": "vm-0007",
+      "host_id": "r2-h1",
+      "gen": 1,
+      "detail": "blocked east_west to vm-0006"
+    },
+    {
+      "seq": 905,
+      "at": 1767225693000,
+      "kind": "reconcile",
+      "host_id": "r1-h2",
+      "detail": "adopted 1, stopped 0, re-placed 0"
+    },
+    {
+      "seq": 906,
+      "at": 1767225694000,
+      "kind": "topology",
+      "host_id": "r3-h2",
+      "rack": "r3",
+      "detail": "drain started"
+    }
+  ]
+}
