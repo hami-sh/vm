@@ -151,7 +151,7 @@ button:focus-visible, a:focus-visible, .input:focus-visible { outline: 2px solid
 .disconnected .fleet-panel::before { content: 'Connection lost · reconnecting to the fleet'; display: block; padding: 6px 12px; color: var(--warn); }
 body.playback .controls-rail { display: none; }
 body.playback .layout { grid-template-columns: minmax(0, 1fr) 360px; height: calc(100dvh - 170px); }
-.col-main { display: grid; grid-template-rows: auto minmax(472px, 1fr) minmax(120px, .25fr) minmax(110px, .3fr); gap: 12px; min-width: 0; min-height: 0; position: relative; }
+.col-main { display: grid; grid-template-rows: auto minmax(576px, 1fr) minmax(120px, .25fr) minmax(110px, .3fr); gap: 12px; min-width: 0; min-height: 0; position: relative; }
 .col-side { display: flex; flex-direction: column; gap: 12px; min-width: 0; min-height: 0; overflow: auto; }
 .fleet-panel { overflow: auto; }
 .row-bottom { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }

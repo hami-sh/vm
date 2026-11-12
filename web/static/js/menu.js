@@ -1,6 +1,4 @@
-// Click-to-break: picking a rack, host, VM or the scheduler selects it and,
-// on the live fleet, opens a menu of every chaos action the catalogue lists
-// for that kind of target. Nothing here knows the action names in advance
+// Explicit fault menus for inspected components. Nothing here knows the action names in advance
 // except the small tables of defaults below.
 import { $, esc, mount, vmName, plural } from './util.js';
 import { state, update } from './store.js';
@@ -132,7 +130,7 @@ function item(a, recover) {
 function build(m, s, catalog) {
   const head = describe(m.kind, m.id, s);
   if (!head) return '';
-  const mine = catalog.actions.filter((a) => a.target === m.kind && !ELSEWHERE.has(a.name));
+  const mine = catalog.actions.filter((a) => a.target === m.kind && (!m.layer || a.layer === m.layer) && !ELSEWHERE.has(a.name));
   const fix = recoveries(m.kind, m.id, s);
   const groups = [];
   const first = mine.filter((a) => fix.has(a.name));
@@ -183,16 +181,16 @@ function anchor(el, e) {
 }
 
 export const actions = {
-  pick(el, e) {
+  pick(el) {
     const { kind, id } = el.dataset;
     update((st) => {
       st.selection = { kind, id };
-      st.menu = st.route.page === 'live' ? { kind, id, ...anchor(el, e) } : null;
+      st.menu = null;
     });
   },
   'open-menu'(el, e) {
-    const { kind, id = '' } = el.dataset;
-    update((st) => (st.menu = { kind, id, ...anchor(el, e) }));
+    const { kind, id = '', layer } = el.dataset;
+    update((st) => (st.menu = { kind, id, layer, ...anchor(el, e) }));
   },
   'menu-close': () => update((st) => (st.menu = null)),
   chaos(el) {

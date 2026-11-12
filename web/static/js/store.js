@@ -11,7 +11,7 @@ export const state = {
   live: { snapshot: null, events: [], history: [] },
   runs: null, // []RunSummary once loaded
   run: null, // { id, report, frames, cursor, playing, rate, loading, error }
-  selection: null, // { kind: vm|host|rack|scheduler, id }
+  selection: null, // { kind: vm|guest|host|agent|rack|scheduler, id }
   highlight: null, // VM id picked in the event log
   menu: null, // { kind, id, x, y }
   popover: null, // name of the open controls popover
