@@ -1,5 +1,5 @@
 // The event log: newest first, filtered by kind and by a rack, host or VM id.
-import { $, esc, mount, clock, badge, EVENT_KINDS, stateVar, vmName, shorten } from './util.js';
+import { $, esc, mount, clock, badge, EVENT_KINDS, stateVar, vmName, shorten, eventDetail } from './util.js';
 import { update } from './store.js';
 
 const MAX_ROWS = 200;
@@ -11,7 +11,7 @@ const ref = (kind, id, st) =>
 
 function matches(e, text) {
   if (!text) return true;
-  return [e.vm_id, e.vm_id && vmName(e.vm_id), e.host_id, e.rack, e.detail, e.kind].some((x) => x && x.toLowerCase().includes(text));
+  return [e.vm_id, e.vm_id && vmName(e.vm_id), e.host_id, e.rack, eventDetail(e), e.kind].some((x) => x && x.toLowerCase().includes(text));
 }
 
 function row(e, st, n) {
@@ -30,7 +30,7 @@ function row(e, st, n) {
   return `<div class="${cls.join(' ')}">
     <span class="log-time">${clock(e.at)}</span>
     <span>${badge(e.kind, EVENT_KINDS[e.kind] || 'var(--dim)')}</span>
-    <span class="log-text">${refs.join(' ')} ${gen}${move}<span class="${e.from || e.to ? 'dim' : ''}">${esc(shorten(e.detail))}</span>${n > 1 ? `<span class="log-n" title="${n} identical events in a row">×${n}</span>` : ''}</span>
+    <span class="log-text">${refs.join(' ')} ${gen}${move}<span class="${e.from || e.to ? 'dim' : ''}">${esc(shorten(eventDetail(e)))}</span>${n > 1 ? `<span class="log-n" title="${n} identical events in a row">×${n}</span>` : ''}</span>
   </div>`;
 }
 

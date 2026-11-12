@@ -63,6 +63,12 @@ document.addEventListener('click', (e) => {
 });
 document.addEventListener('change', (e) => dispatch(changes, 'change', e));
 document.addEventListener('input', (e) => dispatch(inputs, 'input', e));
+document.addEventListener('submit', (e) => {
+  if (e.target.matches('[data-submit]')) {
+    e.preventDefault();
+    dispatch(actions, 'submit', e);
+  }
+});
 
 // Hints are immediate and follow the pointer, rather than native titles
 // appearing after a delay at an unrelated position.
@@ -116,5 +122,8 @@ api.catalog().then(
   (catalog) => update((st) => (st.catalog = catalog)),
   () => {}, // the menus stay empty; the stream's state already shows the outage
 );
-api.source().then((source) => update((st) => (st.source = source.label)), () => {});
+api.source().then((source) => update((st) => {
+  st.source = source.label;
+  st.lifetimeConfig = source;
+}), () => {});
 route();

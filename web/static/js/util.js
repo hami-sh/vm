@@ -6,13 +6,14 @@ export const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ESC[c]);
 
 export const $ = (sel, root = document) => root.querySelector(sel);
 
-// VM-targeted actions are history, not ongoing host faults. Older playback
-// can lack the action catalog; live views use the server's target definitions.
-export function hostFaults(host, catalog, playback) {
+// VM-targeted actions are history, not ongoing host faults. Missing catalogs
+// use the historical names in both live views and older playback.
+export function hostFaults(host, catalog) {
   const vmActions = catalog?.actions?.length
     ? catalog.actions.filter((action) => action.target === 'vm').map((action) => action.name)
-    : playback ? ['kill-guestd', 'crash-vm', 'hang-next-boot', 'compromise', 'impostor-register', 'delete'] : [];
-  return (host.faults || []).filter((name) => !vmActions.includes(name));
+    : ['kill-guestd', 'crash-vm', 'hang-next-boot', 'compromise', 'impostor-register', 'delete'];
+  // Placement eligibility comes from admin_state, not historical commands.
+  return (host.faults || []).filter((name) => !vmActions.includes(name) && name !== 'cordon' && name !== 'uncordon');
 }
 
 // mount replaces el's content with html. Every panel is rebuilt from the
@@ -46,6 +47,7 @@ export const prio = (n) => PRIORITIES[n] || PRIORITIES[2];
 
 export const EVENT_KINDS = {
   transition: '#8894a7',
+  workload: '#8fd3c1',
   chaos: '#f5a524',
   fencing: '#ff5d6c',
   admission: '#6aa8ff',
@@ -55,6 +57,10 @@ export const EVENT_KINDS = {
   alert: '#ff5d6c',
   reconcile: '#b392f0',
 };
+
+export const eventDetail = (event) => event.kind === 'workload'
+  ? ({ completed: 'workload completed', idle: 'idle reclaimed' }[event.detail] || event.detail)
+  : event.detail;
 
 export const INVARIANTS = {
   one_authoritative_copy: 'One authoritative copy',

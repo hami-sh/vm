@@ -51,7 +51,7 @@ const EFFECTS = {
   'restart-host': 'Restart the host agent and recover its running VM inventory',
   'clock-skew': 'Offset this host’s clock by the specified milliseconds',
   'fill-disk': 'Simulate a full disk so this host cannot accept new VMs',
-  cordon: 'Stop placing new VMs on this host',
+  cordon: 'Stop placing new VMs on this host; existing VMs keep running. Uncordon allows new placements again.',
   'partition-rack': 'Disconnect this rack from the scheduler while its VMs keep running',
   'one-way-partition': 'Drop communication in one direction between this host and the scheduler',
   'latency-spike': 'Add the specified milliseconds of network delay',

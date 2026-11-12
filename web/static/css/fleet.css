@@ -55,6 +55,8 @@
 .host-id:hover { color: var(--accent); }
 .agent-node { display: inline-flex; align-items: center; gap: 4px; padding: 1px 3px; font: 10px var(--sans); color: var(--dim); background: var(--raise); border: 1px solid var(--line); border-radius: 4px; cursor: pointer; }
 .agent-node i { width: 5px; height: 5px; border-radius: 50%; background: var(--lease); }
+.agent-node.stopped { color: var(--bad); }
+.agent-node.stopped i { background: var(--bad); }
 .agent-node:hover, .agent-node.sel { color: var(--text); border-color: var(--accent); }
 .host.lease-suspect .agent-node, .host.lease-lost .agent-node { color: var(--lease); }
 .tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
@@ -90,6 +92,9 @@
 .vm:hover { background: color-mix(in srgb, var(--c) 22%, var(--panel)); }
 .vm-top { display: flex; align-items: center; gap: 5px; font: 500 11.5px var(--mono); min-width: 0; }
 .vm-id { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vm:has(.workload-chip) { height: 56px; }
+.workload-chip { justify-self: start; border: 1px solid var(--line-2); border-radius: 3px; padding: 0 3px; color: var(--text); font: 10px/13px var(--sans); background: var(--panel-2); }
+.workload-chip.idle { color: var(--dim); }
 .vm-gen { color: var(--dim); font-size: 10.5px; }
 .vm-prio {
   min-width: 14px; padding: 0 3px; font: 700 9.5px/13px var(--sans); text-align: center; color: var(--p);
