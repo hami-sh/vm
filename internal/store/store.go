@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"time"
 
 	"github.com/hami-sh/vm/internal/api"
 	"github.com/hami-sh/vm/internal/config"
@@ -38,6 +37,7 @@ type HostRecord struct {
 
 // Data contains only durable intent, never leases, tokens or reservations.
 type Data struct {
+	Epoch int64
 	VMs   map[string]Record
 	Hosts map[string]HostRecord
 	Queue map[string]api.QueueEntry
@@ -90,7 +90,7 @@ func (s *Store) Fresh() bool { return s.fresh }
 
 // Start atomically increments scheduler_epoch and loads the write-ahead record.
 // Only one live scheduler may own a Store.
-func (s *Store) Start(ctx context.Context, now time.Time) (Data, int64, error) {
+func (s *Store) Start(ctx context.Context) (Data, int64, error) {
 	d := Data{VMs: map[string]Record{}, Hosts: map[string]HostRecord{}, Queue: map[string]api.QueueEntry{}}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -103,10 +103,11 @@ func (s *Store) Start(ctx context.Context, now time.Time) (Data, int64, error) {
 	}
 	s.fresh = exists == 0
 	var epoch int64
-	err = tx.QueryRowContext(ctx, `INSERT INTO meta(key,value) VALUES('scheduler_epoch',?) ON CONFLICT(key) DO UPDATE SET value=max(CAST(value AS INTEGER)+1,CAST(excluded.value AS INTEGER)) RETURNING CAST(value AS INTEGER)`, now.UnixMilli()).Scan(&epoch)
+	err = tx.QueryRowContext(ctx, `INSERT INTO meta(key,value) VALUES('scheduler_epoch','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1 RETURNING CAST(value AS INTEGER)`).Scan(&epoch)
 	if err != nil {
 		return d, 0, err
 	}
+	d.Epoch = epoch
 	rows, err := tx.QueryContext(ctx, "SELECT id,rack,slots,admin_state,registered_at FROM hosts")
 	if err != nil {
 		return d, 0, err
@@ -176,6 +177,20 @@ func (s *Store) Commit(ctx context.Context, before, after Data, events []api.Eve
 		return err
 	}
 	defer tx.Rollback()
+	if after.Epoch < before.Epoch {
+		return ErrCAS
+	}
+	res, err := tx.ExecContext(ctx, "UPDATE meta SET value=? WHERE key='scheduler_epoch' AND CAST(value AS INTEGER)=?", after.Epoch, before.Epoch)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrCAS
+	}
 	for id, h := range after.Hosts {
 		if reflect.DeepEqual(before.Hosts[id], h) {
 			continue
@@ -230,7 +245,7 @@ func (s *Store) Commit(ctx context.Context, before, after Data, events []api.Eve
 			return fmt.Errorf("event: %w", err)
 		}
 	}
-	_, err = tx.ExecContext(ctx, "DELETE FROM events WHERE seq <= (SELECT max(seq)-10000 FROM events)")
+	_, err = tx.ExecContext(ctx, "DELETE FROM events WHERE seq <= (SELECT max(seq)-? FROM events)", config.Default().EventRetention)
 	if err != nil {
 		return err
 	}

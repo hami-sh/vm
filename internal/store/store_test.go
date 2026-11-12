@@ -6,7 +6,6 @@ import (
 	"maps"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/hami-sh/vm/internal/api"
 	"github.com/hami-sh/vm/internal/config"
@@ -19,15 +18,15 @@ func TestAtomicGenerationCASAndQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	empty, _, err := s.Start(ctx, time.Unix(1000, 0))
+	empty, _, err := s.Start(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	before := Data{VMs: map[string]Record{"v": {VM: api.VM{ID: "v", Pool: config.Pools[0].Name, State: api.VMPending, Desired: api.DesiredRunning, Priority: 2}, Key: "key", Hash: "hash"}}, Hosts: map[string]HostRecord{"h": {ID: "h", Rack: "r", Slots: 2, Admin: api.AdminActive}}, Queue: map[string]api.QueueEntry{"v": {VMID: "v", Priority: 2, Reason: api.QueueNew}}}
+	before := Data{Epoch: empty.Epoch, VMs: map[string]Record{"v": {VM: api.VM{ID: "v", Pool: config.Pools[0].Name, State: api.VMPending, Desired: api.DesiredRunning, Priority: 2}, Key: "key", Hash: "hash"}}, Hosts: map[string]HostRecord{"h": {ID: "h", Rack: "r", Slots: 2, Admin: api.AdminActive}}, Queue: map[string]api.QueueEntry{"v": {VMID: "v", Priority: 2, Reason: api.QueueNew}}}
 	if err = s.Commit(ctx, empty, before, nil); err != nil {
 		t.Fatal(err)
 	}
-	after := Data{VMs: maps.Clone(before.VMs), Hosts: before.Hosts, Queue: map[string]api.QueueEntry{}}
+	after := Data{Epoch: before.Epoch, VMs: maps.Clone(before.VMs), Hosts: before.Hosts, Queue: map[string]api.QueueEntry{}}
 	r := after.VMs["v"]
 	r.VM.Generation = 1
 	r.VM.State = api.VMBooting
@@ -42,7 +41,7 @@ func TestAtomicGenerationCASAndQueue(t *testing.T) {
 	if err = s.Commit(ctx, before, after, []api.Event{event}); !errors.Is(err, ErrCAS) {
 		t.Fatalf("stale writer accepted: %v", err)
 	}
-	loaded, _, err := s.Start(ctx, time.Unix(1000, 0))
+	loaded, _, err := s.Start(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +55,7 @@ func TestAtomicGenerationCASAndQueue(t *testing.T) {
 
 	// A bad event must roll back the VM, queue, and all previous writes in
 	// this transaction, not merely reject that event row.
-	deleted := Data{VMs: maps.Clone(loaded.VMs), Hosts: loaded.Hosts, Queue: loaded.Queue}
+	deleted := Data{Epoch: loaded.Epoch, VMs: maps.Clone(loaded.VMs), Hosts: loaded.Hosts, Queue: loaded.Queue}
 	r = deleted.VMs["v"]
 	r.VM.Desired = api.DesiredDeleted
 	r.VM.State = api.VMTerminating
@@ -64,7 +63,7 @@ func TestAtomicGenerationCASAndQueue(t *testing.T) {
 	if err = s.Commit(ctx, loaded, deleted, []api.Event{{Kind: "invalid"}}); err == nil {
 		t.Fatal("invalid audit row accepted")
 	}
-	restored, _, err := s.Start(ctx, time.Unix(1000, 0))
+	restored, _, err := s.Start(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,17 +75,16 @@ func TestAtomicGenerationCASAndQueue(t *testing.T) {
 func TestEpochAndFreshnessAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "state.db")
-	now := time.Unix(1234, 0)
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, epoch, err := s.Start(ctx, now)
+	_, epoch, err := s.Start(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if epoch != now.UnixMilli() || !s.Fresh() {
-		t.Fatal("fresh epoch not based on clock")
+	if epoch != 1 || !s.Fresh() {
+		t.Fatal("fresh epoch not 1")
 	}
 	s.Close()
 	s, err = Open(path)
@@ -94,15 +92,15 @@ func TestEpochAndFreshnessAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	_, next, err := s.Start(ctx, now)
+	_, next, err := s.Start(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if next != epoch+1 || s.Fresh() {
 		t.Fatalf("restart epoch=%d fresh=%v", next, s.Fresh())
 	}
-	// Even a clock behind persisted metadata cannot roll epoch back.
-	_, next, err = s.Start(ctx, now.Add(-time.Hour))
+	// Further starts increment persisted metadata without consulting time.
+	_, next, err = s.Start(ctx)
 	if err != nil || next != epoch+2 {
 		t.Fatalf("epoch rollback: %d %v", next, err)
 	}
