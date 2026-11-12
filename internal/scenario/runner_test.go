@@ -100,9 +100,10 @@ func TestRunnerRejectsMissingEventsAndTransientViolations(t *testing.T) {
 	}
 }
 
-func TestHostileTenantRequiresEveryVictimToStayQuarantined(t *testing.T) {
-	for _, fault := range []string{"", "resurrection", "missing victim", "wrong terminal reason"} {
+func TestHostileTenantEvidenceBasedQuarantine(t *testing.T) {
+	for _, fault := range []string{"", "clean recycle", "unknown attack", "resurrection", "event resurrection", "missing victim", "wrong terminal reason", "compromised driver running", "missing driver evidence", "disconnected driver", "no quarantine", "successful attack"} {
 		t.Run(fault, func(t *testing.T) {
+			wantPass := fault == "" || fault == "clean recycle" || fault == "unknown attack"
 			s := Catalog()[12]
 			newRun := s.NewRun
 			s.NewRun = func() Scenario {
@@ -113,30 +114,57 @@ func TestHostileTenantRequiresEveryVictimToStayQuarantined(t *testing.T) {
 			factory := func(_ context.Context, _ Scenario, seed int64, _ float64) (System, func(), error) {
 				before, middle, after := snapshot(11000, api.VMReady), snapshot(30000, api.VMFailed), snapshot(90000, api.VMFailed)
 				before.VMs, middle.VMs, after.VMs = nil, nil, nil
+				var events []api.Event
 				for i := range 3 {
 					v := api.VM{ID: fmt.Sprintf("%d-victim-%d", seed, i), Generation: seed + int64(i), State: api.VMReady, Desired: api.DesiredRunning}
 					before.VMs = append(before.VMs, v)
+					if fault != "no quarantine" && !(i == 2 && (fault == "clean recycle" || fault == "unknown attack")) {
+						events = append(events, api.Event{At: 20000, Kind: api.EventSecurity, VMID: v.ID, Generation: v.Generation, Detail: api.AttackImpersonate})
+					}
 					v.State, v.LastReason = api.VMFailed, api.ReasonQuarantined
 					middle.VMs, after.VMs = append(middle.VMs, v), append(after.VMs, v)
 				}
 				middle.Security.Blocked, after.Security.Blocked = 15, 15
+				after.Observed = []api.HostObservation{{HostID: after.Hosts[0].ID, Connected: true}}
 				switch fault {
+				case "clean recycle", "unknown attack":
+					after.VMs[2].State, after.VMs[2].LastReason = api.VMReady, "guest ready"
+					after.VMs[2].Generation++
+					after.Observed[0].Actual = []api.DriverVM{{VMID: after.VMs[2].ID, Generation: after.VMs[2].Generation, Running: true}}
+					if fault == "unknown attack" {
+						events = append(events, api.Event{At: 22000, Kind: api.EventSecurity, VMID: after.VMs[2].ID, Detail: "unknown impersonate"})
+					}
 				case "resurrection":
 					middle.VMs[1].State = api.VMReady
 					middle.VMs[1].Generation++
+				case "event resurrection":
+					events = append(events, api.Event{At: 25000, Kind: api.EventTransition, VMID: after.VMs[1].ID, Generation: after.VMs[1].Generation + 1, To: api.VMReady})
 				case "missing victim":
 					after.VMs = after.VMs[:2]
 				case "wrong terminal reason":
 					after.VMs[2].LastReason = api.ReasonRetryBudget
+				case "compromised driver running":
+					after.Observed[0].Actual = []api.DriverVM{{VMID: before.VMs[2].ID, Generation: before.VMs[2].Generation, Running: true}}
+				case "missing driver evidence":
+					after.Observed = nil
+				case "disconnected driver":
+					after.Observed[0].Connected = false
+				case "no quarantine":
+					for i := range after.VMs {
+						after.VMs[i].State = api.VMReady
+						after.VMs[i].Generation++
+					}
+				case "successful attack":
+					after.Security.Succeeded = 1
 				}
 				initial := before
 				initial.At = 0
-				return &fakeFleet{initial: initial, frames: []api.Snapshot{before, middle, after}}, func() {}, nil
+				return &fakeFleet{initial: initial, frames: []api.Snapshot{before, middle, after}, events: events}, func() {}, nil
 			}
 			// Different victim IDs and generations across concurrent runs expose
 			// accidental sharing between the catalog's action/check closures.
 			reports, err := Suite(context.Background(), []Scenario{s}, factory, Options{Repeat: 3, Parallel: 3, Seed: 7, Speed: 5, Output: t.TempDir()}, io.Discard)
-			if (err == nil) != (fault == "") {
+			if (err == nil) != wantPass {
 				t.Fatalf("fault=%s reports=%+v err=%v", fault, reports, err)
 			}
 		})
