@@ -1,6 +1,7 @@
 package invariant
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/hami-sh/vm/internal/api"
@@ -80,6 +81,130 @@ func TestCrossComponentSlackAndEventDeduplication(t *testing.T) {
 	}
 	if e := c.Check(s); len(e) != 0 {
 		t.Fatal("duplicate event checked twice", e)
+	}
+}
+
+func TestDriverAheadDuringSchedulerOutage(t *testing.T) {
+	c := New(config.Default())
+	s := api.Snapshot{At: 1036834, Scheduler: api.SchedulerUp, VMs: []api.VM{{ID: "vm33", State: api.VMReady, Desired: api.DesiredRunning, Generation: 1, HostID: "h"}}}
+	raw := Observation{Host: api.Host{ID: "h"}, Connected: true, Actual: []api.DriverVM{{VMID: "vm33", Generation: 2, Running: true}}}
+	// Seed 15's durable placement reached the driver before publication;
+	// the scheduler died 117ms later and published gen2 only after restart.
+	for _, at := range []int64{1036834, 1036951, 1044244, 1046699, 1046700, 1049392} {
+		s.At = at
+		if at >= 1036951 {
+			s.Scheduler = api.SchedulerDown
+		}
+		if at >= 1046700 {
+			s.Scheduler = api.SchedulerUp
+			s.VMs[0].Generation = 2
+			s.VMs[0].State = api.VMBooting
+		}
+		if at >= 1049392 {
+			s.VMs[0].State = api.VMReady
+		}
+		if out := c.Check(s, raw); len(out) != 0 {
+			t.Fatalf("at %d, durable copy is not stale: %v", at, out)
+		}
+		if out := c.CheckKeys(s, map[string]string{"vm33": "K"}, raw); len(out) != 0 {
+			t.Fatalf("at %d, one logical VM counted twice: %v", at, out)
+		}
+	}
+}
+
+func TestDriverAheadRequiresContinuousUpPublication(t *testing.T) {
+	cfg := config.Default()
+	hb := cfg.HostHeartbeat.Milliseconds()
+	for _, reset := range []string{"none", "higher-driver-generation", "down", "reconciling", "disconnected", "stopped", "caught-up"} {
+		t.Run(reset, func(t *testing.T) {
+			c := New(cfg)
+			s := api.Snapshot{At: 1000, Scheduler: api.SchedulerUp, VMs: []api.VM{{ID: "v", State: api.VMReady, Desired: api.DesiredRunning, Generation: 1, HostID: "h"}}}
+			raw := Observation{Host: api.Host{ID: "h"}, Connected: true, Actual: []api.DriverVM{{VMID: "v", Generation: 2, Running: true}}}
+			check := func(want bool) {
+				t.Helper()
+				out := c.Check(s, raw)
+				if !want && len(out) != 0 {
+					t.Fatalf("unexpected violation at %d: %v", s.At, out)
+				}
+				if want && (len(out) != 1 || !strings.HasPrefix(out[0].Detail, string(api.InvGenMonotonic)+":")) {
+					t.Fatalf("missing persist-before-act violation at %d: %v", s.At, out)
+				}
+			}
+			check(false)
+			s.At += hb
+			check(false) // Exactly one heartbeat is allowed.
+			switch reset {
+			case "higher-driver-generation":
+				raw.Actual[0].Generation = 3
+			case "down":
+				s.Scheduler = api.SchedulerDown
+			case "reconciling":
+				s.Scheduler = api.SchedulerReconciling
+			case "disconnected":
+				raw.Connected = false
+			case "stopped":
+				raw.Actual[0].Running = false
+			case "caught-up":
+				s.VMs[0].Generation = 2
+			}
+			s.At++
+			if reset == "higher-driver-generation" {
+				out := c.Check(s, raw)
+				if len(out) != 1 || !strings.HasPrefix(out[0].Detail, string(api.InvGenMonotonic)+":") {
+					t.Fatalf("increasing driver generation reset the deadline: %v", out)
+				}
+				return
+			}
+			check(reset == "none")
+			if reset == "none" {
+				return
+			}
+			s.At += 4 * hb // Neither outage nor disconnection ages the deadline.
+			check(false)
+			s.Scheduler, raw.Connected, raw.Actual[0].Running = api.SchedulerUp, true, true
+			raw.Actual[0].Generation = s.VMs[0].Generation + 1
+			s.At++
+			check(false)
+			s.At += hb
+			check(false)
+			s.At++
+			out := c.Check(s, raw)
+			if len(out) != 1 || !strings.HasPrefix(out[0].Detail, string(api.InvGenMonotonic)+":") {
+				t.Fatalf("continuous up publication did not fail: %v", out)
+			}
+		})
+	}
+}
+
+func TestDriverAheadKeyOwnershipAfterPublication(t *testing.T) {
+	cfg := config.Default()
+	c := New(cfg)
+	s := api.Snapshot{At: 1000, Scheduler: api.SchedulerDown, VMs: []api.VM{
+		{ID: "old", State: api.VMTerminated, Generation: 1},
+		{ID: "retry", State: api.VMReady, Generation: 1},
+	}}
+	raw := Observation{Host: api.Host{ID: "h"}, Connected: true, Actual: []api.DriverVM{{VMID: "old", Generation: 2, Running: true}}}
+	keys := map[string]string{"old": "K", "retry": "K"}
+	for range 3 {
+		if out := c.CheckKeys(s, keys, raw); len(out) != 0 {
+			t.Fatalf("ahead-of-publication copy became a second owner: %v", out)
+		}
+		s.At += cfg.HostHeartbeat.Milliseconds() + 1
+	}
+	// Once publication catches up, this is a genuine retired copy sharing
+	// the retry's key, and must stop within the ordinary heartbeat bound.
+	s.Scheduler = api.SchedulerUp
+	s.VMs[0].Generation = 2
+	if out := c.CheckKeys(s, keys, raw); len(out) != 0 {
+		t.Fatal("missing heartbeat slack after publication", out)
+	}
+	s.At += cfg.HostHeartbeat.Milliseconds()
+	if out := c.CheckKeys(s, keys, raw); len(out) != 0 {
+		t.Fatal("exact heartbeat boundary", out)
+	}
+	s.At++
+	if out := c.CheckKeys(s, keys, raw); len(out) != 1 {
+		t.Fatal("published second logical VM not detected", out)
 	}
 }
 
