@@ -15,16 +15,28 @@ const CHECKS = {
   pending_placed_promptly: 'A Pending VM is placed within 2 s of capacity being free.',
 };
 
+// Short names for the lights; the full name and the rule show on click.
+const SHORT = {
+  one_authoritative_copy: 'One live copy',
+  stale_copy_stopped: 'Stale copy stopped',
+  slot_capacity: 'Slot capacity',
+  generation_monotonic: 'Generations rise',
+  legal_transitions: 'Legal transitions',
+  queue_bounded: 'Queue bounded',
+  no_successful_attack: 'No attack succeeds',
+  pending_placed_promptly: 'Prompt placement',
+};
+
 function invariants(s, st) {
   const list = s.invariants || [];
   const total = list.reduce((n, x) => n + x.violations, 0);
   const lights = list
-    .map((x, i) => {
+    .map((x) => {
       const cls = ['light'];
       if (x.violations) cls.push('bad');
       if (st.invariant === x.name) cls.push('on');
-      return `<button class="${cls.join(' ')}" data-act="invariant" data-name="${esc(x.name)}" title="${esc(CHECKS[x.name] || '')}">
-        <i></i><span class="n">${i + 1}</span><span class="name">${esc(INVARIANTS[x.name] || title(x.name))}</span><span class="count">${x.violations}</span></button>`;
+      return `<button class="${cls.join(' ')}" data-act="invariant" data-name="${esc(x.name)}" title="${esc(INVARIANTS[x.name] || title(x.name))}: ${esc(CHECKS[x.name] || '')}">
+        <i></i><span class="name">${esc(SHORT[x.name] || INVARIANTS[x.name] || title(x.name))}</span><span class="count">${x.violations}</span></button>`;
     })
     .join('');
   const open = list.find((x) => x.name === st.invariant);
@@ -40,7 +52,7 @@ function invariants(s, st) {
   return {
     total,
     html: `<div class="ev-section">
-      <div class="ev-title"><h2>Invariants</h2><span class="dim">checked every 100 ms of sim time</span><span class="spacer"></span>
+      <div class="ev-title"><h2>Invariants</h2><span class="dim">checked every 100 ms</span><span class="spacer"></span>
         <span class="mono ${total ? 'bad' : 'dim'}">${total} violation${total === 1 ? '' : 's'}</span></div>
       <div class="lights">${lights}</div>${detail}</div>`,
   };

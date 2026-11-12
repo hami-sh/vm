@@ -6,7 +6,7 @@ import { $, esc, mount, stateVar, prio, dur, plural, vmName } from './util.js';
 const LEASE = { healthy: 'var(--ok)', suspect: 'var(--warn)', lost: 'var(--bad)' };
 const SCHED = { up: 'var(--ok)', reconciling: 'var(--warn)', down: 'var(--bad)' };
 const UNPLACED = ['Pending', 'Failed', 'Terminated'];
-const MAX_UNPLACED = 18;
+const MAX_UNPLACED = 6;
 
 const isSel = (st, kind, id) => st.selection?.kind === kind && st.selection.id === id;
 
@@ -18,7 +18,7 @@ export function vmChip(vm, st, slotState) {
   if (st.highlight === vm.id) cls.push('hl');
   const p = prio(vm.priority);
   const note = vm.compromised
-    ? 'compromised'
+    ? 'hostile'
     : vm.state !== 'Ready' && vm.last_reason
       ? vm.last_reason.replace(/_/g, ' ')
       : '';
@@ -39,7 +39,7 @@ function slot(sl, vms, st) {
 
 function leaseText(h) {
   if (h.lease === 'healthy') return `heartbeat ${dur(h.lease_age_ms)}`;
-  return `${h.lease} · silent ${dur(h.lease_age_ms)}`;
+  return `${h.lease} · ${dur(h.lease_age_ms)} silent`;
 }
 
 function hostCard(h, vms, st) {

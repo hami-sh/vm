@@ -14,7 +14,7 @@ function matches(e, text) {
   return [e.vm_id, e.vm_id && vmName(e.vm_id), e.host_id, e.rack, e.detail, e.kind].some((x) => x && x.toLowerCase().includes(text));
 }
 
-function row(e, st) {
+function row(e, st, n) {
   const refs = [];
   if (e.vm_id) refs.push(ref('vm', e.vm_id, st));
   if (e.host_id) refs.push(ref('host', e.host_id, st));
@@ -30,7 +30,7 @@ function row(e, st) {
   return `<div class="${cls.join(' ')}">
     <span class="log-time">${clock(e.at)}</span>
     <span>${badge(e.kind, EVENT_KINDS[e.kind] || 'var(--dim)')}</span>
-    <span class="log-text">${refs.join(' ')} ${gen}${move}<span class="${e.from || e.to ? 'dim' : ''}">${esc(shorten(e.detail))}</span></span>
+    <span class="log-text">${refs.join(' ')} ${gen}${move}<span class="${e.from || e.to ? 'dim' : ''}">${esc(shorten(e.detail))}</span>${n > 1 ? `<span class="log-n" title="${n} identical events in a row">×${n}</span>` : ''}</span>
   </div>`;
 }
 
@@ -43,11 +43,18 @@ export function render(st, v) {
       .join(''),
   );
   const text = st.log.text.trim().toLowerCase();
-  const rows = [];
-  for (let i = v.events.length - 1; i >= 0 && rows.length < MAX_ROWS; i--) {
+  // Newest first. A run of identical events (a flood of 429s) folds into one
+  // row with a count, so it cannot push everything else out of view.
+  const groups = [];
+  for (let i = v.events.length - 1; i >= 0 && groups.length <= MAX_ROWS; i--) {
     const e = v.events[i];
-    if ((kinds.size === 0 || kinds.has(e.kind)) && matches(e, text)) rows.push(row(e, st));
+    if (!(kinds.size === 0 || kinds.has(e.kind)) || !matches(e, text)) continue;
+    const key = [e.kind, e.vm_id, e.host_id, e.rack, e.from, e.to, e.detail].join('|');
+    const last = groups.at(-1);
+    if (last && last.key === key) last.n++;
+    else groups.push({ key, e, n: 1 });
   }
+  const rows = groups.slice(0, MAX_ROWS).map((g) => row(g.e, st, g.n));
   const none = v.events.length ? 'No events match the filter.' : 'No events yet.';
   mount($('#log'), rows.join('') || `<div class="empty">${none}</div>`);
 }

@@ -17,10 +17,10 @@ function row(q, i, now, live) {
     : '<span></span>';
   return `<div class="q-row">
     <span class="q-pos">${i + 1}</span>
-    <span class="q-main">${badge(eff.label, eff.color)}<button class="ref" data-act="ref" data-kind="vm" data-id="${esc(q.vm_id)}" title="${esc(q.vm_id)}">${esc(vmName(q.vm_id))}</button>${
+    <span class="q-main"><span class="vm-prio" style="--p:${eff.color}" title="${eff.label}">${eff.short}</span><button class="ref" data-act="ref" data-kind="vm" data-id="${esc(q.vm_id)}" title="${esc(q.vm_id)}">${esc(vmName(q.vm_id))}</button>${
       q.reason !== 'new' ? badge(q.reason, REASON[q.reason] || 'var(--dim)') : ''
     }${aged}</span>
-    <span class="q-wait">${backoff ? `<span class="backoff">retry in ${dur(q.not_before - now)}</span>` : `waited ${dur(now - q.enqueued_at)}`}</span>
+    <span class="q-wait">${backoff ? `<span class="backoff">retry in ${dur(q.not_before - now)}</span>` : `<span title="Time in the queue">${dur(now - q.enqueued_at)}</span>`}</span>
     ${move}
   </div>`;
 }

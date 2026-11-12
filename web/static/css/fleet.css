@@ -36,11 +36,11 @@
 .host.lease-lost { background: repeating-linear-gradient(135deg, rgba(255, 93, 108, .06) 0 6px, transparent 6px 12px), var(--bg); }
 .host.admin-cordoned, .host.admin-draining { border-top-style: dashed; border-right-style: dashed; border-bottom-style: dashed; }
 .host-head { display: flex; align-items: center; gap: 8px; min-height: 18px; }
-.host-id { padding: 0; font: 600 12px var(--mono); color: var(--text); background: none; border: 0; cursor: pointer; }
-.lease { display: inline-flex; align-items: center; gap: 5px; color: var(--dim); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.host-id { flex: none; white-space: nowrap; padding: 0; font: 600 12px var(--mono); color: var(--text); background: none; border: 0; cursor: pointer; }
+.lease { min-width: 0; display: inline-flex; align-items: center; gap: 5px; color: var(--dim); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .lease i { width: 6px; height: 6px; border-radius: 50%; background: var(--lease); flex: none; }
 .host.lease-suspect .lease, .host.lease-lost .lease { color: var(--lease); }
-.tags { display: flex; gap: 4px; margin-left: auto; }
+.tags { display: flex; flex: none; gap: 4px; margin-left: auto; }
 .tag {
   height: 16px; padding: 0 5px; border-radius: 3px; font-size: 10px; font-weight: 600; line-height: 16px;
   letter-spacing: .03em; text-transform: uppercase; white-space: nowrap;
@@ -90,10 +90,10 @@
 }
 .stale b { font: 600 10.5px var(--mono); }
 
-.unplaced { display: grid; gap: 8px; padding: 10px 12px 12px; border-top: 1px solid var(--line); }
-.unplaced-title { font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); }
+.unplaced { display: flex; flex-wrap: wrap; gap: 8px 28px; padding: 10px 12px 12px; border-top: 1px solid var(--line); }
+.unplaced-title { flex: 0 0 100%; font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); }
 .unplaced-group { display: flex; align-items: flex-start; gap: 10px; }
-.unplaced-label { display: inline-flex; align-items: center; gap: 6px; width: 104px; height: 40px; flex: none; color: var(--dim); }
+.unplaced-label { display: inline-flex; align-items: center; gap: 6px; min-width: 96px; height: 40px; flex: none; color: var(--dim); }
 .unplaced-label b { color: var(--text); font-family: var(--mono); font-weight: 500; }
 .unplaced-chips { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
 .unplaced-chips .vm { width: 136px; }
