@@ -42,6 +42,40 @@ const OFF = {
 const ELSEWHERE = new Set(['reset', 'noise', 'sustained-load', 'flood', 'add-rack']);
 const DESTRUCTIVE = new Set(['delete', 'wipe-store', 'remove-rack', 'power-off-rack']);
 
+const EFFECTS = {
+  'kill-guestd': 'Stop the in-VM health agent to test detection and replacement',
+  'crash-vm': 'Crash the VM to test automatic recovery',
+  'hang-next-boot': 'Make the next boot hang to test the boot deadline',
+  'slow-boot': 'Multiply boot time on this host by the specified factor',
+  compromise: 'Make the guest attempt unauthorized control-plane operations',
+  'kill-host': 'Power off this host and its VMs to test replacement elsewhere',
+  'pause-heartbeats': 'Stop host health reports while its VMs keep running',
+  'restart-host': 'Restart the host agent and recover its running VM inventory',
+  'clock-skew': 'Offset this host’s clock by the specified milliseconds',
+  'fill-disk': 'Simulate a full disk so this host cannot accept new VMs',
+  cordon: 'Stop placing new VMs on this host',
+  'partition-rack': 'Disconnect this rack from the scheduler while its VMs keep running',
+  'one-way-partition': 'Drop communication in one direction between this host and the scheduler',
+  'latency-spike': 'Add the specified milliseconds of network delay',
+  'packet-loss': 'Drop the specified percentage of network messages',
+  'duplicate-messages': 'Deliver duplicate network messages to test safe retries',
+  'reorder-messages': 'Deliver network messages out of order',
+  'kill-scheduler': 'Stop scheduling while existing host VMs keep running',
+  'wipe-store': 'Erase scheduler state to test recovery from host inventories',
+  'slow-store': 'Delay each durable scheduler commit by the specified milliseconds',
+  'burst-after-rack-loss': 'Power off this rack and submit the specified number of VM requests',
+  'remove-rack': 'Drain the rack’s hosts and remove them after they are empty',
+  'heal-rack': 'Restore communication between this rack and the scheduler',
+  'power-off-rack': 'Power off every host and VM in this rack',
+  'resume-heartbeats': 'Resume host health reports to the scheduler',
+  'restart-scheduler': 'Restart the scheduler and reconcile its durable state',
+  uncordon: 'Allow new VM placements on this host again',
+  drain: 'Stop new placements, then move remaining VMs after the grace period',
+  'add-host': 'Add hosts to this rack using the count beside this button',
+  'impostor-register': 'Attempt a forged host registration from this guest',
+  delete: 'Delete this VM and release its capacity',
+};
+
 // describe returns the menu's heading for a target, or null if it is gone.
 function describe(kind, id, s) {
   if (kind === 'vm') {
@@ -81,7 +115,7 @@ function item(a, recover) {
   const params = (a.params || [])
     .map(
       (p) =>
-        `<span class="menu-param">${esc(p)}<input type="number" step="any" data-param="${esc(p)}" value="${defaults[p] ?? 1}" aria-label="${esc(a.label)} ${esc(p)}"></span>`,
+        `<span class="menu-param">${esc(p)}<input type="number" step="any" data-param="${esc(p)}" value="${defaults[p] ?? 1}" title="Set ${esc(p === 'ms' ? 'milliseconds' : p === 'factor' ? 'the slowdown multiplier' : p === 'percent' ? 'the percentage' : p)} before applying ${esc(a.label.toLowerCase())}" aria-label="${esc(a.label)} ${esc(p)}"></span>`,
     )
     .join('');
   const off = OFF[a.name]
@@ -91,7 +125,7 @@ function item(a, recover) {
   if (recover) cls.push('suggested');
   if (DESTRUCTIVE.has(a.name)) cls.push('danger');
   return `<div class="${cls.join(' ')}">
-    <button data-act="chaos" data-action="${esc(a.name)}"><span>${esc(a.label)}</span></button>${params}${off}
+    <button data-act="chaos" data-action="${esc(a.name)}" title="${esc(EFFECTS[a.name] || `Apply ${a.label.toLowerCase()} to the selected ${a.target}`)}"><span>${esc(a.label)}</span></button>${params}${off}
   </div>`;
 }
 
@@ -119,7 +153,7 @@ function build(m, s, catalog) {
         .join('')
     : `<div class="menu-note">${catalog.actions.length ? 'No actions for this target.' : 'The action catalogue has not loaded.'}</div>`;
   return `<div class="menu" role="menu" aria-label="Chaos actions for ${esc(head.name)}">
-    <div class="menu-head"><b>${esc(head.name)}</b><span class="sub">${esc(head.sub)}</span><button class="menu-x" data-act="menu-close" aria-label="Close">×</button></div>
+    <div class="menu-head"><b>${esc(head.name)}</b><span class="sub">${esc(head.sub)}</span><button class="menu-x" data-act="menu-close" title="Close this action menu without applying a fault" aria-label="Close">×</button></div>
     ${body}
   </div>`;
 }

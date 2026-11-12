@@ -12,7 +12,7 @@
 </head>
 <body>
 <header class="topbar">
-  <a class="brand" href="#/"><span class="brand-mark"></span>macOS VM control plane</a>
+  <a class="brand" href="#/" title="Return to the live fleet dashboard"><span class="brand-mark"></span>macOS VM control plane</a>
   <nav class="nav" id="nav"></nav>
 </header>
 
@@ -34,7 +34,7 @@
           <h2>Events</h2>
           <div class="log-kinds" id="log-kinds"></div>
           <!-- Static so typing isn't interrupted by a re-render. -->
-          <input class="input log-filter" id="log-filter" type="search" placeholder="rack, host or VM id" spellcheck="false" autocomplete="off">
+          <input class="input log-filter" id="log-filter" type="search" placeholder="rack, host or VM id" title="Filter events by rack, host, VM ID or text. Clear to show all events." spellcheck="false" autocomplete="off">
         </header>
         <div class="log" id="log"></div>
     </section>

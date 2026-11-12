@@ -7,7 +7,7 @@ const MAX_ROWS = 200;
 const STRONG = new Set(['fencing', 'invariant', 'alert', 'security']);
 
 const ref = (kind, id, st) =>
-  `<button class="ref${st.selection?.kind === kind && st.selection.id === id ? ' on' : ''}" data-act="ref" data-kind="${kind}" data-id="${esc(id)}" title="${esc(id)}">${esc(kind === 'vm' ? vmName(id) : id)}</button>`;
+  `<button class="ref${st.selection?.kind === kind && st.selection.id === id ? ' on' : ''}" data-act="ref" data-kind="${kind}" data-id="${esc(id)}" title="Inspect ${esc(kind)} ${esc(id)} and its recent history">${esc(kind === 'vm' ? vmName(id) : id)}</button>`;
 
 function matches(e, text) {
   if (!text) return true;
@@ -39,7 +39,7 @@ export function render(st, v) {
   mount(
     $('#log-kinds'),
     Object.entries(EVENT_KINDS)
-      .map(([kind, color]) => `<button class="chip${kinds.has(kind) ? ' on' : ''}" style="--c:${color}" data-act="log-kind" data-kind="${kind}"><i></i>${kind}</button>`)
+      .map(([kind, color]) => `<button class="chip${kinds.has(kind) ? ' on' : ''}" style="--c:${color}" data-act="log-kind" data-kind="${kind}" title="Toggle ${kind} events in the log. With no kinds selected, all events are shown."><i></i>${kind}</button>`)
       .join(''),
   );
   const text = st.log.text.trim().toLowerCase();

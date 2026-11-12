@@ -9,8 +9,8 @@ function nav(st) {
   const page = st.route.page;
   mount(
     $('#nav'),
-    `<a href="#/" class="${page === 'live' ? 'on' : ''}">Live</a>
-     <a href="#/runs" class="${page !== 'live' ? 'on' : ''}">Runs</a>`,
+    `<a href="#/" title="Watch and control the live fleet" class="${page === 'live' ? 'on' : ''}">Live</a>
+     <a href="#/runs" title="Browse recorded scenarios, replay snapshots and inspect their reports" class="${page !== 'live' ? 'on' : ''}">Runs</a>`,
   );
 }
 

@@ -148,7 +148,7 @@ function chart(s, st, v) {
   return `<div class="ev-section">
     <div class="ev-title"><h2>Time to Ready</h2><span class="spacer"></span>
       <div class="seg">${PRIORITIES.slice(1)
-        .map((p) => `<button data-act="chart-class" data-class="${p.key}" class="${p.key === cls ? 'on' : ''}">${p.label}</button>`)
+        .map((p) => `<button data-act="chart-class" data-class="${p.key}" title="Show time-to-Ready percentiles and queue depth for ${p.label} requests" class="${p.key === cls ? 'on' : ''}">${p.label}</button>`)
         .join('')}</div></div>
     <svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="p50 and p99 time to Ready, ${esc(cls)} class">
       ${shade}${grid}

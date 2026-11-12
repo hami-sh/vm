@@ -23,7 +23,7 @@ export function vmChip(vm, st, slotState) {
       ? vm.last_reason.replace(/_/g, ' ')
       : '';
   return `<button class="${cls.join(' ')}" style="--c:${stateVar(vm.state)}" data-act="pick" data-kind="vm" data-id="${esc(vm.id)}"
-    title="${esc(vm.id)} · ${esc(vm.state)} · gen ${vm.gen} · ${p.label}${note ? ' · ' + esc(note) : ''}">
+    title="Inspect VM ${esc(vm.id)} and its history · ${esc(vm.state)} · gen ${vm.gen} · ${p.label}${note ? ' · ' + esc(note) : ''}">
     <span class="vm-top"><span class="vm-id">${esc(vmName(vm.id))}</span></span>
     <span class="vm-bot"><span class="vm-state" title="${esc(stateMeaning(vm.state))}">${esc(vm.state)}</span><span class="vm-gen" title="Generation: increases on re-placement">g${vm.gen}</span><span class="vm-prio" title="Priority: ${p.label}" style="--p:${p.color}">${p.short}</span></span>
   </button>`;
@@ -71,7 +71,7 @@ function rackCol(r, hosts, vms, st) {
   if (r.partitioned) cls.push('partitioned');
   if (isSel(st, 'rack', r.id)) cls.push('sel');
   return `<div class="${cls.join(' ')}">
-    <button class="rack-head" data-act="pick" data-kind="rack" data-id="${esc(r.id)}">
+    <button class="rack-head" data-act="pick" data-kind="rack" data-id="${esc(r.id)}" title="Inspect rack ${esc(r.id)}, its capacity and recent history">
       <span class="rack-id">Rack ${esc(r.id)}</span>
       <span class="rack-meta">${plural(mine.length, 'host')} · ${used}/${total} slots${down ? ` · <span class="bad">${down} down</span>` : ''}</span>
       ${r.partitioned ? '<span class="tag fault">partitioned</span>' : ''}
@@ -118,7 +118,7 @@ export function render(st, v) {
       <h2>${st.source?.startsWith('Fixture') ? 'Fixture fleet' : 'Fleet'}</h2>
       <span class="dim">${plural(s.racks.length, 'rack')} · ${plural(s.hosts.filter((h) => h.admin_state !== 'removed').length, 'host')}</span>
       <span class="spacer"></span>
-      <button class="sched${isSel(st, 'scheduler', 'scheduler') ? ' sel' : ''}" style="--c:${SCHED[sched] || 'var(--faint)'}" data-act="pick" data-kind="scheduler" data-id="scheduler">
+      <button class="sched${isSel(st, 'scheduler', 'scheduler') ? ' sel' : ''}" style="--c:${SCHED[sched] || 'var(--faint)'}" data-act="pick" data-kind="scheduler" data-id="scheduler" title="Inspect scheduler status, authority epoch and recent history">
         <i></i><span>Scheduler</span><b>${esc(sched)}</b><span class="dim">epoch ${s.epoch}</span>
         <span aria-hidden="true">⋯</span>
       </button>

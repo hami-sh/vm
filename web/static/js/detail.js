@@ -13,7 +13,7 @@ const kv = (pairs) =>
 
 const head = (name, tag) =>
   `<header class="panel-head"><span class="detail-title">${esc(name)}</span>${tag}<span class="spacer"></span>
-    <button class="btn sm" data-act="deselect" aria-label="Close inspector">Close ×</button></header>`;
+    <button class="btn sm" data-act="deselect" title="Close this inspector and clear the selection" aria-label="Close inspector">Close ×</button></header>`;
 
 function eventRows(list, empty) {
   if (!list.length) return `<div class="empty">${empty}</div>`;

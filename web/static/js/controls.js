@@ -46,12 +46,12 @@ function requestSettings(s) {
   return `<div class="ctl">
     <div class="ctl-title"><h2>Single-VM settings</h2><span class="dim">Optional settings for the Create VM button.</span></div>
     <div class="create-form">
-      <label>Environment · software and VM size<select class="input" data-change="form" data-key="pool" aria-label="VM environment">${options(pools, form.pool)}</select></label>
-      <label>When the fleet is full, serve this request<select class="input" data-change="form" data-key="priority" aria-label="Queue priority">${options([['interactive', 'First · urgent'], ['standard', 'Normally · default'], ['batch', 'Last · background work']], form.priority)}</select></label>
+      <label>Environment · software and VM size<select class="input" data-change="form" data-key="pool" title="Choose the macOS image, Xcode version, CPU and memory for the next single VM request" aria-label="VM environment">${options(pools, form.pool)}</select></label>
+      <label>When the fleet is full, serve this request<select class="input" data-change="form" data-key="priority" title="Choose where the next single VM request waits in the queue: urgent before normal, background after normal" aria-label="Queue priority">${options([['interactive', 'First · urgent'], ['standard', 'Normally · default'], ['batch', 'Last · background work']], form.priority)}</select></label>
     </div>
     <div class="ctl-title"><h2>Automatic traffic</h2><span class="dim">Continuously creates VMs to test admission and recovery. Set to 0 to stop.</span></div>
     <div class="ctl-row"><span class="lbl">New VMs per sim-second</span>
-      <input type="range" min="0" max="${MAX_RATE}" step="0.1" value="${rate}" data-input="slide" data-unit="/s" data-digits="1" data-change="load-rate" aria-label="Sustained create rate">
+      <input type="range" min="0" max="${MAX_RATE}" step="0.1" value="${rate}" data-input="slide" data-unit="/s" data-digits="1" data-change="load-rate" title="Set how many new VM requests arrive per simulated second. Set to 0 to stop automatic traffic." aria-label="Sustained create rate">
       <output>${rate.toFixed(1)}/s</output></div>
     <div class="ctl-row"><span class="lbl">Queue priority for automatic traffic</span>
       <div class="seg">${Object.entries(MIXES)
@@ -68,16 +68,16 @@ function topology(s) {
   return `<div class="ctl">
     <div class="ctl-title"><h2>Topology</h2><span class="dim">grow, shrink and drain</span></div>
     <div class="ctl-row"><span class="lbl">Rack</span>
-      <button class="btn" data-act="add-rack">Add rack</button>
+      <button class="btn" data-act="add-rack" title="Add a new rack with the number of hosts specified beside this button">Add rack</button>
       <span class="dim">with</span>
-      <input class="input num" type="number" min="1" max="8" value="${form.rackHosts}" data-change="form" data-key="rackHosts" aria-label="Hosts in the new rack">
+      <input class="input num" type="number" min="1" max="8" value="${form.rackHosts}" data-change="form" data-key="rackHosts" title="Choose how many hosts the Add rack button creates, from 1 to 8" aria-label="Hosts in the new rack">
       <span class="dim">hosts</span></div>
     <div class="ctl-row"><span class="lbl">Host</span>
-      <button class="btn" data-act="add-host" ${racks.length ? '' : 'disabled'}>Add host</button>
+      <button class="btn" data-act="add-host" title="Add one host to the rack selected beside this button" ${racks.length ? '' : 'disabled'}>Add host</button>
       <span class="dim">to</span>
-      <select class="input" data-change="form" data-key="addTo" aria-label="Rack to grow">${options(racks.map((r) => [r, `rack ${r}`]), form.addTo)}</select></div>
+      <select class="input" data-change="form" data-key="addTo" title="Choose which rack receives the new host when you click Add host" aria-label="Rack to grow">${options(racks.map((r) => [r, `rack ${r}`]), form.addTo)}</select></div>
     <div class="ctl-row"><span class="lbl">Drain</span>
-      <select class="input" data-change="form" data-key="drain" aria-label="Host to drain">${options(hosts.map((h) => [h, h]), form.drain)}</select>
+      <select class="input" data-change="form" data-key="drain" title="Choose the host to stop placing new VMs on when you click Drain" aria-label="Host to drain">${options(hosts.map((h) => [h, h]), form.drain)}</select>
       <button class="btn" data-act="drain" ${hosts.length ? '' : 'disabled'} title="Stop new placements now; move its VMs after the grace period">Drain</button></div>
   </div>`;
 }
@@ -96,29 +96,38 @@ function chaos(s, catalog) {
     const names = ambient.filter((a) => a.layer === layer).map((a) => a.name);
     if (!names.length) return '';
     const n = names.filter((x) => on.has(x)).length;
-    return `<button class="chip${n ? ' on' : ''}" data-act="filter" data-layer="${layer}" title="${esc(names.join(', '))}">${label} <b>${n}</b></button>`;
+    return `<button class="chip${n ? ' on' : ''}" data-act="filter" data-layer="${layer}" title="Toggle random ${label.toLowerCase()} faults: ${esc(names.join(', '))}">${label} <b>${n}</b></button>`;
   }).join('');
   const scope = s.sim.racks || [];
   const racks = s.racks
-    .map((r) => `<button class="chip${scope.includes(r.id) ? ' on' : ''}" data-act="scope" data-rack="${esc(r.id)}">${esc(r.id)}</button>`)
+    .map((r) => `<button class="chip${scope.includes(r.id) ? ' on' : ''}" data-act="scope" data-rack="${esc(r.id)}" title="Toggle rack ${esc(r.id)} in the set affected by random faults">${esc(r.id)}</button>`)
     .join('');
   return `<div class="ctl">
     <div class="ctl-title"><h2>Ambient chaos</h2><span class="dim">seeded random faults</span></div>
     <div class="ctl-row"><span class="lbl">Intensity</span>
-      <input type="range" min="0" max="100" step="1" value="${Math.round(intensity * 100)}" data-input="slide" data-unit="%" data-digits="0" data-change="intensity" aria-label="Ambient chaos intensity">
+      <input type="range" min="0" max="100" step="1" value="${Math.round(intensity * 100)}" data-input="slide" data-unit="%" data-digits="0" data-change="intensity" title="Control the frequency of random faults. Set to 0 to stop injecting new random faults." aria-label="Ambient chaos intensity">
       <output>${Math.round(intensity * 100)}%</output></div>
     <div class="ctl-row"><span class="lbl">Faults</span>${layers || '<span class="faint">catalogue not loaded</span>'}</div>
     <div class="ctl-row"><span class="lbl">Racks</span>
-      <button class="chip${scope.length ? '' : ' on'}" data-act="scope" data-rack="">all</button>${racks}</div>
+      <button class="chip${scope.length ? '' : ' on'}" data-act="scope" data-rack="" title="Allow random faults to affect any rack">all</button>${racks}</div>
   </div>`;
 }
+
+const SCENARIOS = {
+  'split-brain': 'Disconnect a rack while its VMs keep running, then restore communication',
+  'gray-failure': 'Silence health reports from up to three hosts, then resume them',
+  'thundering-herd': 'Fill most capacity, power off a rack, then flood the remaining fleet with urgent requests',
+  'rolling-maintenance': 'Drain and remove racks one at a time',
+  'hostile-tenant': 'Compromise up to three existing VMs and submit a burst of new requests',
+  'bad-day': 'Combine random faults, network delay, a request burst and a scheduler restart',
+};
 
 function presets(catalog) {
   return `<div class="ctl wide">
     <div class="ctl-title"><h2>Scenarios</h2><span class="dim">Start a fault sequence and record it</span></div>
     <div class="ctl-row">
       <div class="presets">${catalog.presets
-        .map((p) => `<button class="btn" data-act="preset" data-name="${esc(p.name)}" title="Start ${esc(p.label)}; view the recording in Runs after completion">${esc(p.label)}</button>`)
+        .map((p) => `<button class="btn" data-act="preset" data-name="${esc(p.name)}" title="${esc(SCENARIOS[p.name] || `Start ${p.label}`)}. Records a run for playback and inspection in Runs.">${esc(p.label)}</button>`)
         .join('')}</div>
       </div>
   </div>`;

@@ -92,9 +92,9 @@ function list(st) {
   const passed = runs.filter((r) => r.passed).length;
   const rows = runs
     .map(
-      (r) => `<tr data-act="open-run" data-id="${esc(r.id)}">
+      (r) => `<tr data-act="open-run" data-id="${esc(r.id)}" title="Open ${esc(r.scenario)} recording and its invariant report">
         <td>${verdict(r.passed)}</td>
-        <td><a class="mono" href="#/runs/${encodeURIComponent(r.id)}">${esc(r.id)}</a></td>
+        <td><a class="mono" href="#/runs/${encodeURIComponent(r.id)}" title="Replay recording ${esc(r.id)} and inspect its report">${esc(r.id)}</a></td>
         <td>${esc(r.scenario)}</td>
         <td class="num">${r.seed}</td>
         <td class="num">${r.speed}×</td>
@@ -137,14 +137,14 @@ function runbar(st) {
   const ready = frames.length > 0;
   mount(
     $('#run-info'),
-    `<a class="btn ghost sm" href="#/runs">← Runs</a>
+    `<a class="btn ghost sm" href="#/runs" title="Return to the list of recorded runs">← Runs</a>
      <b class="mono">${esc(run.id)}</b>
      ${r ? `${verdict(r.passed)}<span class="dim">${esc(r.scenario)} · seed ${r.seed} · recorded at ${r.speed}×</span>` : `<span class="dim">${esc(run.error || 'Loading…')}</span>`}
      <span class="spacer"></span>
      <button class="btn icon" data-act="run-step" data-by="-1" ${ready ? '' : 'disabled'} title="Back one snapshot (←)" aria-label="Step back">‹</button>
      <button class="btn icon primary" data-act="run-play" ${ready ? '' : 'disabled'} title="Play or pause (space)" aria-label="${run.playing ? 'Pause' : 'Play'}">${run.playing ? '❚❚' : '▶'}</button>
      <button class="btn icon" data-act="run-step" data-by="1" ${ready ? '' : 'disabled'} title="Forward one snapshot (→)" aria-label="Step forward">›</button>
-     <div class="seg" role="group" aria-label="Playback rate">${RATES.map((x) => `<button data-act="run-rate" data-rate="${x}" class="${x === run.rate ? 'on' : ''}">${x}×</button>`).join('')}</div>
+     <div class="seg" role="group" aria-label="Playback rate">${RATES.map((x) => `<button data-act="run-rate" data-rate="${x}" title="Replay the recording at ${x} times its simulated speed" class="${x === run.rate ? 'on' : ''}">${x}×</button>`).join('')}</div>
      <span class="run-time mono">${frame ? clock(frame.at) : '--:--:--'}</span>
      <span class="dim mono">${ready ? `${run.cursor + 1}/${frames.length}` : ''}</span>`,
   );
@@ -165,7 +165,7 @@ function runbar(st) {
   mount(
     $('#run-scrub'),
     `<div class="marks">${marks}</div>
-     <input type="range" id="scrubber" data-live data-input="scrub" min="0" max="${frames.length - 1}" step="1" aria-label="Position in the recording">
+     <input type="range" id="scrubber" data-live data-input="scrub" min="0" max="${frames.length - 1}" step="1" title="Drag to inspect a snapshot in the recording. Arrow keys step; Home and End jump to the start and finish." aria-label="Position in the recording">
      <div class="scrub-ends"><span>${clock(from)}</span>
        <span class="scrub-key"><i class="mark-key"></i>chaos action<i class="mark-key violation"></i>invariant violation</span>
        <span>${clock(from + span)}</span></div>`,
@@ -194,7 +194,7 @@ function report(st) {
       return `<div class="check ${c.passed ? 'pass' : 'fail'}">
         <i>${c.passed ? '✓' : '✕'}</i>
         <div><b>${esc(title(c.name))}</b>${c.detail ? `<span>${esc(shorten(c.detail))}</span>` : ''}</div>
-        ${bad ? `<button class="btn sm danger" data-act="seek" data-at="${bad.at}">Go to ${clock(bad.at)}</button>` : ''}
+        ${bad ? `<button class="btn sm danger" data-act="seek" data-at="${bad.at}" title="Jump to the first recorded violation of this check">Go to ${clock(bad.at)}</button>` : ''}
       </div>`;
     })
     .join('');
@@ -206,7 +206,7 @@ function report(st) {
   const markers = (r.markers || [])
     .map((m) => {
       const bad = isViolation(m);
-      return `<button class="marker-row${bad ? ' violation' : ''}${m.at <= cursorAt ? ' past' : ''}" data-act="seek" data-at="${m.at}">
+      return `<button class="marker-row${bad ? ' violation' : ''}${m.at <= cursorAt ? ' past' : ''}" data-act="seek" data-at="${m.at}" title="Jump to ${clock(m.at)}: ${esc(m.detail)}">
         <span class="t">${clock(m.at)}</span>${badge(bad ? 'violation' : m.kind, bad ? 'var(--bad)' : EVENT_KINDS[m.kind] || 'var(--dim)')}
         <span class="d">${esc(shorten(m.detail))}${m.host_id ? ` · ${esc(m.host_id)}` : ''}</span></button>`;
     })
@@ -214,7 +214,7 @@ function report(st) {
   mount(
     el,
     `<header class="panel-head"><h2>Report</h2>${verdict(r.passed)}<span class="spacer"></span>
-       <a class="btn ghost sm" href="/v1/runs/${encodeURIComponent(run.id)}" target="_blank" rel="noopener">report.json</a></header>
+       <a class="btn ghost sm" href="/v1/runs/${encodeURIComponent(run.id)}" target="_blank" rel="noopener" title="Open the full machine-readable run report in a new tab">report.json</a></header>
      <div class="kv">
        <div><span class="k">Scenario</span><span class="v">${esc(r.scenario)}</span></div>
        <div><span class="k">Seed</span><span class="v">${r.seed}</span></div>
