@@ -514,6 +514,99 @@ func TestReregisterAfterDroppedRegistration(t *testing.T) {
 	}
 }
 
+func TestBlockedGuestLeaseExpiry(t *testing.T) {
+	for _, recent := range []bool{true, false} {
+		t.Run(fmt.Sprintf("recent=%v", recent), func(t *testing.T) {
+			cfg := config.Default()
+			if !recent {
+				cfg.QuarantineWindow = cfg.GuestHeartbeat
+			}
+			h := newHarnessClock(t, clock.NewFake(time.Unix(1000, 0)), cfg)
+			h.boot("a", 1)
+			if err := h.d.Compromise("a", func(ctx context.Context, ep api.Endpoint) {
+				_ = ep.Send(h.host, api.PortVsock, api.GuestRegister{VMID: "neighbour", Generation: 1})
+				<-ctx.Done()
+			}); err != nil {
+				t.Fatal(err)
+			}
+			h.until(func(s agent.Snapshot) bool { return s.Security.Blocked == 1 })
+			s := h.until(func(s agent.Snapshot) bool {
+				return len(s.Inventory) == 1 && (s.Inventory[0].State == api.VMFailed || s.Inventory[0].State == api.VMUnhealthy)
+			})
+			if recent {
+				if len(s.Actual) != 0 || s.Inventory[0].State != api.VMFailed {
+					t.Fatalf("silent attacker escaped quarantine: %+v", s)
+				}
+				quarantined, stopped := false, false
+				for _, m := range h.messages {
+					switch r := m.(type) {
+					case api.SecurityReport:
+						quarantined = quarantined || r.Quarantined
+					case api.StoppedReport:
+						stopped = stopped || r.Reason == api.ReasonQuarantined
+					case api.UnhealthyReport:
+						t.Fatalf("quarantined lease emitted recycle report: %+v", r)
+					}
+				}
+				if !quarantined || !stopped {
+					t.Fatalf("missing quarantine reports: %+v", h.messages)
+				}
+				h.send(start("a", 2))
+				h.until(func(agent.Snapshot) bool {
+					for _, m := range h.messages {
+						if r, ok := m.(api.StartVMResult); ok && r.Generation == 2 {
+							if r.Admitted || r.Reason != api.ReasonQuarantined {
+								t.Fatalf("silent attacker recycled: %+v", r)
+							}
+							return true
+						}
+					}
+					return false
+				})
+				if len(h.snapshot().Actual) != 0 {
+					t.Fatal("new generation started for silent attacker")
+				}
+			} else {
+				if s.Inventory[0].State != api.VMUnhealthy {
+					t.Fatalf("expired attack poisoned lease recovery: %+v", s)
+				}
+				h.send(start("a", 2))
+				h.until(func(s agent.Snapshot) bool { return ready(s, "a", 2) })
+			}
+		})
+	}
+}
+
+func TestRecycleRecoversLostGuestRegistration(t *testing.T) {
+	h := newHarness(t)
+	h.boot("a", 1)
+	h.d.KillGuest("a")
+	h.until(func(s agent.Snapshot) bool { return s.Inventory[0].State == api.VMUnhealthy })
+	placed := h.c.Now()
+	h.send(start("a", 2))
+	h.until(func(s agent.Snapshot) bool {
+		return len(s.Actual) == 1 && s.Actual[0].Generation == 2 && !s.Actual[0].Running
+	})
+	// Lose the boot's Register, not its StartVM. Driver boot and guestd run
+	// over real simnet; after healing, heartbeats alone cannot authenticate it.
+	h.n.SetPacketLoss(1)
+	h.until(func(s agent.Snapshot) bool { return len(s.Actual) == 1 && s.Actual[0].Running })
+	for range 2 {
+		h.step(h.cfg.GuestHeartbeat)
+	}
+	if ready(h.snapshot(), "a", 2) {
+		t.Fatal("registration escaped packet loss")
+	}
+	h.n.SetPacketLoss(0)
+	for h.c.Now().Sub(placed) < h.cfg.BootDeadline {
+		if ready(h.snapshot(), "a", 2) {
+			return
+		}
+		h.step(100 * time.Millisecond)
+	}
+	t.Fatalf("admitted recycle booted in driver but never registered before deadline: %+v", h.snapshot())
+}
+
 func TestQuarantineRefusesLeaseRecycle(t *testing.T) {
 	for _, phase := range []string{"during-release", "after-release"} {
 		t.Run(phase, func(t *testing.T) {

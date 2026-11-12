@@ -126,7 +126,8 @@ type HeartbeatAck struct {
 
 // --- guestd -> Agent (vsock in real life) ---
 
-// GuestRegister is sent once per boot. The agent ignores the claimed VMID for
+// GuestRegister is retransmitted at the guest heartbeat interval until an authenticated GuestRegisterResult accepts it; duplicates are idempotent.
+// The agent ignores the claimed VMID for
 // identity: it uses the channel the message arrived on (Envelope.From) and
 // treats the token as a second factor.
 type GuestRegister struct {

@@ -493,7 +493,12 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 		var out []Effect
 		for _, v := range a.vms {
 			if v.state == api.VMReady && now.Sub(v.last) >= a.cfg.GuestLeaseTTL {
-				out = append(out, a.unhealthy(v, api.ReasonGuestLease)...)
+				if len(v.blocked) > 0 && v.blocked[len(v.blocked)-1].After(now.Add(-a.cfg.QuarantineWindow)) {
+					out = append(out, a.report(api.SecurityReport{HostID: a.ep.Addr().ID, VMID: v.start.VMID, Generation: v.start.Generation, Attack: api.ReasonGuestLease, Quarantined: true}))
+					out = append(out, a.release(v, api.ReasonQuarantined)...)
+				} else {
+					out = append(out, a.unhealthy(v, api.ReasonGuestLease)...)
+				}
 			}
 		}
 		return out
