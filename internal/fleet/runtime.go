@@ -263,7 +263,6 @@ func (r *runtime) read(ctx context.Context) (observed, error) {
 	} else {
 		s.Scheduler = api.SchedulerDown
 	}
-	s.Racks = append([]api.Rack(nil), r.racks...)
 	s.At = r.clock.Now().UnixMilli()
 	leases := map[string]api.Host{}
 	for _, h := range s.Hosts {
@@ -282,6 +281,26 @@ func (r *runtime) read(ctx context.Context) (observed, error) {
 		if err != nil {
 			return observed{}, err
 		}
+		if h.admin == api.AdminDraining && s.Scheduler == api.SchedulerUp {
+			empty := len(a.Inventory) == 0 &&
+				!slices.ContainsFunc(a.Actual, func(v api.DriverVM) bool { return v.Running }) &&
+				!slices.ContainsFunc(a.Host.Slots, func(slot api.Slot) bool { return slot.State != api.SlotFree }) &&
+				!slices.ContainsFunc(s.VMs, func(v api.VM) bool { return v.HostID == id && v.State != api.VMTerminated })
+			if empty {
+				if err := r.scheduler.SetHostAdmin(ctx, id, api.AdminRemoved); err != nil {
+					return observed{}, err
+				}
+				h.cancel()
+				<-h.agent.Done()
+				h.driver.Close()
+				delete(r.hosts, id)
+				for i := range r.racks {
+					r.racks[i].Hosts = slices.DeleteFunc(r.racks[i].Hosts, func(host string) bool { return host == id })
+				}
+				r.emit(api.Event{At: s.At, Kind: api.EventTopology, HostID: id, Rack: h.addr.Rack, Detail: "drain completed"})
+				continue
+			}
+		}
 		sh, ok := leases[id]
 		connected := ok && sh.Lease == api.LeaseHealthy
 		a.Host.AdminState = h.admin
@@ -297,10 +316,17 @@ func (r *runtime) read(ctx context.Context) (observed, error) {
 			s.Security.ByAttack[k] += n
 		}
 	}
+	s.Hosts = slices.DeleteFunc(s.Hosts, func(h api.Host) bool { return r.hosts[h.ID] == nil })
 	for i := range s.Hosts {
 		if h := r.hosts[s.Hosts[i].ID]; h != nil {
+			s.Hosts[i].AdminState = h.admin
 			s.Hosts[i].Faults = slices.Clone(h.faults)
 		}
+	}
+	r.racks = slices.DeleteFunc(r.racks, func(rack api.Rack) bool { return len(rack.Hosts) == 0 })
+	s.Racks = slices.Clone(r.racks)
+	for i := range s.Racks {
+		s.Racks[i].Hosts = slices.Clone(s.Racks[i].Hosts)
 	}
 	for i := range s.VMs {
 		s.VMs[i].Compromised = r.compromised[s.VMs[i].ID]
