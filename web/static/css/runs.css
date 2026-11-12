@@ -12,6 +12,9 @@
 .runs-table tbody tr:last-child td { border-bottom: 0; }
 .runs-table .num { text-align: right; font-family: var(--mono); }
 .runs-table a { font-weight: 600; }
+.runs-table td:nth-child(2) { white-space: normal; overflow-wrap: anywhere; }
+.run-condition { max-width: 36em; margin-top: 5px; white-space: normal; color: var(--dim); font-size: 12px; }
+.run-condition b { color: var(--text); font-weight: 500; }
 
 /* ----------------------------------------------------------------- run bar */
 .runbar {

@@ -17,7 +17,12 @@ export function enter(route) {
   stop();
   if (route.page === 'runs') {
     update((st) => (st.run = null));
-    api.runs().then(
+    api.runs().then((list) => Promise.all((list || []).map(async (r) => {
+      // Summaries omit checks. Load failed reports so changed test conditions
+      // are explained in the list, rather than looking like a safety failure.
+      if (!r.passed) r.checks = (await api.run(r.id)).checks;
+      return r;
+    }))).then(
       (list) => update((st) => (st.runs = list || [])),
       (err) => update((st) => (st.runs = { error: err.message })),
     );
@@ -92,9 +97,12 @@ function list(st) {
   const passed = runs.filter((r) => r.passed).length;
   const rows = runs
     .map(
-      (r) => `<tr data-act="open-run" data-id="${esc(r.id)}" title="Open ${esc(r.scenario)} recording and its invariant report">
+      (r) => {
+        const conditions = r.checks?.find((c) => c.name === 'conditions unchanged' && !c.passed);
+        return `<tr data-act="open-run" data-id="${esc(r.id)}" title="Open ${esc(r.scenario)} recording and its invariant report">
         <td>${verdict(r.passed)}</td>
-        <td><a class="mono" href="#/runs/${encodeURIComponent(r.id)}" title="Replay recording ${esc(r.id)} and inspect its report">${esc(r.id)}</a></td>
+        <td><a class="mono" href="#/runs/${encodeURIComponent(r.id)}" title="Replay recording ${esc(r.id)} and inspect its report">${esc(r.id)}</a>
+          ${conditions ? `<div class="run-condition"><b>Conditions unchanged</b> — ${esc(conditions.detail)}</div>` : ''}</td>
         <td>${esc(r.scenario)}</td>
         <td class="num">${r.seed}</td>
         <td class="num">${r.speed}×</td>
@@ -102,7 +110,8 @@ function list(st) {
         <td class="num${r.violations ? ' bad' : ''}">${r.violations}</td>
         <td class="num">${dur(r.duration_ms)}</td>
         <td class="dim">${esc(started(r.started_at))}</td>
-      </tr>`,
+      </tr>`;
+      },
     )
     .join('');
   return `<section class="panel">
