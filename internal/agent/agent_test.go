@@ -514,6 +514,82 @@ func TestReregisterAfterDroppedRegistration(t *testing.T) {
 	}
 }
 
+func TestQuarantineRefusesLeaseRecycle(t *testing.T) {
+	for _, phase := range []string{"during-release", "after-release"} {
+		t.Run(phase, func(t *testing.T) {
+			h := newHarness(t)
+			h.boot("a", 1)
+			// Stop renewing the guest lease; hold shutdown open so the
+			// releasing state is deterministic rather than a scheduling race.
+			releaseGuest := make(chan struct{}, 1)
+			t.Cleanup(func() { close(releaseGuest) })
+			if err := h.d.Compromise("a", func(ctx context.Context, _ api.Endpoint) {
+				<-ctx.Done()
+				<-releaseGuest
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var delayed api.UnhealthyReport
+			h.until(func(agent.Snapshot) bool {
+				for _, m := range h.messages {
+					if r, ok := m.(api.UnhealthyReport); ok && r.VMID == "a" && r.Generation == 1 && r.Reason == api.ReasonGuestLease {
+						delayed = r
+						return true
+					}
+				}
+				return false
+			})
+			// The stub scheduler delays acting on that lease report, and
+			// loses both quarantine reports before it asks for gen 2.
+			h.n.PartitionOneWay(h.host, h.scheduler.Addr(), true)
+			for range h.cfg.QuarantineAttempts {
+				h.guest("a", api.GuestRegister{VMID: "a", Generation: 1, Token: "bad"})
+			}
+			h.until(func(s agent.Snapshot) bool { return s.Host.Slots[0].State == api.SlotReleasing })
+			if phase == "after-release" {
+				releaseGuest <- struct{}{}
+				h.until(func(s agent.Snapshot) bool {
+					return len(s.Actual) == 0 && len(s.Inventory) == 1 && s.Inventory[0].State == api.VMFailed
+				})
+			}
+			h.n.PartitionOneWay(h.host, h.scheduler.Addr(), false)
+			recycle := start(delayed.VMID, delayed.Generation+1)
+			// Quarantine dominates older, duplicate and newer starts alike.
+			for _, gen := range []int64{recycle.Generation, 0, 1} {
+				recycle.Generation = gen
+				before := len(h.messages)
+				h.send(recycle)
+				h.until(func(agent.Snapshot) bool {
+					for _, m := range h.messages[before:] {
+						if r, ok := m.(api.StartVMResult); ok && r.VMID == recycle.VMID && r.Generation == gen {
+							if r.Admitted || r.Reason != api.ReasonQuarantined {
+								t.Fatalf("quarantined identity accepted/reclassified: %+v", r)
+							}
+							return true
+						}
+					}
+					return false
+				})
+			}
+			if phase == "during-release" {
+				h.n.PartitionOneWay(h.host, h.scheduler.Addr(), true)
+				releaseGuest <- struct{}{}
+				h.until(func(s agent.Snapshot) bool {
+					return len(s.Actual) == 0 && len(s.Inventory) == 1 && s.Inventory[0].State == api.VMFailed
+				})
+				h.n.PartitionOneWay(h.host, h.scheduler.Addr(), false)
+			}
+			for range 4 {
+				h.step(h.cfg.BootMax)
+				s := h.snapshot()
+				if len(s.Actual) != 0 || len(s.Inventory) != 1 || s.Inventory[0].Generation != 1 || s.Inventory[0].State != api.VMFailed {
+					t.Fatalf("lease recycle escaped quarantine into driver: %+v", s)
+				}
+			}
+		})
+	}
+}
+
 func TestQuarantineTombstoneSurvivesDroppedReports(t *testing.T) {
 	h := newHarness(t)
 	cmd := start("a", 5)
@@ -577,15 +653,8 @@ func TestQuarantineTombstoneSurvivesDroppedReports(t *testing.T) {
 		}
 		return false
 	})
-	// The tombstone uses no slot, including when the same VM has a newer copy.
-	h.boot("a", 6)
-	for range h.cfg.QuarantineAttempts {
-		h.guest("a", api.GuestRegister{VMID: "a", Generation: 6, Token: "bad"})
-	}
-	h.until(func(s agent.Snapshot) bool {
-		return len(s.Actual) == 0 && len(s.Inventory) == 2 && s.Inventory[0].State == api.VMFailed && s.Inventory[1].State == api.VMFailed
-	})
-	h.boot("a", 7)
+	// The tombstone uses no slot; other logical VMs can use both slots.
+	h.boot("b", 1)
 	h.boot("neighbour", 1)
 	h.n.PartitionOneWay(h.scheduler.Addr(), h.host, true)
 	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 2, Stale: []api.InventoryItem{{VMID: "a", Generation: 5}}})
@@ -596,17 +665,12 @@ func TestQuarantineTombstoneSurvivesDroppedReports(t *testing.T) {
 	h.send(api.HeartbeatAck{HostID: "other", Epoch: 3, Stale: []api.InventoryItem{{VMID: "a", Generation: 5}}})
 	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 3})
 	s = h.until(func(s agent.Snapshot) bool { return s.Epoch == 3 })
-	if !contains(s.Inventory) || len(s.Inventory) != 4 || len(s.Actual) != 2 {
+	if !contains(s.Inventory) || len(s.Inventory) != 3 || len(s.Actual) != 2 {
 		t.Fatalf("lost/unrelated ack erased tombstone or consumed capacity: %+v", s)
 	}
 	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 3, Stale: []api.InventoryItem{{VMID: "a", Generation: 5}}})
 	s = h.until(func(s agent.Snapshot) bool { return !contains(s.Inventory) })
-	if len(s.Inventory) != 3 || s.Inventory[0].VMID != "a" || s.Inventory[0].Generation != 6 || s.Inventory[0].State != api.VMFailed {
-		t.Fatalf("ack cleared a different generation's tombstone: %+v", s)
-	}
-	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 3, Stale: []api.InventoryItem{{VMID: "a", Generation: 6}}})
-	s = h.until(func(s agent.Snapshot) bool { return len(s.Inventory) == 2 })
-	if len(s.Actual) != 2 || !ready(s, "a", 7) || !ready(s, "neighbour", 1) {
+	if len(s.Inventory) != 2 || len(s.Actual) != 2 || !ready(s, "b", 1) || !ready(s, "neighbour", 1) {
 		t.Fatalf("tombstone ack harmed live generations: %+v", s)
 	}
 }
