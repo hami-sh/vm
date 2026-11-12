@@ -132,7 +132,7 @@ func (h *harness) snapshot() agent.Snapshot {
 		h.t.Fatal(err)
 	}
 	h.drain()
-	if len(s.Host.Slots) != 2 || len(s.Inventory) > 2 || len(s.Actual) > 2 {
+	if len(s.Host.Slots) != 2 || len(s.Actual) > 2 {
 		h.t.Fatalf("capacity violated: %+v", s)
 	}
 	if s.Security.Succeeded != 0 {
@@ -514,6 +514,103 @@ func TestReregisterAfterDroppedRegistration(t *testing.T) {
 	}
 }
 
+func TestQuarantineTombstoneSurvivesDroppedReports(t *testing.T) {
+	h := newHarness(t)
+	cmd := start("a", 5)
+	cmd.IdempotencyKey = "quarantined-key"
+	cmd.RequestHash = "quarantined-hash"
+	h.send(cmd)
+	h.until(func(s agent.Snapshot) bool { return ready(s, "a", 5) })
+	before := len(h.messages)
+	h.n.PartitionOneWay(h.host, h.scheduler.Addr(), true)
+	for range h.cfg.QuarantineAttempts {
+		h.guest("a", api.GuestRegister{VMID: "a", Generation: 5, Token: "bad"})
+	}
+	s := h.until(func(s agent.Snapshot) bool {
+		return len(s.Actual) == 0 && s.Host.Slots[0].State == api.SlotFree && s.Host.Slots[1].State == api.SlotFree
+	})
+	for _, m := range h.messages[before:] {
+		switch m.(type) {
+		case api.SecurityReport, api.StoppedReport:
+			t.Fatalf("quarantine report escaped the partition: %+v", m)
+		}
+	}
+	want := api.InventoryItem{VMID: "a", Generation: 5, State: api.VMFailed, Pool: cmd.Spec.Pool, IdempotencyKey: cmd.IdempotencyKey, RequestHash: cmd.RequestHash}
+	contains := func(items []api.InventoryItem) bool {
+		for _, item := range items {
+			if item == want {
+				return true
+			}
+		}
+		return false
+	}
+	if !contains(s.Inventory) {
+		t.Fatalf("quarantine disappeared with its dropped reports: %+v", s)
+	}
+	h.n.PartitionOneWay(h.host, h.scheduler.Addr(), false)
+	for range 3 {
+		before = len(h.messages)
+		h.until(func(agent.Snapshot) bool {
+			for _, m := range h.messages[before:] {
+				if hb, ok := m.(api.HostHeartbeat); ok {
+					if !contains(hb.Inventory) {
+						t.Fatalf("heartbeat lost quarantine tombstone: %+v", hb)
+					}
+					return true
+				}
+			}
+			return false
+		})
+	}
+	// A repeated stop and an unrelated stale generation must not erase it.
+	h.send(api.StopVM{VMID: "a", Generation: 5, Epoch: 1, Reason: api.ReasonQuarantined})
+	before = len(h.messages)
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 1, Reregister: true, Stale: []api.InventoryItem{{VMID: "a", Generation: 4}}})
+	h.until(func(agent.Snapshot) bool {
+		for _, m := range h.messages[before:] {
+			if r, ok := m.(api.RegisterHost); ok {
+				if !contains(r.Inventory) {
+					t.Fatalf("re-registration lost quarantine tombstone: %+v", r)
+				}
+				return true
+			}
+		}
+		return false
+	})
+	// The tombstone uses no slot, including when the same VM has a newer copy.
+	h.boot("a", 6)
+	for range h.cfg.QuarantineAttempts {
+		h.guest("a", api.GuestRegister{VMID: "a", Generation: 6, Token: "bad"})
+	}
+	h.until(func(s agent.Snapshot) bool {
+		return len(s.Actual) == 0 && len(s.Inventory) == 2 && s.Inventory[0].State == api.VMFailed && s.Inventory[1].State == api.VMFailed
+	})
+	h.boot("a", 7)
+	h.boot("neighbour", 1)
+	h.n.PartitionOneWay(h.scheduler.Addr(), h.host, true)
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 2, Stale: []api.InventoryItem{{VMID: "a", Generation: 5}}})
+	h.n.PartitionOneWay(h.scheduler.Addr(), h.host, false)
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 2, Stale: []api.InventoryItem{{VMID: "a", Generation: 4}}})
+	h.until(func(s agent.Snapshot) bool { return s.Epoch == 2 })
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 1, Stale: []api.InventoryItem{{VMID: "a", Generation: 5}}})
+	h.send(api.HeartbeatAck{HostID: "other", Epoch: 3, Stale: []api.InventoryItem{{VMID: "a", Generation: 5}}})
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 3})
+	s = h.until(func(s agent.Snapshot) bool { return s.Epoch == 3 })
+	if !contains(s.Inventory) || len(s.Inventory) != 4 || len(s.Actual) != 2 {
+		t.Fatalf("lost/unrelated ack erased tombstone or consumed capacity: %+v", s)
+	}
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 3, Stale: []api.InventoryItem{{VMID: "a", Generation: 5}}})
+	s = h.until(func(s agent.Snapshot) bool { return !contains(s.Inventory) })
+	if len(s.Inventory) != 3 || s.Inventory[0].VMID != "a" || s.Inventory[0].Generation != 6 || s.Inventory[0].State != api.VMFailed {
+		t.Fatalf("ack cleared a different generation's tombstone: %+v", s)
+	}
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 3, Stale: []api.InventoryItem{{VMID: "a", Generation: 6}}})
+	s = h.until(func(s agent.Snapshot) bool { return len(s.Inventory) == 2 })
+	if len(s.Actual) != 2 || !ready(s, "a", 7) || !ready(s, "neighbour", 1) {
+		t.Fatalf("tombstone ack harmed live generations: %+v", s)
+	}
+}
+
 func TestCompromiseUsesRealEndpointAndStops(t *testing.T) {
 	for _, cause := range []string{"stop", "crash", "quarantine"} {
 		t.Run(cause, func(t *testing.T) {
@@ -624,7 +721,7 @@ func TestFloodDoesNotStarveNeighbours(t *testing.T) {
 		_ = h.d.GuestSend("attacker", h.host, api.PortVsock, api.GuestHeartbeat{VMID: "attacker", Generation: 1})
 	}
 	h.until(func(s agent.Snapshot) bool {
-		return len(s.Inventory) == 1 && s.Security.ByAttack[api.AttackFlood] >= h.cfg.QuarantineAttempts
+		return len(s.Actual) == 1 && ready(s, "neighbour", 1) && s.Security.ByAttack[api.AttackFlood] >= h.cfg.QuarantineAttempts
 	})
 	for range 40 {
 		h.step(h.cfg.GuestHeartbeat / 2)

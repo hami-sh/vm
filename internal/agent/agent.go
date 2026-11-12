@@ -51,6 +51,10 @@ type recovered struct {
 	err      error
 }
 type query struct{ reply chan<- Snapshot }
+type vmGeneration struct {
+	id  string
+	gen int64
+}
 type control struct {
 	paused, cordoned *bool
 	down             *bool
@@ -79,6 +83,7 @@ type Agent struct {
 	workers          sync.WaitGroup
 	vms              map[string]*instance
 	highest          map[string]int64
+	quarantined      map[vmGeneration]api.InventoryItem
 	epoch            int64
 	seq              uint64
 	paused, cordoned bool
@@ -93,7 +98,7 @@ type Agent struct {
 // New constructs the actor; call Run exactly once. Endpoint identity must be
 // provisioned by the trusted host, never by a guest-supplied payload.
 func New(cfg config.Config, c clock.Clock, ep api.Endpoint, scheduler api.Addr, d api.Driver) *Agent {
-	return &Agent{cfg: cfg, clock: c, ep: ep, scheduler: scheduler, driver: d, inbox: make(chan any, cfg.GuestMsgMaxBytes), done: make(chan struct{}), vms: make(map[string]*instance), highest: make(map[string]int64), security: api.SecurityStatus{ByAttack: make(map[string]int)}}
+	return &Agent{cfg: cfg, clock: c, ep: ep, scheduler: scheduler, driver: d, inbox: make(chan any, cfg.GuestMsgMaxBytes), done: make(chan struct{}), vms: make(map[string]*instance), highest: make(map[string]int64), quarantined: make(map[vmGeneration]api.InventoryItem), security: api.SecurityStatus{ByAttack: make(map[string]int)}}
 }
 func (a *Agent) Run(ctx context.Context) {
 	a.ctx = ctx
@@ -200,11 +205,19 @@ func (a *Agent) diskFull() bool {
 	return false
 }
 func (a *Agent) inventory() []api.InventoryItem {
-	out := make([]api.InventoryItem, 0, len(a.vms))
+	out := make([]api.InventoryItem, 0, len(a.vms)+len(a.quarantined))
 	for id, v := range a.vms {
 		out = append(out, api.InventoryItem{VMID: id, Generation: v.start.Generation, State: v.state, Pool: v.start.Spec.Pool, IdempotencyKey: v.start.IdempotencyKey, RequestHash: v.start.RequestHash})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].VMID < out[j].VMID })
+	for _, item := range a.quarantined {
+		out = append(out, item)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].VMID == out[j].VMID {
+			return out[i].Generation < out[j].Generation
+		}
+		return out[i].VMID < out[j].VMID
+	})
 	return out
 }
 func (a *Agent) heartbeat() []Effect {
@@ -373,6 +386,7 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 					out = append(out, a.registration())
 				}
 				for _, stale := range cmd.Stale {
+					delete(a.quarantined, vmGeneration{stale.VMID, stale.Generation})
 					if v := a.vms[stale.VMID]; v != nil && v.start.Generation <= stale.Generation {
 						out = append(out, a.release(v, api.ReasonStale)...)
 					}
@@ -446,6 +460,9 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 				return nil
 			} // Never reclaim a disk whose cleanup failed.
 			delete(a.vms, m.id)
+			if v.reason == api.ReasonQuarantined {
+				a.quarantined[vmGeneration{m.id, m.gen}] = api.InventoryItem{VMID: m.id, Generation: m.gen, State: api.VMFailed, Pool: v.start.Spec.Pool, IdempotencyKey: v.start.IdempotencyKey, RequestHash: v.start.RequestHash}
+			}
 			out := []Effect{a.report(api.StoppedReport{HostID: a.ep.Addr().ID, VMID: m.id, Generation: m.gen, Reason: v.reason})}
 			if v.pending != nil {
 				out = append(out, a.start(now, *v.pending)...)
@@ -492,6 +509,8 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 			revision := a.revision
 			clear(a.vms)
 			clear(a.highest)
+			// Quarantine delivery survives packet loss, not a process restart.
+			clear(a.quarantined)
 			a.epoch = 0
 			a.seq = 0
 			a.paused = false
@@ -568,8 +587,11 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 			h.AdminState = api.AdminCordoned
 		}
 		inv := a.inventory()
-		for i, item := range inv {
-			h.Slots = append(h.Slots, api.Slot{Index: i, State: a.vms[item.VMID].slot, VMID: item.VMID, Generation: item.Generation})
+		for _, item := range inv {
+			if item.State == api.VMFailed {
+				continue
+			}
+			h.Slots = append(h.Slots, api.Slot{Index: len(h.Slots), State: a.vms[item.VMID].slot, VMID: item.VMID, Generation: item.Generation})
 		}
 		for len(h.Slots) < h.SlotCount {
 			h.Slots = append(h.Slots, api.Slot{Index: len(h.Slots), State: api.SlotFree})
