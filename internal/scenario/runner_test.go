@@ -19,6 +19,120 @@ import (
 	"github.com/hami-sh/vm/internal/config"
 )
 
+func TestOverloadPriorityAfterCapacityRelease(t *testing.T) {
+	for _, fault := range []string{"", "aging respected", "lower class placed", "FIFO bypass", "interactive shed", "wrong class shed", "queue inverted", "unintended loss", "no 429", "queue not refilled"} {
+		t.Run(fault, func(t *testing.T) {
+			before, after := snapshot(19000, api.VMReady), snapshot(90000, api.VMReady)
+			before.VMs, after.VMs = nil, nil
+			for i := range 24 {
+				v := api.VM{ID: fmt.Sprintf("serving-%02d", i), State: api.VMReady, Desired: api.DesiredRunning, Priority: api.PriorityStandard}
+				before.VMs = append(before.VMs, v)
+				if i < 4 {
+					v.State, v.Desired = api.VMTerminated, api.DesiredDeleted
+				}
+				if i == 5 && fault == "unintended loss" {
+					v.State = api.VMPending
+				}
+				after.VMs = append(after.VMs, v)
+			}
+			var events []api.Event
+			for i := range 37 {
+				id := fmt.Sprintf("queued-%02d", i)
+				v := api.VM{ID: id, State: api.VMPending, Desired: api.DesiredRunning, Priority: api.PriorityBatch, CreatedAt: 10000 + int64(i)}
+				if i < 5 {
+					v.Priority = api.PriorityInteractive
+				}
+				q := api.QueueEntry{VMID: id, Priority: v.Priority, EffectivePriority: v.Priority, EnqueuedAt: v.CreatedAt}
+				if i == 0 && fault == "aging respected" {
+					v.Priority, v.CreatedAt = api.PriorityBatch, -110000
+					q.Priority, q.EnqueuedAt, q.EffectivePriority = v.Priority, v.CreatedAt, api.PriorityInteractive
+				}
+				if i < 32 {
+					before.Queue = append(before.Queue, q)
+					before.VMs = append(before.VMs, v)
+				}
+				events = append(events, api.Event{Kind: api.EventAdmission, VMID: id, At: v.CreatedAt, Detail: "queued"})
+				if i < 4 {
+					v.State = api.VMReady
+				} else if i == 31 {
+					v.State, v.LastReason = api.VMFailed, api.ReasonShed
+				} else {
+					after.Queue = append(after.Queue, q)
+				}
+				after.VMs = append(after.VMs, v)
+			}
+			shedID := "queued-31"
+			if fault == "interactive shed" {
+				shedID = "queued-04"
+			}
+			if fault == "wrong class shed" {
+				// Leave batch waiting but shed a standard request.
+				after.VMs[24+31].Priority = api.PriorityStandard
+			}
+			events = append(events, api.Event{Kind: api.EventTransition, VMID: shedID, At: 18000, To: api.VMFailed, Detail: api.ReasonShed})
+			for i := range 4 {
+				id := fmt.Sprintf("queued-%02d", i)
+				if i == 0 && fault == "lower class placed" {
+					id = "queued-05"
+				}
+				if fault == "FIFO bypass" && i < 2 {
+					id = fmt.Sprintf("queued-%02d", 1-i)
+				}
+				events = append(events, api.Event{Kind: api.EventTransition, VMID: id, At: 21000 + int64(i), To: api.VMBooting, Detail: "placed"})
+			}
+			if fault == "queue inverted" {
+				before.Queue[0], before.Queue[31] = before.Queue[31], before.Queue[0]
+			}
+			if fault == "queue not refilled" {
+				after.Queue = after.Queue[:28]
+			}
+			before.Counters.Shed, after.Counters.Shed = 1, 1
+			before.Counters.Rejected429, after.Counters.Rejected429 = 4, 4
+			if fault == "no 429" {
+				after.Counters.Rejected429 = 0
+			}
+			initial := before
+			initial.At, initial.Seq = 0, 1
+			f := &overloadFleet{fakeFleet: &fakeFleet{initial: initial, frames: []api.Snapshot{before, after}, events: events}}
+			s := Catalog()[3].NewRun()
+			s.Topology, s.Load.Count = Topology{1, 1, 2}, 0
+			r, err := Run(context.Background(), s, func(context.Context, Scenario, int64, float64) (System, func(), error) {
+				return f, func() {}, nil
+			}, 1, 5, t.TempDir())
+			if err != nil || r.Passed != (fault == "" || fault == "aging respected") || f.deleted != 4 {
+				t.Fatalf("fault=%s deleted=%d report=%+v err=%v", fault, f.deleted, r, err)
+			}
+			checkName := "placements serve queue head and shedding serves lowest class"
+			switch fault {
+			case "", "aging respected":
+				return
+			case "queue inverted":
+				checkName = "queue ordered by effective class"
+			case "unintended loss":
+				checkName = "previously Ready VMs recovered"
+			case "no 429", "queue not refilled":
+				checkName = "all 24 slots Ready under overload"
+			}
+			for _, check := range r.Checks {
+				if check.Name == checkName && !check.Passed {
+					return
+				}
+			}
+			t.Fatalf("fault=%s did not fail %q: %+v", fault, checkName, r.Checks)
+		})
+	}
+}
+
+type overloadFleet struct {
+	*fakeFleet
+	deleted int
+}
+
+func (f *overloadFleet) DeleteVM(_ context.Context, id string) (api.VM, error) {
+	f.deleted++
+	return api.VM{ID: id, Desired: api.DesiredDeleted}, nil
+}
+
 func TestEventuallyUsesFinalState(t *testing.T) {
 	for _, test := range []struct {
 		name   string

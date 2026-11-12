@@ -90,6 +90,8 @@ Power-off is not a fencing test: the original VMs are gone. Stale-copy fencing i
 
 The six scenario presets are split brain, gray failure, thundering herd, rolling maintenance, hostile tenant and bad day. See `internal/scenario` for their explicit timelines. These are integration specifications; passing the harness's fake-fleet unit tests does not certify the system against them.
 
+Overload deliberately deletes four Ready VMs after the flood has filled the queue, then refills the four consumed queue positions with batch work. This tests the next-free-slot promise without preemption or seed luck: placements serve the highest effective class/FIFO head, every snapshot's queue respects effective class including aging, and shedding removes the lowest effective class, never interactive work while standard or batch work waits. The final frame still requires 24 Ready, at least one interactive Ready, 32 queued, shedding and a 429. Bad-day uses a **chaos window then recovery window**: ambient chaos and sustained load stop at 60 simulated seconds; the unchanged final-frame checks at 90 seconds measure recovery after the faults heal, not an arbitrary point inside ongoing chaos.
+
 ## Security: guests are untrusted
 
 Identity comes from the transport-stamped sending channel, never a guest-supplied VM ID. Registration also requires the current generation and boot token. StartVM and StopVM are idempotent for `(vm, generation)`; a stale stop must never kill a newer boot.

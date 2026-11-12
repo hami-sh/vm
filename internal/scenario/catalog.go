@@ -33,7 +33,13 @@ func Catalog() []Scenario {
 		base("thundering-herd", Step{10 * sec, Chaos("power-off-rack", "r2", nil)}, Step{11 * sec, Chaos("flood", "", map[string]float64{"count": 60, "interactive": 1})}),
 		base("rolling-maintenance", Step{10 * sec, drain("r1")}, Step{20 * sec, addRack("r4")}, Step{30 * sec, drain("r2")}, Step{40 * sec, addRack("r5")}, Step{50 * sec, drain("r3")}, Step{60 * sec, addRack("r6")}),
 		base("hostile-tenant"),
-		base("bad-day", Step{10 * sec, ambient}, Step{11 * sec, Chaos("sustained-load", "", map[string]float64{"rate": 6})}, Step{11 * sec, Chaos("flood", "", map[string]float64{"count": 60})}, Step{12 * sec, Chaos("latency-spike", "", map[string]float64{"ms": 1000})}, Step{30 * sec, Chaos("kill-scheduler", "", nil)}, Step{40 * sec, Chaos("restart-scheduler", "", nil)}, Step{45 * sec, Chaos("sustained-load", "", map[string]float64{"rate": 0})}),
+		base("bad-day", Step{10 * sec, ambient}, Step{11 * sec, Chaos("sustained-load", "", map[string]float64{"rate": 6})}, Step{11 * sec, Chaos("flood", "", map[string]float64{"count": 60})}, Step{12 * sec, Chaos("latency-spike", "", map[string]float64{"ms": 1000})}, Step{30 * sec, Chaos("kill-scheduler", "", nil)}, Step{40 * sec, Chaos("restart-scheduler", "", nil)}, Step{60 * sec, func(ctx context.Context, f System) error {
+			intensity := 0.0
+			if _, err := f.Sim(ctx, "chaos", api.SimRequest{Intensity: &intensity}); err != nil {
+				return err
+			}
+			return Chaos("sustained-load", "", map[string]float64{"rate": 0})(ctx, f)
+		}}),
 	}
 	// Overload is intentionally not an all-ready assertion: excess demand must
 	// queue or be rejected; it cannot all fit on 24 slots.
@@ -85,18 +91,7 @@ func Catalog() []Scenario {
 	s[10].Expect = append(s[10].Expect, Eventually(s[10].Duration, "rack loss exposes negative headroom and backpressure", func(s api.Snapshot) bool {
 		return s.Counters.Headroom < 0 && s.Counters.Rejected429+s.Counters.Shed > 0
 	}))
-	s[3].Expect = append(s[3].Expect, Eventually(s[3].Duration, "all 24 slots Ready under overload", func(s api.Snapshot) bool {
-		ready, interactive := 0, 0
-		for _, v := range s.VMs {
-			if v.State == api.VMReady {
-				ready++
-				if v.Priority == api.PriorityInteractive {
-					interactive++
-				}
-			}
-		}
-		return ready == cfg.Racks*cfg.HostsPerRack*cfg.SlotsPerHost && interactive > 0 && s.Counters.Shed > 0
-	}))
+	s[3] = overload(s[3])
 	for _, i := range []int{0, 4, 8, 9, 10, 11} {
 		index := i
 		s[i] = victimRecovery(s[i], func(v api.VM) bool {
@@ -144,6 +139,10 @@ func ReplacementQueueOrdered(s api.Snapshot) bool {
 }
 
 func readyCohort() Predicate {
+	return readyCohortExcept(nil)
+}
+
+func readyCohortExcept(deleted map[string]bool) Predicate {
 	ids := map[string]bool{}
 	return func(s api.Snapshot) bool {
 		current := map[string]api.VM{}
@@ -154,6 +153,9 @@ func readyCohort() Predicate {
 			}
 		}
 		for id := range ids {
+			if deleted[id] {
+				continue
+			}
 			v := current[id]
 			if v.State != api.VMReady && !(v.State == api.VMFailed && v.LastReason == api.ReasonQuarantined) {
 				return false
