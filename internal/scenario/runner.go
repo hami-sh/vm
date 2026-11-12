@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -406,6 +407,21 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 					}
 				}
 				if s.Name == "bad-day" {
+					// Ambient action diversity is evidence, not a scheduler guarantee.
+					report.Metrics["ambient_events"] = 0
+					for _, e := range report.Markers {
+						if e.Kind != api.EventChaos {
+							continue
+						}
+						parts := strings.Fields(e.Detail)
+						if len(parts) > 0 {
+							switch parts[0] {
+							case "scenario", "sustained-load", "flood", "latency-spike", "kill-scheduler", "restart-scheduler", "ambient", "failed", "load:":
+							default:
+								report.Metrics["ambient_events"]++
+							}
+						}
+					}
 					neverReadyLost := 0
 					for id := range lost {
 						if !everReady[id] {

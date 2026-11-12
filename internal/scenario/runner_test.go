@@ -141,7 +141,7 @@ func TestBadDayReportsNeverReadyLossWithoutHidingReadyLoss(t *testing.T) {
 }
 
 func TestBadDayPostRestartAdmission(t *testing.T) {
-	for _, fault := range []string{"", "healed scheduler outage", "late placement", "lower class", "wrong host", "no final Ready", "unrelated loss"} {
+	for _, fault := range []string{"", "healed scheduler outage", "excluded chaos only", "no post-restart placement", "late placement", "lower class", "wrong host", "no final Ready", "unrelated loss"} {
 		t.Run(fault, func(t *testing.T) {
 			initial := snapshot(0, api.VMReady)
 			initial.Hosts[0].Lease, initial.Hosts[0].AdminState = api.LeaseHealthy, api.AdminActive
@@ -181,6 +181,13 @@ func TestBadDayPostRestartAdmission(t *testing.T) {
 				{Kind: api.EventTransition, VMID: "standard", HostID: "r1-h1", At: 60000, From: api.VMPending, To: api.VMBooting},
 			}
 			switch fault {
+			case "excluded chaos only":
+				events[3].Detail = "latency-spike "
+				for _, detail := range []string{"scenario bad-day step 0", "sustained-load ", "flood ", "kill-scheduler ", "restart-scheduler ", "ambient healed latency-spike with latency-spike ", "failed action", "load: 429: capacity and queue full "} {
+					events = append(events, api.Event{Kind: api.EventChaos, At: 65000, Detail: detail})
+				}
+			case "no post-restart placement":
+				events[8].At, events[9].At = 39000, 39000
 			case "late placement":
 				events[9].At++ // The exact BootDeadline boundary above must pass.
 			case "lower class":
@@ -237,8 +244,20 @@ func TestBadDayPostRestartAdmission(t *testing.T) {
 			r, err := Run(context.Background(), run, func(context.Context, Scenario, int64, float64) (System, func(), error) {
 				return f, func() {}, nil
 			}, 1, 5, t.TempDir())
-			if err != nil || r.Passed != (fault == "" || fault == "healed scheduler outage") || f.deleted != 2 {
+			if err != nil || r.Passed != (fault == "" || fault == "healed scheduler outage" || fault == "excluded chaos only") || f.deleted != 2 {
 				t.Fatalf("fault=%s deleted=%d checks=%+v err=%v", fault, f.deleted, r.Checks, err)
+			}
+			wantAmbient := float64(1)
+			if fault == "excluded chaos only" {
+				wantAmbient = 0
+			}
+			if ambient, ok := r.Metrics["ambient_events"]; !ok || ambient != wantAmbient {
+				t.Fatalf("ambient event evidence missing or incorrect: %+v", r.Metrics)
+			}
+			for _, check := range r.Checks {
+				if check.Name == "restarted scheduler places useful work" && check.Passed != (fault != "no post-restart placement") {
+					t.Fatalf("post-restart placement verdict: %+v", check)
+				}
 			}
 		})
 	}

@@ -3,7 +3,6 @@ package scenario
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -274,7 +273,7 @@ func restartProgress(base Scenario, create bool) Scenario {
 		run.NewRun = nil
 		run.Timeline = append([]Step(nil), base.Timeline...)
 		probe := ""
-		placed, restartedAt, ambientEvents := false, int64(0), 0
+		placed, restartedAt := false, int64(0)
 		// The restart is the final scheduler restart in these timelines.
 		at := 20 * time.Second
 		if !create {
@@ -301,7 +300,7 @@ func restartProgress(base Scenario, create bool) Scenario {
 				return false
 			}
 			if !create {
-				return ambientEvents > 0
+				return true
 			}
 			for _, v := range s.VMs {
 				if v.ID == probe && probe != "" && v.State == api.VMReady {
@@ -315,18 +314,6 @@ func restartProgress(base Scenario, create bool) Scenario {
 		observe.EventTest = func(e api.Event) bool {
 			if restartedAt != 0 && e.At > restartedAt && e.Kind == api.EventTransition && e.To == api.VMBooting {
 				placed = true
-			}
-			if !create && e.Kind == api.EventChaos {
-				// Exclude all explicit injections; these other successful chaos
-				// actions can only have come from the ambient engine.
-				parts := strings.Fields(e.Detail)
-				if len(parts) > 0 {
-					switch parts[0] {
-					case "scenario", "sustained-load", "flood", "latency-spike", "kill-scheduler", "restart-scheduler", "ambient", "failed", "load:":
-					default:
-						ambientEvents++
-					}
-				}
 			}
 			return true
 		}
