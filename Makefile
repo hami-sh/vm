@@ -1,5 +1,7 @@
 .PHONY: build vet test fixture run verify e2e
 
+VERIFY_PARALLEL ?= 4
+
 build:
 	go build ./...
 
@@ -18,7 +20,7 @@ run:
 
 # Real actors and SQLite run in-process under the race detector.
 verify: vet test
-	go run -race ./cmd/vmctl verify --repeat 20
+	go run -race ./cmd/vmctl verify --repeat 20 --parallel $(VERIFY_PARALLEL)
 
 # Separate integration gate; fails until the HTTP server is wired to web.
 e2e:

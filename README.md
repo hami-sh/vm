@@ -25,6 +25,8 @@ go run ./cmd/vmctl verify --scenario rack-partition --repeat 50 --speed 1
 make e2e
 ```
 
+The default is four concurrent isolated fleets. On the 16-vCPU / 31-GiB verification orb, use `make verify VERIFY_PARALLEL=8`; this changes concurrency only, not speeds, repeats or thresholds.
+
 The runner defaults to **5×**, including under `-race`. Explicit `--speed 0` calibrates the complete suite at 5× and 50× with the same seeds. Different liveness pass rates select 5×; this includes time-bounded invariants 2 (stale-copy stop deadline) and 8 (prompt placement). Any violation of invariant 1 or 3–7 at either speed fails calibration: reducing speed must never conceal those safety bugs. Failures at both speeds also stop calibration. Use `--speed` for an explicit diagnostic override, `--seed` to choose the seed range, `--parallel` to cap isolated systems and `--output` to choose the recording directory. Seeds reproduce fault choices, not goroutine scheduling. Recovery latency is measured from Lost/Unhealthy to Ready transition events, not snapshots, which can miss transient lifecycle states.
 
 Each `runs/<id>/` contains:
@@ -93,6 +95,8 @@ The six scenario presets are split brain, gray failure, thundering herd, rolling
 Identity comes from the transport-stamped sending channel, never a guest-supplied VM ID. Registration also requires the current generation and boot token. StartVM and StopVM are idempotent for `(vm, generation)`; a stale stop must never kill a newer boot.
 
 The simulated policy denies guest-to-guest and guest-to-control-plane access. Guests may speak vsock only to their own host agent; permitted egress goes through an allowlist. The evidence panel counts blocked attacks and successful attacks separately; any success fails verification. Rate limiting, bounded messages, disk limits and quarantine constrain abuse. These are modeled controls, not proof of a hardened macOS boundary.
+
+On real Macs, Virtualization.framework's default NAT puts a host's guests on a shared subnet; NAT alone is not tenant isolation. Replace the simulated policy with per-VM pf rules or a separate userspace network stack per VM, plus an allowlisted egress proxy. Hypervisor escapes are outside this simulator's security model.
 
 The public demo has no authentication and must contain no secrets or tenant workloads. Real deployment requires mTLS between agents and scheduler, OIDC/RBAC on the API, real vsock channel binding, actual network sandboxing, quotas and audit retention. Global demo caps and per-IP chaos limits are part of the integration plan, not security guarantees of the initial stub.
 
