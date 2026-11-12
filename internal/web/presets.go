@@ -38,6 +38,10 @@ func (s *Server) startPreset(ctx context.Context, action string) (api.ChaosResul
 		definition = definition.NewRun()
 	}
 	initial := s.o.Snapshots.Latest()
+	if initial.Scheduler != api.SchedulerUp {
+		return api.ChaosResult{}, &api.Error{Status: 503,
+			Msg: fmt.Sprintf("scheduler %s; retry preset when ready", initial.Scheduler), RetryAfterS: 1}
+	}
 	// Snapshot publication can lag a just-applied seed or speed change.
 	status, err := s.o.Chaos.Sim(ctx, "status", api.SimRequest{})
 	if err != nil {

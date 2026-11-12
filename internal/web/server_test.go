@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -143,7 +144,7 @@ func (p *presetEngine) Do(_ context.Context, action string, req api.ChaosRequest
 // Exercise the HTTP contract: starting a preset records real snapshot data,
 // ignores old violations, preserves new violations and lists the finished run.
 func TestDashboardPresetRecording(t *testing.T) {
-	for _, mode := range []string{"pass", "violation", "reset", "security", "not-ready", "regressed", "no-generation", "stale", "missing-observation", "no-recovery", "slow-recovery", "event-gap", "hostile-empty", "hostile-blocked", "hostile-resurrected-event", "speed-changed", "seed-changed"} {
+	for _, mode := range []string{"pass", "reconciling", "down", "violation", "reset", "security", "not-ready", "regressed", "no-generation", "stale", "missing-observation", "no-recovery", "slow-recovery", "event-gap", "hostile-empty", "hostile-blocked", "hostile-resurrected-event", "speed-changed", "seed-changed"} {
 		t.Run(mode, func(t *testing.T) {
 			action := "split-brain"
 			if strings.HasPrefix(mode, "hostile-") {
@@ -151,6 +152,9 @@ func TestDashboardPresetRecording(t *testing.T) {
 			}
 			initial := api.Snapshot{At: 1000, Scheduler: api.SchedulerUp, Sim: api.SimStatus{Seed: 42, Speed: 2},
 				Recent: []api.Event{{Seq: 6, At: 1000, Kind: api.EventInvariant, Detail: "old violation"}}}
+			if mode == "reconciling" || mode == "down" {
+				initial.Scheduler = api.SchedulerStatus(mode)
+			}
 			for i, id := range []string{"slow", "fast", "third"} {
 				rack := []string{"r2", "r1", "r3"}[i]
 				host := rack + "-h1"
@@ -274,7 +278,19 @@ func TestDashboardPresetRecording(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			wantStatus(t, h.do("POST", "/v1/chaos/"+action, `{}`), 200)
+			response := h.do("POST", "/v1/chaos/"+action, `{}`)
+			if mode == "reconciling" || mode == "down" {
+				wantStatus(t, response, http.StatusServiceUnavailable)
+				if failure := decodeBody[api.ErrorResponse](t, response); failure.RetryAfterS <= 0 || !strings.Contains(failure.Error, mode) {
+					t.Fatalf("startup rejection must explain readiness and allow retry: %+v", failure)
+				}
+				entries, err := os.ReadDir(h.srv.o.RunsDir)
+				if err != nil || len(entries) != 0 {
+					t.Fatalf("unavailable setup must not create a recording: %v, %v", entries, err)
+				}
+				return
+			}
+			wantStatus(t, response, 200)
 			if mode == "reset" {
 				wantStatus(t, h.do("POST", "/v1/chaos/gray-failure", `{}`), 409)
 				wantStatus(t, h.do("POST", "/v1/chaos/reset", `{}`), 200)
