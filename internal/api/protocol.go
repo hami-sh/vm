@@ -9,6 +9,9 @@ type InventoryItem struct {
 	VMID       string  `json:"vm_id"`
 	Generation int64   `json:"gen"`
 	State      VMState `json:"state"` // agent's local view: Booting, Ready, Unhealthy, Terminating
+	// Pool is copied from StartVM.Spec.Pool. It lets a scheduler whose store
+	// was wiped adopt a VM it has no record of; the spec follows from the pool.
+	Pool string `json:"pool,omitempty"`
 }
 
 // --- Agent -> Scheduler ---
