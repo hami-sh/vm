@@ -401,9 +401,10 @@ func (p *planner) place(id, hostID string) {
 		p.metrics.observe("queue_wait_seconds", q.Priority, float64(p.now.UnixMilli()-q.EnqueuedAt)/1000)
 		delete(p.data.Queue, id)
 	}
-	p.reservations[id] = reservation{host: hostID, gen: v.Generation, until: p.now.Add(p.cfg.ReservationTTL).UnixMilli()}
 	pl, _ := pool(v.Pool)
-	p.send(hostID, api.StartVM{VMID: id, Generation: v.Generation, Epoch: p.epoch, Token: uuid.NewString(), Spec: api.VMSpec{Pool: pl.Name, Image: pl.Image, CPUs: pl.CPUs, MemoryMB: pl.MemoryMB}, IdempotencyKey: r.Key, RequestHash: r.Hash})
+	command := api.StartVM{VMID: id, Generation: v.Generation, Epoch: p.epoch, Token: uuid.NewString(), Spec: api.VMSpec{Pool: pl.Name, Image: pl.Image, CPUs: pl.CPUs, MemoryMB: pl.MemoryMB}, IdempotencyKey: r.Key, RequestHash: r.Hash}
+	p.reservations[id] = reservation{host: hostID, gen: v.Generation, until: p.now.Add(p.cfg.ReservationTTL).UnixMilli(), command: command}
+	p.send(hostID, command)
 	p.counters.Placed++
 	p.log(api.EventAdmission, id, hostID, "placed")
 }
@@ -448,12 +449,17 @@ func (p *planner) enqueue(id string, replacement bool, reason string) {
 	qr := api.QueueRetry
 	nb := p.now.UnixMilli()
 	enqueued := v.CreatedAt
-	if replacement {
+	// A failed recycle still restores previously serving capacity. Only an
+	// initial replacement may reset the old incarnation's attempt count below;
+	// genuine boot failures retain their configured backoff and retry budget.
+	recovery := replacement || r.ReachedReady
+	if recovery {
 		pr = 0
 		qr = api.QueueReplace
 		enqueued = nb
 		p.replacement[id] = true
-	} else {
+	}
+	if !replacement && !(recovery && reason == api.ReasonReservationTTL) {
 		backoff := p.cfg.BackoffBase
 		for i := 1; i < v.Attempts && backoff < p.cfg.BackoffMax; i++ {
 			backoff *= 2
@@ -465,8 +471,8 @@ func (p *planner) enqueue(id string, replacement bool, reason string) {
 			nb = p.now.Add(time.Duration(rand.Int64N(int64(backoff) + 1))).UnixMilli()
 		}
 	}
-	if !p.makeRoom(pr, replacement) {
-		if !replacement {
+	if !p.makeRoom(pr, recovery) {
+		if !recovery {
 			if v.State == api.VMLost {
 				p.move(id, api.VMPending, reason)
 			}

@@ -66,6 +66,13 @@ func (p *planner) receive(from api.Addr, msg any) {
 		h.disk = m.DiskFull
 		p.hosts[id] = h
 		p.reconcile(id, m.Inventory, rejoin)
+		// Missing/older inventory cannot acknowledge a command that was
+		// dropped. Retry its exact incarnation until admission is observed.
+		for _, res := range p.reservations {
+			if res.host == id && !res.admitted {
+				p.send(id, res.command)
+			}
+		}
 	case api.StartVMResult:
 		if m.HostID != id || !p.current(id, m.VMID, m.Generation) {
 			return
@@ -366,7 +373,7 @@ func (p *planner) reconcile(hostID string, inventory []api.InventoryItem, strict
 		if i.Generation != v.Generation || wrongHost || v.Desired == api.DesiredDeleted || vm.Terminal(v.State) || v.State == api.VMPending || v.State == api.VMLost || v.State == api.VMTerminating {
 			stale = append(stale, i)
 			p.stop(hostID, v.ID, i.Generation, api.ReasonStale)
-			p.log(api.EventFencing, v.ID, hostID, api.ReasonStale)
+			p.event(api.Event{At: p.now.UnixMilli(), Kind: api.EventFencing, VMID: v.ID, HostID: hostID, Generation: i.Generation, Detail: api.ReasonStale})
 			continue
 		}
 		if v.HostID != hostID {
