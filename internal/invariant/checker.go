@@ -81,16 +81,25 @@ func (c *Checker) Check(s api.Snapshot, observations ...Observation) []api.Event
 	auth := map[string]int{}
 	staleNow := map[string]int64{}
 	free := false
+	hosts := map[string]api.Host{}
+	for _, h := range s.Hosts {
+		hosts[h.ID] = h
+	}
 	capacityNow := map[string]int64{}
 	for _, o := range observations {
 		h := o.Host
+		sh, known := hosts[h.ID]
+		placeable := known && o.Connected && sh.Lease == api.LeaseHealthy && sh.AdminState == api.AdminActive &&
+			h.Lease == api.LeaseHealthy && h.AdminState == api.AdminActive &&
+			!slices.Contains(h.Faults, "kill-host") && !slices.Contains(h.Faults, "one-way-partition") &&
+			!slices.Contains(h.Faults, "fill-disk") && !slices.Contains(sh.Faults, "fill-disk")
 		used := 0
 		counted := map[string]bool{}
 		for _, slot := range h.Slots {
 			if slot.State != api.SlotFree {
 				used++
 				counted[fmt.Sprintf("%s/%d", slot.VMID, slot.Generation)] = true
-			} else if h.Lease == api.LeaseHealthy && h.AdminState == api.AdminActive && !slices.Contains(h.Faults, "fill-disk") {
+			} else if placeable && slices.ContainsFunc(sh.Slots, func(s api.Slot) bool { return s.Index == slot.Index && s.State == api.SlotFree }) {
 				free = true
 			}
 		}
