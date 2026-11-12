@@ -410,10 +410,14 @@ func (p *planner) reconcile(hostID string, inventory []api.InventoryItem, strict
 			p.move(id, api.VMTerminated, "clean inventory")
 			continue
 		}
-		// A heartbeat sent before StartVM arrived is not evidence of a lost
-		// boot. Re-registration, however, is authoritative after a restart.
-		if !strict && v.State == api.VMBooting {
-			continue
+		// Even a registration can have been sent before StartVM arrived.
+		// Admission or the existing reservation deadline, not absence in an
+		// in-flight inventory, decides whether this boot has been lost.
+		if v.State == api.VMBooting {
+			res, reserved := p.reservations[id]
+			if !strict || (reserved && !res.admitted) {
+				continue
+			}
 		}
 		wasReady := v.State == api.VMReady
 		p.replacement[id] = wasReady
@@ -421,6 +425,14 @@ func (p *planner) reconcile(hostID string, inventory []api.InventoryItem, strict
 		p.exclude[id] = hostID
 		delete(p.reservations, id)
 		p.enqueue(id, wasReady, "missing from inventory")
+	}
+	// A lost/missing host's clean return ends that exclusion. Refusals and
+	// genuine boot failures still prefer a different host on their next try.
+	for id, excluded := range p.exclude {
+		v := p.data.VMs[id].VM
+		if excluded == hostID && (v.LastReason == api.ReasonHostLost || v.LastReason == "missing from inventory") {
+			delete(p.exclude, id)
+		}
 	}
 	p.send(hostID, api.HeartbeatAck{HostID: hostID, Epoch: p.epoch, Stale: stale})
 }
