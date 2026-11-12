@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -149,7 +150,9 @@ func (f *Fleet) Latest() api.Snapshot {
 	return r
 }
 func (f *Fleet) Subscribe() (<-chan api.Snapshot, <-chan api.Event, func()) {
-	s := &subscription{snapshots: make(chan api.Snapshot, 1), events: make(chan api.Event, 64)}
+	// Recorders can be busy dispatching an entire synchronous flood. Keep the
+	// bounded event backlog proportional to fleet size, without blocking actors.
+	s := &subscription{snapshots: make(chan api.Snapshot, 1), events: make(chan api.Event, f.runtime.cfg.MaxVMs*16)}
 	ack := make(chan struct{})
 	select {
 	case f.queries <- publicationQuery{sub: s, ack: ack}:
@@ -201,6 +204,8 @@ func (f *Fleet) publish(cfg config.Config, events <-chan api.Event) {
 			select {
 			case s.events <- e:
 			default:
+				// Never renumber after dropping: the next delivered event retains
+				// this gap in the publisher's sequence for recording validation.
 			}
 		}
 	}
@@ -208,11 +213,12 @@ func (f *Fleet) publish(cfg config.Config, events <-chan api.Event) {
 		s := clone(latest)
 		now := f.Clock.Now()
 		if nextCheck.IsZero() || !now.Before(nextCheck) {
-			observed, raw, epoch, err := f.runtime.observe(f.ctx)
+			o, err := f.runtime.observe(f.ctx)
 			if err != nil {
 				return
 			}
-			s = observed
+			s = o.snapshot
+			raw, epoch := o.raw, o.epoch
 			if epoch != logIncarnation {
 				schedulerSeq = 0
 				logIncarnation = epoch
@@ -240,7 +246,14 @@ func (f *Fleet) publish(cfg config.Config, events <-chan api.Event) {
 			}
 		drained:
 			s.Recent = recent
+			s.Observed = make([]api.HostObservation, 0, len(raw))
+			for _, observation := range raw {
+				s.Observed = append(s.Observed, api.HostObservation{HostID: observation.Host.ID, Connected: observation.Connected, Actual: slices.Clone(observation.Actual)})
+			}
 			for _, e := range check.Check(s, raw...) {
+				appendEvent(e)
+			}
+			for _, e := range check.CheckKeys(s, o.keys, raw...) {
 				appendEvent(e)
 			}
 			nextCheck = now.Add(cfg.InvariantEvery)

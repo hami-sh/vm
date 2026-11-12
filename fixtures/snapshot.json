@@ -674,6 +674,10 @@
     {
       "name": "pending_placed_promptly",
       "violations": 0
+    },
+    {
+      "name": "idempotency_unique",
+      "violations": 0
     }
   ],
   "security": {

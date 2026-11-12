@@ -190,12 +190,12 @@ func TestRealFleetFailureScenarios(t *testing.T) {
 				}
 				until := h.f.Clock.Now().Add(2 * h.cfg.GuestLeaseTTL).UnixMilli()
 				h.wait(3*h.cfg.GuestLeaseTTL, "data plane remains alive", func(s api.Snapshot) bool { return s.At >= until })
-				_, raw, _, err := h.f.runtime.observe(h.ctx)
+				o, err := h.f.runtime.observe(h.ctx)
 				if err != nil {
 					t.Fatal(err)
 				}
 				for _, old := range before.VMs {
-					if !slices.ContainsFunc(raw, func(o invariant.Observation) bool {
+					if !slices.ContainsFunc(o.raw, func(o invariant.Observation) bool {
 						return slices.ContainsFunc(o.Actual, func(v api.DriverVM) bool { return v.VMID == old.ID && v.Generation == old.Generation && v.Running })
 					}) {
 						t.Fatalf("VM stopped during scheduler outage: %s", old.ID)
@@ -230,6 +230,48 @@ func TestRealCompromiseQuarantinesWithoutHurtingNeighbour(t *testing.T) {
 		return s.Security.Blocked >= h.cfg.QuarantineAttempts && slices.ContainsFunc(s.VMs, func(v api.VM) bool {
 			return v.ID == victim.ID && v.State == api.VMFailed && v.LastReason == api.ReasonQuarantined && v.Generation == victim.Generation
 		})
+	})
+}
+
+func TestSecurityTotalsSurviveHostRemovalAndReuse(t *testing.T) {
+	h := newScenarioFleet(t)
+	h.create(1)
+	v := h.ready(1).VMs[0]
+	_, err := h.f.runtime.call(h.ctx, func(ctx context.Context) (any, error) {
+		a := h.f.runtime.hosts[v.HostID].agent
+		for range 2 {
+			if err := a.RecordBlocked(ctx, v.ID, "exfiltration"); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := h.wait(h.cfg.HostHeartbeat, "blocked attack counters", func(s api.Snapshot) bool { return s.Security.Blocked == 2 })
+	for range 2 {
+		s, err := h.f.runtime.Snapshot(h.ctx)
+		if err != nil || s.Security.Blocked != 2 {
+			t.Fatalf("double-counted snapshot: %+v, %v", s.Security, err)
+		}
+	}
+	h.fault("kill-host", v.HostID)
+	h.fault("drain", v.HostID)
+	h.wait(h.cfg.HostLeaseTTL+2*h.cfg.BootDeadline, "remove counted host", func(s api.Snapshot) bool {
+		if s.Security.Blocked != before.Security.Blocked || s.Security.ByAttack["exfiltration"] != 2 {
+			t.Fatalf("host removal erased security history: %+v", s.Security)
+		}
+		return !slices.ContainsFunc(s.Hosts, func(host api.Host) bool { return host.ID == v.HostID }) && s.Counters.ByState[api.VMReady] == 1
+	})
+	if _, err := h.f.Chaos.Topology(h.ctx, "add-host", api.TopologyRequest{Rack: v.Rack, Host: v.HostID}); err != nil {
+		t.Fatal(err)
+	}
+	h.wait(h.cfg.HostLeaseTTL, "reuse counted host ID", func(s api.Snapshot) bool {
+		if s.Security.Blocked != 2 || s.Security.ByAttack["exfiltration"] != 2 {
+			t.Fatalf("host reuse changed historical totals: %+v", s.Security)
+		}
+		return slices.ContainsFunc(s.Hosts, func(host api.Host) bool { return host.ID == v.HostID && host.Lease == api.LeaseHealthy })
 	})
 }
 

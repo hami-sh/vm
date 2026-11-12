@@ -44,20 +44,31 @@ const (
 type InvariantName string
 
 const (
-	InvOneAuthoritative InvariantName = "one_authoritative_copy"  // 1
-	InvStaleStopped     InvariantName = "stale_copy_stopped"      // 2
-	InvSlotCapacity     InvariantName = "slot_capacity"           // 3
-	InvGenMonotonic     InvariantName = "generation_monotonic"    // 4
-	InvLegalTransitions InvariantName = "legal_transitions"       // 5
-	InvQueueBounded     InvariantName = "queue_bounded"           // 6
-	InvNoAttackSuccess  InvariantName = "no_successful_attack"    // 7
-	InvPendingPlaced    InvariantName = "pending_placed_promptly" // 8
+	InvOneAuthoritative  InvariantName = "one_authoritative_copy"  // 1
+	InvStaleStopped      InvariantName = "stale_copy_stopped"      // 2
+	InvSlotCapacity      InvariantName = "slot_capacity"           // 3
+	InvGenMonotonic      InvariantName = "generation_monotonic"    // 4
+	InvLegalTransitions  InvariantName = "legal_transitions"       // 5
+	InvQueueBounded      InvariantName = "queue_bounded"           // 6
+	InvNoAttackSuccess   InvariantName = "no_successful_attack"    // 7
+	InvPendingPlaced     InvariantName = "pending_placed_promptly" // 8
+	InvIdempotencyUnique InvariantName = "idempotency_unique"      // 9
 )
 
 // AllInvariants lists invariants in display order.
 var AllInvariants = []InvariantName{
 	InvOneAuthoritative, InvStaleStopped, InvSlotCapacity, InvGenMonotonic,
 	InvLegalTransitions, InvQueueBounded, InvNoAttackSuccess, InvPendingPlaced,
+	InvIdempotencyUnique,
+}
+
+// HostObservation is the independent driver evidence evaluated by the checker
+// for a published snapshot. Disconnected hosts remain unobserved by invariants;
+// consumers must honor Connected rather than treating Actual as authoritative.
+type HostObservation struct {
+	HostID    string     `json:"host_id"`
+	Connected bool       `json:"connected"`
+	Actual    []DriverVM `json:"actual"`
 }
 
 // InvariantStatus is one light on the evidence panel.
@@ -115,14 +126,17 @@ type SimStatus struct {
 // 100 ms of sim time (streamed over SSE every 500 ms wall time) and recorded
 // to runs/<id>/snapshots.jsonl. The UI re-renders entirely from each one.
 type Snapshot struct {
-	Seq        int64                   `json:"seq"`
-	At         int64                   `json:"at"` // sim-clock unix ms
-	Scheduler  SchedulerStatus         `json:"scheduler"`
-	Epoch      int64                   `json:"epoch"`
-	Sim        SimStatus               `json:"sim"`
-	Pools      []Pool                  `json:"pools"`
-	Racks      []Rack                  `json:"racks"`
-	Hosts      []Host                  `json:"hosts"`
+	Seq       int64           `json:"seq"`
+	At        int64           `json:"at"` // sim-clock unix ms
+	Scheduler SchedulerStatus `json:"scheduler"`
+	Epoch     int64           `json:"epoch"`
+	Sim       SimStatus       `json:"sim"`
+	Pools     []Pool          `json:"pools"`
+	Racks     []Rack          `json:"racks"`
+	Hosts     []Host          `json:"hosts"`
+	// Observed preserves the exact independent evidence checked for this
+	// snapshot. It is absent in older recordings, not an empty observation.
+	Observed   []HostObservation       `json:"observed,omitempty"`
 	VMs        []VM                    `json:"vms"`
 	Queue      []QueueEntry            `json:"queue"`
 	Counters   Counters                `json:"counters"`

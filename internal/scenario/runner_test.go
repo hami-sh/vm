@@ -222,7 +222,11 @@ func TestSuiteSeedsAndCalibration(t *testing.T) {
 		mu.Unlock()
 		snap := snapshot(1000, api.VMReady)
 		if speed == 50 && seed == 12 {
-			snap.Invariants[len(snap.Invariants)-1].Violations = 1
+			for i := range snap.Invariants {
+				if snap.Invariants[i].Name == api.InvPendingPlaced {
+					snap.Invariants[i].Violations = 1
+				}
+			}
 		}
 		return &fakeFleet{initial: snapshot(0, api.VMReady), frames: []api.Snapshot{snap}}, func() {}, nil
 	}

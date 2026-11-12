@@ -11,8 +11,9 @@ func TestEachInvariantDetectsBrokenState(t *testing.T) {
 	for _, name := range api.AllInvariants {
 		t.Run(string(name), func(t *testing.T) {
 			cfg := config.Default()
+			cfg.SlotsPerHost = 1
 			c := New(cfg)
-			s := api.Snapshot{At: 1000, Scheduler: api.SchedulerUp, VMs: []api.VM{{ID: "v", State: api.VMReady, Generation: 2}}, Hosts: []api.Host{{ID: "h", SlotCount: 1, Lease: api.LeaseHealthy, AdminState: api.AdminActive, Slots: []api.Slot{{State: api.SlotOccupied, VMID: "v", Generation: 2}}}}}
+			s := api.Snapshot{At: 1000, Scheduler: api.SchedulerUp, VMs: []api.VM{{ID: "v", State: api.VMReady, Generation: 2, HostID: "h", Desired: api.DesiredRunning}}, Hosts: []api.Host{{ID: "h", SlotCount: 1, Lease: api.LeaseHealthy, AdminState: api.AdminActive, Slots: []api.Slot{{State: api.SlotOccupied, VMID: "v", Generation: 2}}}}}
 			raw := []Observation{{Host: s.Hosts[0], Connected: true, Actual: []api.DriverVM{{VMID: "v", Generation: 2, Running: true}}}}
 			if out := c.Check(s, raw...); len(out) != 0 {
 				t.Fatalf("healthy state: %v", out)
@@ -28,7 +29,7 @@ func TestEachInvariantDetectsBrokenState(t *testing.T) {
 				c.Check(s, raw...)
 				s.At += cfg.HostHeartbeat.Milliseconds() + 1
 			case api.InvSlotCapacity:
-				raw[0].Host.Slots = append(raw[0].Host.Slots, api.Slot{State: api.SlotReleasing, VMID: "other"})
+				raw[0].Actual = append(raw[0].Actual, api.DriverVM{VMID: "other", Generation: 1, Running: true})
 			case api.InvGenMonotonic:
 				s.VMs[0].Generation = 1
 			case api.InvLegalTransitions:
@@ -36,7 +37,9 @@ func TestEachInvariantDetectsBrokenState(t *testing.T) {
 			case api.InvQueueBounded:
 				s.Queue = make([]api.QueueEntry, cfg.QueueCap+1)
 			case api.InvNoAttackSuccess:
-				raw[0].Security.Succeeded = 1
+				s.Security.Succeeded = 1
+			case api.InvIdempotencyUnique:
+				s.VMs = append(s.VMs, api.VM{ID: "second", State: api.VMPending})
 			case api.InvPendingPlaced:
 				s.VMs[0].State = api.VMPending
 				raw[0].Host.Slots[0] = api.Slot{State: api.SlotFree}
@@ -46,6 +49,7 @@ func TestEachInvariantDetectsBrokenState(t *testing.T) {
 				s.At += (cfg.PendingPlaceWithin + cfg.HostHeartbeat).Milliseconds() + 1
 			}
 			out := c.Check(s, raw...)
+			out = append(out, c.CheckKeys(s, map[string]string{"v": "K", "second": "K"}, raw...)...)
 			found := false
 			for _, v := range c.Status() {
 				if v.Name == name && v.Violations > 0 {
@@ -123,6 +127,150 @@ func TestPendingPlacementRequiresJointlyAvailableCapacity(t *testing.T) {
 			}
 			if len(out) != want || (want == 1 && out[0].Detail != string(api.InvPendingPlaced)+": pending") {
 				t.Fatalf("violations=%+v, want %d placement violations", out, want)
+			}
+		})
+	}
+}
+
+func TestDriverEvidenceDetectsFencedAndUnknownCopies(t *testing.T) {
+	for _, mode := range []string{"older", "equal on wrong host", "unknown after wipe", "deleted", "fenced equal", "current Ready", "current Booting", "stopped", "disconnected"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := config.Default()
+			c := New(cfg)
+			s := api.Snapshot{At: 1000, VMs: []api.VM{{ID: "v", Generation: 3, HostID: "h", State: api.VMReady, Desired: api.DesiredRunning}}}
+			o := Observation{Host: api.Host{ID: "h"}, Connected: true, Actual: []api.DriverVM{{VMID: "v", Generation: 3, Running: true}}}
+			want := true
+			switch mode {
+			case "older":
+				o.Actual[0].Generation = 2
+			case "equal on wrong host":
+				s.VMs[0].HostID = "other"
+			case "unknown after wipe":
+				s.VMs = nil
+			case "deleted":
+				s.VMs[0].Desired = api.DesiredDeleted
+			case "fenced equal":
+				s.VMs[0].State = api.VMPending
+			case "current Ready":
+				want = false
+			case "current Booting":
+				s.VMs[0].State = api.VMBooting
+				want = false
+			case "stopped":
+				o.Actual[0].Running = false
+				want = false
+			case "disconnected":
+				s.VMs = nil
+				o.Connected = false
+				want = false
+			}
+			if events := c.Check(s, o); len(events) != 0 {
+				t.Fatal("no cross-component slack", events)
+			}
+			s.At += cfg.HostHeartbeat.Milliseconds()
+			if events := c.Check(s, o); len(events) != 0 {
+				t.Fatal("heartbeat boundary", events)
+			}
+			s.At++
+			c.Check(s, o)
+			for _, status := range c.Status() {
+				if status.Name == api.InvStaleStopped && (status.Violations > 0) != want {
+					t.Fatalf("%s: %+v", mode, status)
+				}
+			}
+		})
+	}
+}
+
+func TestCapacityCountsOnlyIndependentRunningDrivers(t *testing.T) {
+	for _, mode := range []string{"driver exceeds cap", "agent hides overflow", "asynchronous slot union", "nonrunning driver", "configured capacity", "disconnected"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.SlotsPerHost = 2
+			o := Observation{Host: api.Host{ID: "h", SlotCount: 2, Slots: []api.Slot{{VMID: "a", Generation: 1, State: api.SlotReleasing}, {VMID: "b", Generation: 1, State: api.SlotOccupied}}}, Connected: true,
+				Actual: []api.DriverVM{{VMID: "b", Generation: 1, Running: true}, {VMID: "c", Generation: 1, Running: true}}}
+			want := false
+			switch mode {
+			case "driver exceeds cap", "agent hides overflow":
+				o.Actual = append(o.Actual, api.DriverVM{VMID: "d", Generation: 1, Running: true})
+				want = true
+				if mode == "agent hides overflow" {
+					o.Host.Slots = nil
+					o.Host.SlotCount = 99
+				}
+			case "nonrunning driver":
+				o.Actual = append(o.Actual, api.DriverVM{VMID: "d", Generation: 1})
+			case "configured capacity":
+				cfg.SlotsPerHost = 3
+				o.Actual = append(o.Actual, api.DriverVM{VMID: "d", Generation: 1, Running: true})
+			case "disconnected":
+				o.Actual = append(o.Actual, api.DriverVM{VMID: "d", Generation: 1, Running: true})
+				o.Connected = false
+			}
+			c := New(cfg)
+			s := api.Snapshot{At: 1000}
+			c.Check(s, o)
+			for _, status := range c.Status() {
+				if status.Name == api.InvSlotCapacity && (status.Violations > 0) != want {
+					t.Fatalf("%s: %+v", mode, status)
+				}
+			}
+		})
+	}
+}
+
+func TestIdempotencyPartitionWipeRetryHealAndAdoption(t *testing.T) {
+	for _, mode := range []string{"late driver", "late adopted", "key moves to adopted copy", "same logical ID", "different keys", "stopped old copy", "disconnected"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := config.Default()
+			c := New(cfg)
+			keys := map[string]string{"old": "K", "retry": "K"}
+			s := api.Snapshot{At: 1000, VMs: []api.VM{{ID: "old", State: api.VMReady}}}
+			o := Observation{Host: api.Host{ID: "late-host"}, Connected: false, Actual: []api.DriverVM{{VMID: "old", Generation: 7, Running: true}}}
+			if out := c.CheckKeys(s, keys, o); len(out) != 0 {
+				t.Fatal(out)
+			}
+			// Partition, wipe, then retry K: the old copy is still unobserved.
+			s.VMs = []api.VM{{ID: "retry", State: api.VMReady}}
+			s.At += cfg.HostLeaseTTL.Milliseconds()
+			if out := c.CheckKeys(s, keys, o); len(out) != 0 {
+				t.Fatal("disconnected copy observed", out)
+			}
+			o.Connected = true // Heal; observe the late copy independently.
+			want := true
+			immediate := false
+			switch mode {
+			case "late adopted":
+				s.VMs = append(s.VMs, api.VM{ID: "old", State: api.VMReady})
+				immediate = true
+			case "key moves to adopted copy":
+				// Changing the store's current key owner cannot change the retained
+				// accepted-create ledger: both logical IDs still claim K.
+				s.VMs = append(s.VMs, api.VM{ID: "old", State: api.VMReady})
+				immediate = true
+			case "same logical ID":
+				o.Actual[0].VMID = "retry"
+				want = false
+			case "different keys":
+				keys["old"] = "other"
+				want = false
+			case "stopped old copy":
+				o.Actual[0].Running = false
+				want = false
+			case "disconnected":
+				o.Connected = false
+				want = false
+			}
+			if out := c.CheckKeys(s, keys, o); (len(out) > 0) != immediate {
+				t.Fatalf("initial heal: %+v", out)
+			}
+			s.At += cfg.HostHeartbeat.Milliseconds()
+			if out := c.CheckKeys(s, keys, o); (len(out) > 0) != immediate {
+				t.Fatalf("heartbeat boundary: %+v", out)
+			}
+			s.At++
+			if out := c.CheckKeys(s, keys, o); (len(out) > 0) != want {
+				t.Fatalf("after heartbeat: %+v", out)
 			}
 		})
 	}

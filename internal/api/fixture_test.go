@@ -165,8 +165,8 @@ func TestFixtureMatchesContract(t *testing.T) {
 	if len(s.Racks) != 3 || len(s.Hosts) != 12 || slots != 24 {
 		t.Fatalf("topology: %d racks, %d hosts, %d slots", len(s.Racks), len(s.Hosts), slots)
 	}
-	if len(s.Invariants) != 8 {
-		t.Fatalf("want 8 invariants, got %d", len(s.Invariants))
+	if len(s.Invariants) != 9 {
+		t.Fatalf("want 9 invariants, got %d", len(s.Invariants))
 	}
 	for _, st := range []VMState{VMPending, VMBooting, VMReady, VMUnhealthy, VMLost, VMTerminating, VMTerminated, VMFailed} {
 		if s.Counters.ByState[st] == 0 {
