@@ -15,6 +15,7 @@ import (
 	"github.com/hami-sh/vm/internal/api"
 	"github.com/hami-sh/vm/internal/clock"
 	"github.com/hami-sh/vm/internal/config"
+	"github.com/hami-sh/vm/internal/invariant"
 	"github.com/hami-sh/vm/internal/store"
 	"github.com/hami-sh/vm/internal/vm"
 )
@@ -1009,5 +1010,209 @@ func TestEqualGenerationUnexpectedHostKeepsPersistedOwner(t *testing.T) {
 	}
 	if !alert || !stopped || h.s.state.data.VMs[v.ID].VM.HostID != "a" {
 		t.Fatal("unexpected equal-generation host stole ownership after restart")
+	}
+}
+
+func TestUnknownHeartbeatRequestsRegistrationBeforeAdopting(t *testing.T) {
+	for _, reported := range []int64{0, 1, 100} {
+		t.Run(fmt.Sprint(reported), func(t *testing.T) {
+			h := newHarness(t)
+			i := api.InventoryItem{VMID: "recovered", Generation: 7, State: api.VMReady, Pool: config.Pools[0].Name}
+			e := h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Epoch: reported, Inventory: []api.InventoryItem{i}})
+			if len(h.s.state.hosts) != 0 || len(h.s.state.data.VMs) != 0 || len(e.sends) != 1 {
+				t.Fatal("heartbeat guessed registration state")
+			}
+			ack, ok := e.sends[0].msg.(api.HeartbeatAck)
+			if !ok || !ack.Reregister || ack.Epoch <= reported || ack.HostID != "a" || e.sends[0].to.Rack != "r1" {
+				t.Fatalf("bad re-registration request: %+v", e.sends)
+			}
+			h.agent("a", "r1", api.RegisterHost{HostID: "a", Rack: "r1", Slots: 1, DiskFull: true, Epoch: ack.Epoch, Inventory: []api.InventoryItem{i}})
+			if h.s.state.hosts["a"].record.Slots != 1 || !h.s.state.hosts["a"].disk || h.s.state.data.VMs[i.VMID].VM.Generation != 7 {
+				t.Fatal("did not use authoritative registration")
+			}
+		})
+	}
+}
+
+func TestDrainGraceDeletesAndReplacesAtClassZero(t *testing.T) {
+	h := newHarness(t)
+	h.register("a", "r1", 2)
+	keep := h.create("keep", "batch")
+	h.ready(keep)
+	del := h.create("delete", "standard")
+	h.ready(del)
+	e := h.step(request{op: "admin", id: "a", arg: api.AdminDraining})
+	if hasStop(e, keep.ID, keep.Generation) || h.s.state.data.VMs[keep.ID].VM.State != api.VMReady {
+		t.Fatal("drain stopped Ready VM immediately")
+	}
+	queued := h.create("queued", "interactive")
+	if queued.State != api.VMPending {
+		t.Fatal("draining host accepted new placement")
+	}
+	h.step(request{op: "delete", id: del.ID})
+	h.agent("a", "r1", api.StoppedReport{HostID: "a", VMID: del.ID, Generation: del.Generation})
+	deadline := h.c.Now().Add(h.s.cfg.DrainGrace - time.Millisecond)
+	for h.c.Now().Before(deadline) {
+		h.c.Advance(min(h.s.cfg.HostHeartbeat, deadline.Sub(h.c.Now())))
+		h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: uint64(h.c.Now().UnixMilli()), Inventory: []api.InventoryItem{{VMID: keep.ID, Generation: keep.Generation, State: api.VMReady, Pool: keep.Pool}}})
+		h.step(tick{})
+	}
+	if h.s.state.data.VMs[keep.ID].VM.State != api.VMReady || len(h.s.state.data.Queue) != 1 {
+		t.Fatal("VM replaced before drain grace")
+	}
+	// Repeating the same admin state must not extend the original deadline.
+	h.step(request{op: "admin", id: "a", arg: api.AdminDraining})
+	h.c.Advance(time.Millisecond)
+	e = h.step(tick{})
+	q := h.s.state.data.Queue[keep.ID]
+	if q.Priority != api.PriorityReplacement || q.Reason != api.QueueReplace || !hasStop(e, keep.ID, keep.Generation) {
+		t.Fatalf("drain did not fence and enqueue replacement: %+v", q)
+	}
+	if h.s.state.data.VMs[del.ID].VM.State != api.VMTerminated {
+		t.Fatal("deleted VM replaced")
+	}
+	h.agent("a", "r1", api.StoppedReport{HostID: "a", VMID: keep.ID, Generation: keep.Generation})
+	h.register("b", "r2", 2)
+	for _, id := range []string{keep.ID, queued.ID} {
+		v := h.s.state.data.VMs[id].VM
+		if v.State != api.VMBooting || v.HostID != "b" {
+			t.Fatalf("not re-placed: %+v", v)
+		}
+		h.ready(v)
+	}
+	if h.s.state.data.VMs[keep.ID].VM.Generation != keep.Generation+1 {
+		t.Fatal("drain did not fence old generation")
+	}
+	for _, r := range h.s.state.data.VMs {
+		if r.VM.State == api.VMFailed || r.VM.State == api.VMLost {
+			t.Fatalf("drain lost admitted work: %+v", r)
+		}
+	}
+}
+
+func TestRestartGivesDrainingHostFullGrace(t *testing.T) {
+	h := newHarness(t)
+	h.register("a", "r1", 1)
+	v := h.create("v", "standard")
+	h.ready(v)
+	h.step(request{op: "admin", id: "a", arg: api.AdminDraining})
+	h.c.Advance(h.s.cfg.DrainGrace - time.Millisecond)
+	d, epoch, err := h.db.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.s.state = newState(d, epoch, h.c.Now(), h.s.cfg)
+	until := h.c.Now().Add(h.s.cfg.DrainGrace - time.Millisecond)
+	for h.c.Now().Before(until) {
+		h.register("a", "r1", 1, api.InventoryItem{VMID: v.ID, Generation: v.Generation, State: api.VMReady, Pool: v.Pool})
+		h.c.Advance(min(h.s.cfg.HostHeartbeat, until.Sub(h.c.Now())))
+		h.step(tick{})
+	}
+	if h.s.state.data.VMs[v.ID].VM.State != api.VMReady {
+		t.Fatal("restart inherited expired drain deadline")
+	}
+	h.c.Advance(time.Millisecond)
+	h.step(tick{})
+	if h.s.state.data.Queue[v.ID].Priority != api.PriorityReplacement {
+		t.Fatal("fresh drain grace never expired")
+	}
+}
+
+func TestStoreDelaySlowsCommitsHealsAndKeepsFloodBounded(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cfg := config.Default()
+	c := clock.NewFake(time.Unix(1000, 0))
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	sctx, kill := context.WithCancel(ctx)
+	s, err := New(sctx, cfg, c, &testNetwork{}, db)
+	if err != nil {
+		kill()
+		t.Fatal(err)
+	}
+	defer func() { kill(); <-s.Done() }()
+	c.Advance(cfg.HostLeaseTTL)
+	body := api.CreateVMRequest{Pool: config.Pools[0].Name}
+	if _, err := s.CreateVM(ctx, "baseline", body); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetStoreDelay(ctx, cfg.HostHeartbeat); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := s.CreateVM(ctx, "delayed", body); done <- err }()
+	await(t, ctx, func() bool { return c.Pending() > 1 })
+	c.Advance(cfg.HostHeartbeat - time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("commit completed before injected delay: %v", err)
+	default:
+	}
+	c.Advance(time.Millisecond)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if err := s.SetStoreDelay(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	healedAt := c.Now()
+	if _, err := s.CreateVM(ctx, "healed", body); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Now().Equal(healedAt) {
+		t.Fatal("healed store still needed clock advancement")
+	}
+	status(t, s.SetStoreDelay(ctx, -time.Millisecond), 422)
+	if err := s.SetStoreDelay(ctx, cfg.InvariantEvery); err != nil {
+		t.Fatal(err)
+	}
+	const requests = 40
+	results := make(chan error, requests)
+	for n := 0; n < requests; n++ {
+		go func(n int) { _, err := s.CreateVM(ctx, fmt.Sprint("flood-", n), body); results <- err }(n)
+	}
+	accepted, rejected := 0, 0
+	for accepted+rejected < requests {
+		select {
+		case err := <-results:
+			if err == nil {
+				accepted++
+			} else {
+				status(t, err, 429)
+				rejected++
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		default:
+			c.Advance(cfg.InvariantEvery)
+			(clock.Real{}).Sleep(time.Millisecond)
+		}
+	}
+	if accepted != cfg.QueueCap-3 || rejected == 0 {
+		t.Fatalf("flood accepted=%d rejected=%d", accepted, rejected)
+	}
+	snap, err := s.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Queue) != cfg.QueueCap {
+		t.Fatalf("queue did not grow to its bound: %d", len(snap.Queue))
+	}
+	events, truncated, err := s.EventsSince(ctx, 0)
+	if err != nil || truncated {
+		t.Fatalf("audit unavailable: %v %v", truncated, err)
+	}
+	snap.Recent = events
+	if violations := invariant.New(cfg).Check(snap); len(violations) != 0 {
+		t.Fatalf("slow-store flood violations: %+v", violations)
 	}
 }

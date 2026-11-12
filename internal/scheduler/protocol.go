@@ -32,7 +32,22 @@ func (p *planner) receive(from api.Addr, msg any) {
 		p.reconcile(id, m.Inventory, true)
 	case api.HostHeartbeat:
 		h, ok := p.hosts[id]
-		if !ok || m.HostID != id || from.Rack != h.record.Rack {
+		if m.HostID != id {
+			return
+		}
+		if !ok {
+			p.observeEpoch(m.Epoch)
+			// A re-registration request must be strictly ahead even if a
+			// fresh store happens to have the agent's exact epoch already.
+			if p.epoch == m.Epoch {
+				p.epoch++
+				p.data.Epoch = p.epoch
+				p.log(api.EventReconcile, "", "", "advanced scheduler epoch for re-registration")
+			}
+			p.effect.sends = append(p.effect.sends, delivery{from, api.HeartbeatAck{HostID: id, Epoch: p.epoch, Reregister: true}})
+			return
+		}
+		if from.Rack != h.record.Rack {
 			return
 		}
 		p.observeEpoch(m.Epoch)
