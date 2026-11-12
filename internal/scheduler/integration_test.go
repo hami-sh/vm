@@ -195,6 +195,11 @@ func TestRealAgentWipedStoreEpochAndIdempotencyRecovery(t *testing.T) {
 	}
 	start()
 	freshAt := c.Now()
+	// Restart before any host has registered with the wiped store. Neither
+	// the adoption marker nor its original deadline may be lost or extended.
+	c.Advance(time.Millisecond)
+	stop()
+	start()
 	_, err = s.CreateVM(ctx, "K", body)
 	checkStatus(err, 503)
 	wait(true, func() bool { v, err := s.GetVM(ctx, created.ID); return err == nil && v.State == api.VMReady })

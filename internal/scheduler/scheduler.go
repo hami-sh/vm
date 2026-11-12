@@ -91,16 +91,26 @@ func New(ctx context.Context, cfg config.Config, c clock.Clock, transport api.Tr
 	if err != nil {
 		return nil, err
 	}
+	initialized := d
+	if d.RecoverUntil == -1 {
+		initialized.RecoverUntil = c.Now().Add(cfg.HostLeaseTTL).UnixMilli()
+	} else if d.RecoverUntil <= c.Now().UnixMilli() {
+		initialized.RecoverUntil = 0
+	}
+	if initialized.RecoverUntil != d.RecoverUntil {
+		if err := db.Commit(ctx, d, initialized, nil, cfg.EventRetention); err != nil {
+			return nil, err
+		}
+		d = initialized
+	}
 	ep, err := transport.Attach(Address)
 	if err != nil {
 		return nil, err
 	}
 	s := &Scheduler{cfg: cfg, clock: c, store: db, endpoint: ep, inbox: make(chan request, cfg.MaxVMs), done: make(chan struct{})}
 	s.state = newState(d, epoch, c.Now(), cfg)
-	s.state.fresh = db.Fresh()
-	if s.state.fresh {
-		s.state.recoverUntil = c.Now().Add(cfg.HostLeaseTTL).UnixMilli()
-	}
+	s.state.recoverUntil = d.RecoverUntil
+	s.state.fresh = d.RecoverUntil > 0
 	events, err := db.Events(ctx)
 	if err != nil {
 		ep.Close()
@@ -135,7 +145,7 @@ func newState(d store.Data, epoch int64, now time.Time, cfg config.Config) *stat
 
 func (st *state) clone() *state {
 	n := *st
-	n.data = store.Data{Epoch: st.data.Epoch, VMs: maps.Clone(st.data.VMs), Hosts: maps.Clone(st.data.Hosts), Queue: maps.Clone(st.data.Queue)}
+	n.data = store.Data{Epoch: st.data.Epoch, RecoverUntil: st.data.RecoverUntil, VMs: maps.Clone(st.data.VMs), Hosts: maps.Clone(st.data.Hosts), Queue: maps.Clone(st.data.Queue)}
 	n.hosts = maps.Clone(st.hosts)
 	for id, h := range n.hosts {
 		h.inventory = append([]api.InventoryItem(nil), h.inventory...)

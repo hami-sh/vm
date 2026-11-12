@@ -51,9 +51,12 @@ func (p *planner) receive(from api.Addr, msg any) {
 			return
 		}
 		p.observeEpoch(m.Epoch)
-		// A restarted agent begins at 1. Its registration can be lost, so
-		// that first heartbeat also resets the scheduler's sequence window.
-		if m.Seq != 0 && m.Seq != 1 && m.Seq <= h.seq {
+		// Only RegisterHost resets the sequence window. Seq 1 may be a
+		// delayed packet, not evidence of a new agent incarnation.
+		if m.Seq <= h.seq {
+			// Repeat the request on each stale heartbeat so packet loss cannot
+			// strand an agent whose initial registration was dropped.
+			p.send(id, api.HeartbeatAck{HostID: id, Epoch: p.epoch, Reregister: true})
 			return
 		}
 		rejoin := h.lease != api.LeaseHealthy
@@ -72,7 +75,23 @@ func (p *planner) receive(from api.Addr, msg any) {
 			return
 		}
 		if !m.Admitted {
-			p.retry(m.VMID, api.ReasonRefused)
+			switch m.Reason {
+			case "full", "cordoned", "disk_full", "awaiting_scheduler_ack":
+				// Admission never started a boot, so refund just this attempt.
+				record := p.data.VMs[m.VMID]
+				record.VM.Attempts--
+				p.data.VMs[m.VMID] = record
+				delete(p.reservations, m.VMID)
+				if m.Reason != "awaiting_scheduler_ack" {
+					p.exclude[m.VMID] = id
+					p.stop(id, m.VMID, m.Generation, api.ReasonRefused)
+				} else {
+					delete(p.exclude, m.VMID)
+				}
+				p.enqueue(m.VMID, false, m.Reason)
+			default:
+				p.retry(m.VMID, api.ReasonRefused)
+			}
 		} else {
 			r.admitted = true
 			p.reservations[m.VMID] = r
@@ -119,7 +138,10 @@ func (p *planner) receive(from api.Addr, msg any) {
 			return
 		}
 		v := p.data.VMs[m.VMID].VM
-		if v.State == api.VMTerminating {
+		if m.Reason == api.ReasonQuarantined && (v.State == api.VMReady || v.State == api.VMUnhealthy || v.State == api.VMBooting) {
+			p.move(v.ID, api.VMFailed, api.ReasonQuarantined)
+			delete(p.reservations, v.ID)
+		} else if v.State == api.VMTerminating {
 			p.move(v.ID, api.VMTerminated, api.ReasonDeleted)
 		} else if v.State == api.VMBooting {
 			p.retry(v.ID, "stopped during boot")
@@ -181,7 +203,12 @@ func (p *planner) ready(id string) {
 		h.inventory = append(h.inventory, api.InventoryItem{VMID: id, Generation: v.Generation, State: api.VMReady, Pool: v.Pool})
 	}
 	p.hosts[v.HostID] = h
-	p.metrics.observe("vm_time_to_ready_seconds", v.Priority, float64(p.now.UnixMilli()-v.CreatedAt)/1000)
+	r := p.data.VMs[id]
+	if !r.ReachedReady {
+		p.metrics.observe("vm_time_to_ready_seconds", v.Priority, float64(p.now.UnixMilli()-v.CreatedAt)/1000)
+		r.ReachedReady = true
+		p.data.VMs[id] = r
+	}
 	if at, ok := p.recovering[id]; ok {
 		p.metrics.observe("time_to_recover_seconds", v.Priority, float64(p.now.UnixMilli()-at)/1000)
 		delete(p.recovering, id)
@@ -217,13 +244,19 @@ func (p *planner) reconcile(hostID string, inventory []api.InventoryItem, strict
 						if i.Generation > existing.VM.Generation {
 							existing.Key = ""
 							p.data.VMs[id] = existing
+							p.request(request{op: "delete", id: id})
 						} else {
 							key = ""
 						}
 						break
 					}
 				}
-				p.data.VMs[i.VMID] = store.Record{VM: v, Key: key, Hash: i.RequestHash}
+				if i.IdempotencyKey != "" && key == "" {
+					stale = append(stale, i)
+					p.stop(hostID, i.VMID, i.Generation, "duplicate recovered key")
+					continue
+				}
+				p.data.VMs[i.VMID] = store.Record{VM: v, Key: key, Hash: i.RequestHash, ReachedReady: true}
 				p.move(i.VMID, api.VMReady, "adopted after store loss")
 				p.claims[i.VMID] = hostID
 				seen[i.VMID] = true

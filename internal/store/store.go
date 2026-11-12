@@ -23,9 +23,10 @@ import (
 var Schema string
 
 type Record struct {
-	VM        api.VM
-	Key, Hash string
-	Deadline  int64
+	VM           api.VM
+	Key, Hash    string
+	Deadline     int64
+	ReachedReady bool
 }
 
 type HostRecord struct {
@@ -38,9 +39,12 @@ type HostRecord struct {
 // Data contains only durable intent, never leases, tokens or reservations.
 type Data struct {
 	Epoch int64
-	VMs   map[string]Record
-	Hosts map[string]HostRecord
-	Queue map[string]api.QueueEntry
+	// RecoverUntil is -1 before the first scheduler initializes the deadline,
+	// positive during wipe recovery, and zero after recovery has expired.
+	RecoverUntil int64
+	VMs          map[string]Record
+	Hosts        map[string]HostRecord
+	Queue        map[string]api.QueueEntry
 }
 
 type Store struct {
@@ -66,8 +70,7 @@ func Open(path string) (*Store, error) {
 		_, err = db.Exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
 	}
 	if err == nil {
-		err = db.QueryRow("SELECT count(*) FROM meta WHERE key='scheduler_epoch'").Scan(&n)
-		s.fresh = n == 0
+		err = db.QueryRow("SELECT NOT EXISTS(SELECT 1 FROM meta WHERE key='scheduler_epoch') OR EXISTS(SELECT 1 FROM meta WHERE key='recover_until' AND CAST(value AS INTEGER)!=0)").Scan(&s.fresh)
 	}
 	if err == nil {
 		for _, p := range config.Pools {
@@ -102,6 +105,15 @@ func (s *Store) Start(ctx context.Context) (Data, int64, error) {
 		return d, 0, err
 	}
 	s.fresh = exists == 0
+	if s.fresh {
+		if _, err = tx.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES('recover_until','-1')"); err != nil {
+			return d, 0, err
+		}
+	}
+	if err = tx.QueryRowContext(ctx, "SELECT coalesce((SELECT CAST(value AS INTEGER) FROM meta WHERE key='recover_until'),0)").Scan(&d.RecoverUntil); err != nil {
+		return d, 0, err
+	}
+	s.fresh = d.RecoverUntil != 0
 	var epoch int64
 	err = tx.QueryRowContext(ctx, `INSERT INTO meta(key,value) VALUES('scheduler_epoch','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1 RETURNING CAST(value AS INTEGER)`).Scan(&epoch)
 	if err != nil {
@@ -126,14 +138,14 @@ func (s *Store) Start(ctx context.Context) (Data, int64, error) {
 	if err != nil {
 		return d, 0, err
 	}
-	rows, err = tx.QueryContext(ctx, `SELECT id,pool,coalesce(idempotency_key,''),request_hash,desired,state,generation,coalesce(host_id,''),priority,attempts,coalesce(boot_deadline_at,0),coalesce(last_reason,''),created_at,updated_at FROM vms`)
+	rows, err = tx.QueryContext(ctx, `SELECT id,pool,coalesce(idempotency_key,''),request_hash,desired,state,generation,coalesce(host_id,''),priority,attempts,coalesce(boot_deadline_at,0),coalesce(last_reason,''),created_at,updated_at,EXISTS(SELECT 1 FROM meta WHERE key='first_ready/'||vms.id) OR state='Ready' FROM vms`)
 	if err != nil {
 		return d, 0, err
 	}
 	for rows.Next() {
 		var r Record
 		v := &r.VM
-		if err = rows.Scan(&v.ID, &v.Pool, &r.Key, &r.Hash, &v.Desired, &v.State, &v.Generation, &v.HostID, &v.Priority, &v.Attempts, &r.Deadline, &v.LastReason, &v.CreatedAt, &v.UpdatedAt); err != nil {
+		if err = rows.Scan(&v.ID, &v.Pool, &r.Key, &r.Hash, &v.Desired, &v.State, &v.Generation, &v.HostID, &v.Priority, &v.Attempts, &r.Deadline, &v.LastReason, &v.CreatedAt, &v.UpdatedAt, &r.ReachedReady); err != nil {
 			break
 		}
 		if h, ok := d.Hosts[v.HostID]; ok {
@@ -191,6 +203,11 @@ func (s *Store) Commit(ctx context.Context, before, after Data, events []api.Eve
 	if n != 1 {
 		return ErrCAS
 	}
+	if after.RecoverUntil != before.RecoverUntil {
+		if _, err = tx.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES('recover_until',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", after.RecoverUntil); err != nil {
+			return err
+		}
+	}
 	for id, h := range after.Hosts {
 		if reflect.DeepEqual(before.Hosts[id], h) {
 			continue
@@ -215,6 +232,11 @@ func (s *Store) Commit(ctx context.Context, before, after Data, events []api.Eve
 			continue
 		}
 		v := r.VM
+		if r.ReachedReady {
+			if _, err = tx.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,'1') ON CONFLICT(key) DO NOTHING", "first_ready/"+id); err != nil {
+				return err
+			}
+		}
 		if exists {
 			if v.Generation < old.VM.Generation {
 				return ErrCAS

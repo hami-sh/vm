@@ -1,0 +1,156 @@
+package scheduler
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/hami-sh/vm/internal/api"
+)
+
+func TestQuarantinedStopCannotBecomeReplacement(t *testing.T) {
+	for _, state := range []api.VMState{api.VMReady, api.VMUnhealthy} {
+		t.Run(string(state), func(t *testing.T) {
+			h := newHarness(t)
+			h.register("a", "r1", 2)
+			h.register("b", "r2", 2)
+			v := h.create("K", "interactive")
+			h.ready(v)
+			if state == api.VMUnhealthy {
+				r := h.s.state.data.VMs[v.ID]
+				r.VM.State = state
+				h.s.state.data.VMs[v.ID] = r
+			}
+			// SecurityReport is lost, but the release completion still arrives.
+			h.agent(v.HostID, v.Rack, api.StoppedReport{HostID: v.HostID, VMID: v.ID, Generation: v.Generation, Reason: api.ReasonQuarantined})
+			h.agent(v.HostID, v.Rack, api.HostHeartbeat{HostID: v.HostID, Seq: 1})
+			got := h.s.state.data.VMs[v.ID].VM
+			if got.State != api.VMFailed || got.Generation != v.Generation || got.LastReason != api.ReasonQuarantined {
+				t.Fatalf("quarantine replaced: %+v", got)
+			}
+		})
+	}
+}
+
+func TestLateWipeCopyCannotStealRetriedKey(t *testing.T) {
+	h := newHarness(t)
+	h.s.state.recoverUntil = h.c.Now().Add(h.s.cfg.HostLeaseTTL).UnixMilli()
+	h.c.Advance(h.s.cfg.HostLeaseTTL)
+	h.register("new", "r1", 2)
+	v := h.create("K", "standard")
+	h.ready(v)
+	r := h.s.state.data.VMs[v.ID]
+	old := api.InventoryItem{VMID: "prewipe", Generation: v.Generation + 10, State: api.VMReady, Pool: v.Pool, IdempotencyKey: "K", RequestHash: r.Hash}
+	e := h.register("healed", "r2", 2, old)
+	if !hasStop(e, old.VMID, old.Generation) {
+		t.Fatal("late unknown copy was not stopped")
+	}
+	if got := h.create("K", "standard"); got.ID != v.ID {
+		t.Fatalf("retry after heal changed identity: %s -> %s", v.ID, got.ID)
+	}
+	for id, r := range h.s.state.data.VMs {
+		if id != v.ID && r.Key == "K" && r.VM.Desired == api.DesiredRunning {
+			t.Fatalf("duplicate running key: %+v", r)
+		}
+	}
+}
+
+func TestDelayedFirstHeartbeatCannotReplaceReadyVM(t *testing.T) {
+	for _, seq := range []uint64{0, 1, 5} {
+		t.Run(string(rune('0'+seq)), func(t *testing.T) {
+			h := newHarness(t)
+			h.register("a", "r1", 2)
+			v := h.create("K", "standard")
+			h.ready(v)
+			h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: 7, Inventory: []api.InventoryItem{{VMID: v.ID, Generation: v.Generation, State: api.VMReady}}})
+			h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: seq})
+			if got := h.s.state.data.VMs[v.ID].VM; got.State != api.VMReady || got.Generation != v.Generation {
+				t.Fatalf("stale inventory replaced VM: %+v", got)
+			}
+		})
+	}
+}
+
+func TestCapacityRefusalsDoNotConsumeBootBudget(t *testing.T) {
+	for _, reason := range []string{"full", "cordoned", "disk_full"} {
+		t.Run(reason, func(t *testing.T) {
+			h := newHarness(t)
+			v := h.create("K", "standard")
+			for n := 0; n < h.s.cfg.MaxAttempts+1; n++ {
+				id := string(rune('a' + n))
+				h.register(id, "r1", 2)
+				h.c.Advance(h.s.cfg.HostHeartbeat)
+				h.step(tick{})
+				v = h.s.state.data.VMs[v.ID].VM
+				if v.State != api.VMBooting {
+					t.Fatalf("refusal consumed budget: %+v", v)
+				}
+				h.agent(v.HostID, v.Rack, api.StartVMResult{HostID: v.HostID, VMID: v.ID, Generation: v.Generation, Reason: reason})
+				if got := h.s.state.data.VMs[v.ID].VM; got.State != api.VMPending || got.Attempts != 0 {
+					t.Fatalf("capacity refusal counted as boot: %+v", got)
+				}
+			}
+			h.register("success", "r2", 2)
+			h.c.Advance(h.s.cfg.HostHeartbeat)
+			h.step(tick{})
+			v = h.s.state.data.VMs[v.ID].VM
+			h.ready(v)
+			if got := h.s.state.data.VMs[v.ID].VM; got.State != api.VMReady || got.Attempts != 1 {
+				t.Fatalf("could not boot after capacity healed: %+v", got)
+			}
+		})
+	}
+}
+
+func TestAwaitingSchedulerAckRetriesSameHostWithoutAttempt(t *testing.T) {
+	h := newHarness(t)
+	h.register("a", "r1", 2)
+	v := h.create("K", "standard")
+	for n := 0; n <= h.s.cfg.MaxAttempts; n++ {
+		h.agent("a", "r1", api.StartVMResult{HostID: "a", VMID: v.ID, Generation: v.Generation, Reason: "awaiting_scheduler_ack"})
+		h.c.Advance(h.s.cfg.BackoffBase)
+		// The normal heartbeat is acked; the host is usable again without
+		// another RegisterHost or removing any host exclusion by hand.
+		h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: uint64(n + 1)})
+		v = h.s.state.data.VMs[v.ID].VM
+		if v.State != api.VMBooting || v.HostID != "a" || v.Attempts != 1 {
+			t.Fatalf("ack barrier consumed attempts or excluded host: %+v", v)
+		}
+	}
+	h.ready(v)
+	if got := h.s.state.data.VMs[v.ID].VM; got.State != api.VMReady {
+		t.Fatalf("acked host did not boot: %+v", got)
+	}
+}
+
+func TestFirstReadyLatencyNotRepeatedAfterRecovery(t *testing.T) {
+	h := newHarness(t)
+	h.register("a", "r1", 2)
+	v := h.create("K", "interactive")
+	h.c.Advance(time.Second)
+	h.ready(v)
+	h.c.Advance(time.Second)
+	h.agent("a", "r1", api.UnhealthyReport{HostID: "a", VMID: v.ID, Generation: v.Generation, Reason: api.ReasonGuestLease})
+	v = h.s.state.data.VMs[v.ID].VM
+	h.ready(v)
+	e := h.step(request{op: "metrics"})
+	text := e.response.value.(string)
+	if !strings.Contains(text, "vm_time_to_ready_seconds_count{priority=\"interactive\"} 1\n") || !strings.Contains(text, "time_to_recover_seconds_count{priority=\"interactive\"} 1\n") {
+		t.Fatalf("first Ready or recovery sample wrong: %s", text)
+	}
+	// Persisted first-Ready history must survive a restart while recycling,
+	// when the current state alone no longer establishes prior readiness.
+	h.agent("a", "r1", api.UnhealthyReport{HostID: "a", VMID: v.ID, Generation: v.Generation, Reason: api.ReasonGuestLease})
+	d, epoch, err := h.db.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.s.state = newState(d, epoch, h.c.Now(), h.s.cfg)
+	v = d.VMs[v.ID].VM
+	h.register("a", "r1", 2, api.InventoryItem{VMID: v.ID, Generation: v.Generation, State: api.VMReady})
+	text = h.step(request{op: "metrics"}).response.value.(string)
+	if !strings.Contains(text, "vm_time_to_ready_seconds_count{priority=\"interactive\"} 0\n") {
+		t.Fatalf("re-ready after restart counted as a new create: %s", text)
+	}
+}

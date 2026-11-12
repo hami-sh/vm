@@ -25,6 +25,11 @@ type planner struct {
 func (s *Scheduler) handle(now time.Time, msg any) []Effect {
 	e := Effect{next: s.state.clone()}
 	p := planner{state: e.next, cfg: s.cfg, now: now, effect: &e}
+	// Expire before processing even a registration arriving without a tick.
+	if p.fresh && p.recoverUntil > 0 && now.UnixMilli() >= p.recoverUntil {
+		p.fresh = false
+		p.data.RecoverUntil = 0
+	}
 	switch m := msg.(type) {
 	case request:
 		e.reply = m.reply

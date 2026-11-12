@@ -709,6 +709,9 @@ func TestReservationTimeoutRefusalAndRecycle(t *testing.T) {
 	if h.s.state.data.Queue[v.ID].Reason != api.QueueRetry || !hasStop(e, v.ID, retry.Generation) {
 		t.Fatal("refusal got replacement priority")
 	}
+	if h.s.state.data.VMs[v.ID].VM.Attempts != retry.Attempts-1 {
+		t.Fatal("capacity refusal refunded prior boot failures")
+	}
 
 	r := newHarness(t)
 	r.register("a", "r1", 1)
@@ -787,6 +790,9 @@ func TestAdoptedIdempotencyKeyChoosesHighestGeneration(t *testing.T) {
 			}
 			if h.s.state.data.VMs[low.VMID].Key != "" || h.s.state.data.VMs[high.VMID].Key != key {
 				t.Fatal("higher-generation claim did not win")
+			}
+			if h.s.state.data.VMs[low.VMID].VM.Desired != api.DesiredDeleted {
+				t.Fatal("losing adopted copy is still desired-running")
 			}
 			loaded, _, err := h.db.Start(context.Background())
 			if err != nil {
@@ -948,14 +954,26 @@ func TestHeartbeatEchoDoesNotBumpEpochAndRestartResetsSequence(t *testing.T) {
 			t.Fatal("echoed ack epoch changed the epoch or emitted audit events")
 		}
 	}
-	// RegisterHost from the restarted agent was dropped; seq=1 must still
-	// renew its lease despite the previous process having reached seq=10.
-	h.c.Advance(h.s.cfg.HostLeaseTTL - time.Millisecond)
+	// Only registration resets the sequence window; delayed seq=1 cannot.
+	for _, seq := range []uint64{1, 2} {
+		e := h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: seq, Epoch: ackEpoch})
+		if h.s.state.hosts["a"].seq != 10 {
+			t.Fatal("delayed heartbeat reset sequence")
+		}
+		requested := false
+		for _, d := range e.sends {
+			if ack, ok := d.msg.(api.HeartbeatAck); ok && ack.Reregister && ack.Epoch == ackEpoch {
+				requested = true
+			}
+		}
+		if !requested {
+			t.Fatal("dropped registration or re-registration request cannot recover")
+		}
+	}
+	h.register("a", "r1", 1)
 	h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: 1, Epoch: ackEpoch})
-	h.c.Advance(time.Millisecond)
-	h.step(tick{})
 	if h.s.state.hosts["a"].lease != api.LeaseHealthy || h.s.state.hosts["a"].seq != 1 {
-		t.Fatal("lost registration made restart heartbeats look stale")
+		t.Fatal("registration did not reset sequence")
 	}
 }
 

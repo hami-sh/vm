@@ -96,7 +96,7 @@ func TestEpochAndFreshnessAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if next != epoch+1 || s.Fresh() {
+	if next != epoch+1 || !s.Fresh() {
 		t.Fatalf("restart epoch=%d fresh=%v", next, s.Fresh())
 	}
 	// Further starts increment persisted metadata without consulting time.
