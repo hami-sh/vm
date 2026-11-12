@@ -322,6 +322,60 @@ func TestRejectedRegisterGetsVerdict(t *testing.T) {
 	}
 }
 
+func TestRestartRejectsStartsUntilSchedulerAck(t *testing.T) {
+	h := newHarness(t)
+	cmd := start("a", 5)
+	cmd.Epoch = 9
+	h.send(cmd)
+	h.until(func(s agent.Snapshot) bool { return ready(s, "a", 5) })
+	h.send(api.StopVM{VMID: "a", Generation: 5, Epoch: 9})
+	h.until(func(s agent.Snapshot) bool { return len(s.Inventory) == 0 && len(s.Actual) == 0 })
+	if err := h.a.Restart(h.ctx); err != nil {
+		t.Fatal(err)
+	}
+	old := start("a", 4)
+	old.Epoch = 3
+	before := len(h.messages)
+	h.send(old)
+	h.until(func(s agent.Snapshot) bool {
+		for _, m := range h.messages[before:] {
+			if r, ok := m.(api.StartVMResult); ok && r.VMID == "a" && r.Generation == 4 {
+				if r.Admitted || len(s.Inventory) != 0 || len(s.Actual) != 0 {
+					t.Fatalf("delayed start resurrected stopped VM after restart: result=%+v snapshot=%+v", r, s)
+				}
+				return true
+			}
+		}
+		return false
+	})
+	// Another host's ack cannot restore our scheduler fence, even when its
+	// epoch is higher than the current scheduler's.
+	h.send(api.HeartbeatAck{HostID: "other", Epoch: 100})
+	fresh := start("a", 6)
+	fresh.Epoch = 10
+	before = len(h.messages)
+	h.send(fresh)
+	h.until(func(agent.Snapshot) bool {
+		for _, m := range h.messages[before:] {
+			if r, ok := m.(api.StartVMResult); ok && r.VMID == "a" && r.Generation == 6 {
+				if r.Admitted {
+					t.Fatal("wrong-host ack allowed admission")
+				}
+				return true
+			}
+		}
+		return false
+	})
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 10})
+	h.until(func(s agent.Snapshot) bool { return s.Epoch == 10 })
+	h.send(old)
+	h.send(fresh)
+	s := h.until(func(s agent.Snapshot) bool { return ready(s, "a", 6) })
+	if len(s.Actual) != 1 || s.Actual[0].Generation != 6 || !s.Actual[0].Running {
+		t.Fatalf("scheduler ack did not restore safe admission: %+v", s)
+	}
+}
+
 func TestAgentRestartPreservesDriverVMs(t *testing.T) {
 	h := newHarness(t)
 	h.boot("a", 1)
@@ -679,6 +733,8 @@ func TestAdmissionCapAndHostFaults(t *testing.T) {
 	if err := h.a.PauseHeartbeats(h.ctx, false); err != nil {
 		t.Fatal(err)
 	}
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 1})
+	h.until(func(s agent.Snapshot) bool { return s.Epoch == 1 })
 	h.boot("a", 2)
 }
 

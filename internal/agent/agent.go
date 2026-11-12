@@ -83,6 +83,7 @@ type Agent struct {
 	seq              uint64
 	paused, cordoned bool
 	reregister       bool
+	awaitingAck      bool
 	down             bool
 	skew             time.Duration
 	security         api.SecurityStatus
@@ -339,6 +340,9 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 				if cmd.Epoch < a.epoch {
 					return nil
 				}
+				if a.awaitingAck {
+					return []Effect{a.result(cmd, false, "awaiting_scheduler_ack")}
+				}
 				a.epoch = cmd.Epoch
 				return a.start(now, cmd)
 			case api.StopVM:
@@ -362,6 +366,7 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 					return nil
 				}
 				a.epoch = cmd.Epoch
+				a.awaitingAck = false
 				a.reregister = cmd.Reregister
 				var out []Effect
 				if a.reregister {
@@ -492,6 +497,9 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 			a.paused = false
 			a.cordoned = false
 			a.reregister = false
+			// Recovered live VMs do not preserve stopped-generation fences.
+			// Restore the scheduler epoch from an ack before admitting starts.
+			a.awaitingAck = true
 			return []Effect{{Work: func(ctx context.Context) any {
 				for _, done := range boots {
 					<-done
