@@ -120,6 +120,7 @@ func Catalog() []Scenario {
 	}})
 	s[12] = hostileTenant(s[12])
 	s = append(s, wipeLateHost(base("wipe-late-host")))
+	s = append(s, naturalChurn())
 	return s
 }
 

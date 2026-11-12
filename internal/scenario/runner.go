@@ -472,6 +472,9 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 					}
 				}
 				report.Checks = results
+				if s.Report != nil {
+					s.Report(&report)
+				}
 				return report, nil
 			}
 		}

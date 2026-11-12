@@ -12,6 +12,8 @@ In the local or live dashboard:
 4. Heal r2. Look for the fencing event and stale copies being stopped.
 5. Open a recorded run to review snapshots, chaos markers and the machine-readable verdict.
 
+For a steady-state churn demo instead of a flood, enable **VM lifetimes** next to Sustained load: busy 30–90 s, idle timeout 20 s, then offer about 0.2 VMs/s. Watch Busy/Idle chips and `completed`/`idle` workload events as VMs go through Terminating → Terminated and new jobs reuse their slots. Expected Ready occupancy is about 0.2 × (60 + 0.4 × 20) = 13.6 VMs, leaving headroom for boots and recovery on 24 slots. Lifetimes are off by default and affect only load-generator VMs, never manual API/dashboard creates.
+
 For local development, install Go 1.27.4 and run `make run`. The binary listens on `$PORT` (8080 by default); `-addr` overrides it.
 
 ## Verify and record
@@ -29,7 +31,7 @@ The default is four concurrent isolated fleets. The three release gates used `ma
 
 The runner defaults to **5×**, including under `-race`. Explicit `--speed 0` compares the complete suite at 5× and 50× with the same seeds. Any failed 5× baseline returns an error. Only a green baseline with high-speed-only liveness failures can select 5×; invariants 2 and 8 are time-bounded, but every other invariant (including idempotency uniqueness) is safety and can never be calibrated away. Use `--speed` for a diagnostic override, `--seed` to choose the seed range, `--parallel` to cap isolated systems and `--output` to choose the recording directory. Seeds reproduce fault choices, not goroutine scheduling. Eventually is evaluated at the final frame, not latched from an earlier good state. Recovery metrics use Lost/Unhealthy → Ready events; unrecovered VMs are counted separately as `recovery_failures`, not zero-latency samples. Any source event-sequence gap fails the recording.
 
-Each recorded run contains the following files. `vmctl verify` writes `runs/<id>/` by default; `make verify` keeps each full batch under `runs/verify-*/` and bundles one passing run per catalog scenario from the latest successful batch into `runs/latest/`. The catalog now has 15 names, including the wipe/late-host regression. The bundle thins quiet frames by simulated time (2 s), retaining both endpoints and every frame within ±2 simulated seconds of a chaos/violation marker. Events in dropped frames' `recent` lists are carried into the next retained frame for playback. Reports, metrics and event logs are unchanged. Incomplete catalogs and bundles above 100 MB fail. Failed verification never promotes new image evidence; an existing `runs/latest` remains historical evidence, not proof of the failed revision. `vmctl bundle --input runs/verify-...` regenerates a complete green bundle without rerunning the suite.
+Each recorded run contains the following files. `vmctl verify` writes `runs/<id>/` by default; `make verify` keeps each full batch under `runs/verify-*/` and bundles one passing run per catalog scenario from the latest successful batch into `runs/latest/`. The catalog now has 16 names, including the wipe/late-host regression and `natural-churn`; a full gate is 320 runs. The existing 15 scenarios retain their timelines, checks and seed ranges, with lifetimes off. The bundle thins quiet frames by simulated time (2 s), retaining both endpoints and every frame within ±2 simulated seconds of a chaos/violation marker. Events in dropped frames' `recent` lists are carried into the next retained frame for playback. Reports, metrics and event logs are unchanged. Incomplete catalogs and bundles above 100 MB fail. Failed verification never promotes new image evidence; an existing `runs/latest` remains historical evidence, not proof of the failed revision. `vmctl bundle --input runs/verify-...` regenerates a complete green bundle without rerunning the suite.
 
 | File | Contents |
 | --- | --- |
@@ -60,6 +62,8 @@ Each component is an actor with one state-owning goroutine. Slow driver work run
 ## Lifecycle and identity
 
 The normal path is Pending → Booting → Ready. Guest failures go through Unhealthy; host loss goes through Lost. Deletion goes through Terminating → Terminated. Bounded retries can end in Failed. The authoritative transition table is [internal/vm/legal.go](internal/vm/legal.go), including queued deletion, shedding and quarantine edges.
+
+Natural completion and idle reclamation are the simulated tenant calling the same public DeleteVM, not the scheduler inventing a new state or the guest declaring itself done. A lifetime starts at first Ready; an overdue ending waits through recovery until Ready again. The engine records `completed` or `idle` only after a successful delete, and ordinary generation-exact stopping releases the slot. Busy/Idle are workload phases, not scheduler states; there is no retained, restartable Stopped VM. Scheduler restarts and store-wipe adoption retain timers for the same VM ID; losing a VM's row is not hidden as a natural ending.
 
 Three IDs have different jobs:
 
@@ -112,6 +116,8 @@ An accepted create still Booting when its rack dies is re-queued as ordinary dem
 
 Bad-day gates recovery of previously Ready VMs; never-Ready losses remain visible separately as `never_ready_lost`, while `recovery_failures` counts unresolved losses of previously Ready VMs. Scripted client requests retry 503/429 responses with Retry-After for at most AmbientHealAfter + BootDeadline; exhaustion fails the recording with “scripted action could not reach scheduler” while retaining final metrics. Post-restart admission deadlines start at the successful durable deletion, not its scheduled attempt.
 
+The opt-in `natural-churn` scenario runs for 90 simulated seconds at 0.5 VMs/s, with 5–10 s busy lifetimes, 5 s idle timeout and equal completion/idle probabilities. Low guest/host chaos runs from 10–55 s; load stops at 55 s and pending heals/lifetimes continue through the recovery tail. It requires at least three endings of each kind, exactly one marker per successful ending, final Terminated (never Failed), fresh Ready admissions after endings, no shedding/429, and all nine invariants. Delete transitions must start Ready, except for the approved snapshot race: Ready → Unhealthy at most one engine tick before Terminating, never Lost. `workload_delete_race` reports those IDs' count; the unrecovered-ID set must equal that exact race-deleted set and `recovery_failures` must equal its size. No recovery sample is fabricated or loss metric reduced to excuse deletion.
+
 ## Simulated versus real
 
 Railway runs a Linux container, **not macOS VMs**. The fake hypervisor models boots, crashes, leases and failure injection on Go goroutines. Real macOS boots take roughly 30–60 seconds, not the shortened simulation timings. Tart / Virtualization.framework integration requires Apple hardware and real guest readiness plumbing. Apple's macOS licence generally permits up to two additional virtual instances on qualifying Apple hardware; check the applicable licence before deployment.
@@ -163,4 +169,4 @@ The upload command starts a deployment; it is not a health verdict. After the de
 
 ## What's next
 
-Warm pools; scheduler HA through leader election and epoch fencing; mTLS and OIDC; real vsock; image caching and locality-aware placement; quotas per pool; a deterministic simulator. Snapshot/resume is a stretch goal only after the correctness gates pass.
+Warm pools; scheduler HA through leader election and epoch fencing; mTLS and OIDC; real vsock; image caching and locality-aware placement; quotas per pool; a deterministic simulator. A server-enforced maximum VM lifetime is deferred: today's optional workload lifetimes model tenant behaviour, not an enforceable cap on arbitrary API clients or runaway tenants. Snapshot/resume is a stretch goal only after the correctness gates pass.

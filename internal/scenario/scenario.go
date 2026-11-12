@@ -58,6 +58,9 @@ type Scenario struct {
 	Expect   []Check
 	// NewRun isolates state shared by a scenario's actions and assertions.
 	NewRun func() Scenario
+	// Report adds scenario-specific event evidence after final events and
+	// standard recovery metrics have been recorded. Nil leaves them unchanged.
+	Report func(*api.RunReport)
 }
 
 func Always(name string, p Predicate) Check { return Check{Name: name, Test: p} }
