@@ -32,12 +32,13 @@ type delivery struct {
 	msg any
 }
 type host struct {
-	record    store.HostRecord
-	lease     api.LeaseState
-	last      int64
-	seq       uint64
-	disk      bool
-	inventory []api.InventoryItem
+	record     store.HostRecord
+	lease      api.LeaseState
+	last       int64
+	seq        uint64
+	disk       bool
+	drainUntil int64
+	inventory  []api.InventoryItem
 }
 type reservation struct {
 	host       string
@@ -55,6 +56,7 @@ type state struct {
 	fresh        bool
 	recoverUntil int64
 	down         bool
+	storeDelay   time.Duration
 	epoch        int64
 	counters     api.Counters
 	metrics      metrics
@@ -122,6 +124,11 @@ func newState(d store.Data, epoch int64, now time.Time, cfg config.Config) *stat
 		// These leases are already Suspect: only the fresh lost-grace period
 		// remains, not another healthy TTL followed by that grace period.
 		s.hosts[id] = host{record: h, lease: api.LeaseSuspect, last: now.Add(-cfg.HostLeaseTTL).UnixMilli()}
+		if h.Admin == api.AdminDraining {
+			host := s.hosts[id]
+			host.drainUntil = now.Add(cfg.DrainGrace).UnixMilli()
+			s.hosts[id] = host
+		}
 	}
 	return s
 }
@@ -172,7 +179,17 @@ func (s *Scheduler) run(ctx context.Context) {
 			if !reflect.DeepEqual(s.state.data, e.next.data) || len(e.events) > 0 {
 				completed := make(chan error, 1)
 				before, after, events := s.state.data, e.next.data, e.events
+				delay := s.state.storeDelay
 				actor.Work(ctx, completed, func(ctx context.Context) error {
+					if delay > 0 {
+						timer := s.clock.NewTimer(delay)
+						defer timer.Stop()
+						select {
+						case <-ctx.Done():
+							return ctx.Err()
+						case <-timer.C():
+						}
+					}
 					return s.store.Commit(ctx, before, after, events, s.cfg.EventRetention)
 				})
 				select {
@@ -295,6 +312,11 @@ func (s *Scheduler) Metrics(ctx context.Context) (string, error) {
 func (s *Scheduler) SetDown(ctx context.Context, down bool) error {
 	_, e := s.call(ctx, request{op: "down", arg: down})
 	return e
+}
+
+func (s *Scheduler) SetStoreDelay(ctx context.Context, d time.Duration) error {
+	_, err := s.call(ctx, request{op: "store-delay", arg: d})
+	return err
 }
 func (s *Scheduler) SetHostAdmin(ctx context.Context, id string, a api.AdminState) error {
 	_, e := s.call(ctx, request{op: "admin", id: id, arg: a})

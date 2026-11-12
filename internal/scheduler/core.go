@@ -28,7 +28,7 @@ func (s *Scheduler) handle(now time.Time, msg any) []Effect {
 	switch m := msg.(type) {
 	case request:
 		e.reply = m.reply
-		if p.down && m.op != "down" && m.op != "snapshot" && m.op != "metrics" && m.op != "events" {
+		if p.down && m.op != "down" && m.op != "store-delay" && m.op != "snapshot" && m.op != "metrics" && m.op != "events" {
 			e.response.err = &api.Error{Status: 503, Msg: "scheduler down", RetryAfterS: s.retryAfter()}
 			break
 		}
@@ -180,6 +180,12 @@ func (p *planner) request(r request) result {
 			}
 			p.log(api.EventReconcile, "", "", "scheduler resumed; hosts suspect")
 		}
+	case "store-delay":
+		d := r.arg.(time.Duration)
+		if d < 0 {
+			return failure(422, "store delay must not be negative")
+		}
+		p.storeDelay = d
 	case "admin":
 		h, ok := p.hosts[r.id]
 		if !ok {
@@ -189,10 +195,16 @@ func (p *planner) request(r request) result {
 		if a != api.AdminActive && a != api.AdminCordoned && a != api.AdminDraining && a != api.AdminRemoved {
 			return failure(422, "invalid admin state")
 		}
+		if a != h.record.Admin {
+			h.drainUntil = 0
+			if a == api.AdminDraining {
+				h.drainUntil = p.now.Add(p.cfg.DrainGrace).UnixMilli()
+			}
+		}
 		h.record.Admin = a
 		p.hosts[r.id] = h
 		p.data.Hosts[r.id] = h.record
-		if a == api.AdminDraining || a == api.AdminRemoved {
+		if a == api.AdminRemoved {
 			p.lose(r.id, api.ReasonDrained)
 		}
 	}
@@ -497,10 +509,19 @@ func (p *planner) lose(hostID, reason string) {
 		}
 		delete(p.reservations, id)
 		if v.Desired == api.DesiredDeleted || v.State == api.VMTerminating {
+			if reason == api.ReasonDrained {
+				continue
+			}
 			p.move(id, api.VMTerminated, reason)
 			continue
 		}
-		replacement := v.State == api.VMReady
+		replacement := v.State == api.VMReady || reason == api.ReasonDrained
+		if reason == api.ReasonDrained {
+			p.stop(hostID, id, v.Generation, reason)
+			h := p.hosts[hostID]
+			h.inventory = append(h.inventory, api.InventoryItem{VMID: id, Generation: v.Generation, State: api.VMTerminating})
+			p.hosts[hostID] = h
+		}
 		p.replacement[id] = replacement
 		p.recovering[id] = p.now.UnixMilli()
 		p.move(id, api.VMLost, reason)
@@ -510,6 +531,13 @@ func (p *planner) lose(hostID, reason string) {
 }
 func (p *planner) tick() {
 	now := p.now.UnixMilli()
+	for id, h := range p.hosts {
+		if h.record.Admin == api.AdminDraining && h.drainUntil != 0 && now >= h.drainUntil {
+			h.drainUntil = 0
+			p.hosts[id] = h
+			p.lose(id, api.ReasonDrained)
+		}
+	}
 	for id, h := range p.hosts {
 		age := now - h.last
 		switch {
