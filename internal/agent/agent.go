@@ -15,17 +15,18 @@ import (
 )
 
 type instance struct {
-	start    api.StartVM
-	slot     api.SlotState
-	state    api.VMState
-	last     time.Time
-	window   time.Time
-	count    int
-	blocked  []time.Time
-	cancel   context.CancelFunc
-	bootDone chan struct{}
-	pending  *api.StartVM
-	reason   string
+	start     api.StartVM
+	slot      api.SlotState
+	state     api.VMState
+	last      time.Time
+	window    time.Time
+	count     int
+	blocked   []time.Time
+	cancel    context.CancelFunc
+	bootDone  chan struct{}
+	recovered bool
+	pending   *api.StartVM
+	reason    string
 }
 type Effect struct {
 	To      api.Addr
@@ -34,12 +35,19 @@ type Effect struct {
 	Work    func(context.Context) any
 }
 type completion struct {
-	id   string
-	gen  int64
-	stop bool
-	err  error
+	revision uint64
+	id       string
+	gen      int64
+	stop     bool
+	err      error
 }
 type tick struct{}
+type recovered struct {
+	revision uint64
+	vms      []api.DriverVM
+	params   map[string]api.StartVM
+	err      error
+}
 type query struct{ reply chan<- Snapshot }
 type control struct {
 	paused, cordoned *bool
@@ -74,6 +82,7 @@ type Agent struct {
 	down             bool
 	skew             time.Duration
 	security         api.SecurityStatus
+	revision         uint64
 }
 
 // New constructs the actor; call Run exactly once. Endpoint identity must be
@@ -194,7 +203,7 @@ func (a *Agent) execute(effects []Effect) {
 		if e.Work != nil {
 			a.workers.Add(1)
 			actor.Work(a.ctx, a.inbox, func(ctx context.Context) any { defer a.workers.Done(); return e.Work(ctx) })
-		} else {
+		} else if !a.down {
 			_ = a.ep.Send(e.To, e.Port, e.Message)
 		}
 	}
@@ -233,10 +242,11 @@ func (a *Agent) start(now time.Time, m api.StartVM) []Effect {
 	a.vms[m.VMID] = v
 	a.highest[m.VMID] = m.Generation
 	p := api.BootParams{VMID: m.VMID, Generation: m.Generation, Token: m.Token, Host: a.ep.Addr().ID, Rack: a.ep.Addr().Rack}
+	revision := a.revision
 	return []Effect{a.result(m, true, ""), {Work: func(context.Context) any {
 		defer close(v.bootDone)
 		err := a.driver.Start(bootCtx, m.Spec, p)
-		return completion{id: m.VMID, gen: m.Generation, err: err}
+		return completion{revision: revision, id: m.VMID, gen: m.Generation, err: err}
 	}}}
 }
 func (a *Agent) release(v *instance, reason string) []Effect {
@@ -248,10 +258,11 @@ func (a *Agent) release(v *instance, reason string) []Effect {
 	v.state = api.VMTerminating
 	v.reason = reason
 	id, gen, done := v.start.VMID, v.start.Generation, v.bootDone
+	revision := a.revision
 	return []Effect{{Work: func(ctx context.Context) any {
 		<-done
 		err := a.driver.Stop(ctx, id, gen)
-		return completion{id: id, gen: gen, stop: true, err: err}
+		return completion{revision: revision, id: id, gen: gen, stop: true, err: err}
 	}}}
 }
 func (a *Agent) unhealthy(v *instance, reason string) []Effect {
@@ -276,9 +287,23 @@ func (a *Agent) blocked(now time.Time, v *instance, attack string) []Effect {
 	}
 	return out
 }
-func (a *Agent) handle(now time.Time, msg any) []Effect {
+func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 	switch m := msg.(type) {
 	case api.Envelope:
+		if _, ok := m.Msg.(api.GuestRegister); ok && m.From.Kind == api.KindGuest && m.Port == api.PortVsock && !a.down {
+			defer func() {
+				reason := "unknown_or_releasing_guest"
+				for _, e := range effects {
+					if _, ok := e.Message.(api.GuestRegisterResult); ok {
+						return
+					}
+					if r, ok := e.Message.(api.SecurityReport); ok {
+						reason = r.Attack
+					}
+				}
+				effects = append(effects, Effect{To: m.From, Port: api.PortVsock, Message: api.GuestRegisterResult{Accepted: false, Reason: reason}})
+			}()
+		}
 		if a.down {
 			return nil
 		}
@@ -347,6 +372,9 @@ func (a *Agent) handle(now time.Time, msg any) []Effect {
 			if g.Generation != v.start.Generation || subtle.ConstantTimeCompare([]byte(g.Token), []byte(v.start.Token)) != 1 {
 				return a.blocked(now, v, api.AttackReplay)
 			}
+			if v.state == api.VMUnhealthy {
+				return nil
+			}
 			v.state = api.VMReady
 			v.slot = api.SlotOccupied
 			v.last = now
@@ -361,10 +389,19 @@ func (a *Agent) handle(now time.Time, msg any) []Effect {
 			if v.state == api.VMReady {
 				v.last = now
 			}
+			if v.recovered {
+				v.recovered = false
+				v.state = api.VMReady
+				v.last = now
+				return []Effect{a.report(api.ReadyReport{HostID: a.ep.Addr().ID, VMID: m.From.ID, Generation: v.start.Generation})}
+			}
 		default:
 			return a.blocked(now, v, api.AttackControl)
 		}
 	case completion:
+		if m.revision != a.revision {
+			return nil
+		}
 		v := a.vms[m.id]
 		if v == nil || v.start.Generation != m.gen {
 			return nil
@@ -405,8 +442,8 @@ func (a *Agent) handle(now time.Time, msg any) []Effect {
 			a.skew = *m.skew
 		}
 		if m.down != nil {
-			a.down = *m.down
-			if a.down {
+			if *m.down {
+				a.down = true
 				var out []Effect
 				for _, v := range a.vms {
 					v.pending = nil
@@ -414,7 +451,31 @@ func (a *Agent) handle(now time.Time, msg any) []Effect {
 				}
 				return out
 			}
-			return []Effect{a.report(api.RegisterHost{HostID: a.ep.Addr().ID, Rack: a.ep.Addr().Rack, Slots: min(2, a.cfg.SlotsPerHost), DiskFull: a.diskFull(), Inventory: a.inventory()})}
+			// Lose actor memory, but never cancel an incarnation on process
+			// restart. The driver, not scheduler memory, supplies recovery data.
+			a.down = true
+			a.revision++
+			revision := a.revision
+			clear(a.vms)
+			clear(a.highest)
+			a.epoch = 0
+			a.seq = 0
+			a.paused = false
+			a.cordoned = false
+			return []Effect{{Work: func(ctx context.Context) any {
+				vms, err := a.driver.List(ctx)
+				params := make(map[string]api.StartVM)
+				if source, ok := a.driver.(interface {
+					BootInfo(string, int64) (api.BootParams, api.VMSpec, bool)
+				}); ok {
+					for _, v := range vms {
+						if p, s, ok := source.BootInfo(v.VMID, v.Generation); ok {
+							params[v.VMID] = api.StartVM{VMID: p.VMID, Generation: p.Generation, Token: p.Token, Spec: s}
+						}
+					}
+				}
+				return recovered{revision: revision, vms: vms, params: params, err: err}
+			}}}
 		}
 		if m.paused != nil {
 			a.paused = *m.paused
@@ -425,6 +486,22 @@ func (a *Agent) handle(now time.Time, msg any) []Effect {
 		if v := a.vms[m.vm]; v != nil && m.attack != "" && v.slot != api.SlotReleasing {
 			return a.blocked(now, v, m.attack)
 		}
+	case recovered:
+		if m.revision != a.revision || m.err != nil {
+			return nil
+		}
+		for _, actual := range m.vms {
+			cmd, ok := m.params[actual.VMID]
+			if !ok {
+				cmd = api.StartVM{VMID: actual.VMID, Generation: actual.Generation}
+			}
+			done := make(chan struct{})
+			close(done)
+			a.vms[actual.VMID] = &instance{start: cmd, slot: api.SlotOccupied, state: api.VMBooting, last: now, cancel: func() {}, bootDone: done, recovered: actual.Running}
+			a.highest[actual.VMID] = actual.Generation
+		}
+		a.down = false
+		return []Effect{a.report(api.RegisterHost{HostID: a.ep.Addr().ID, Rack: a.ep.Addr().Rack, Slots: min(2, a.cfg.SlotsPerHost), DiskFull: a.diskFull(), Inventory: a.inventory()})}
 	case query:
 		h := api.Host{ID: a.ep.Addr().ID, Rack: a.ep.Addr().Rack, SlotCount: min(2, a.cfg.SlotsPerHost), AdminState: api.AdminActive, Lease: api.LeaseHealthy}
 		if a.cordoned {
