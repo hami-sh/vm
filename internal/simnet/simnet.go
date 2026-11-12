@@ -218,6 +218,14 @@ func (n *Network) run() {
 		if !next.IsZero() {
 			timer = n.clock.NewTimer(max(0, next.Sub(n.clock.Now())))
 			tick = timer.C()
+			// Time may advance between computing the delay and arming the
+			// timer. Recheck the absolute deadline so due packets cannot wait
+			// for another clock advance (or unrelated Send) to wake us.
+			if !next.After(n.clock.Now()) {
+				timer.Stop()
+				n.mu.Unlock()
+				continue
+			}
 		}
 		n.mu.Unlock()
 		select {

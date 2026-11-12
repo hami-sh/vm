@@ -406,6 +406,60 @@ func TestInventoryRoundTripsSchedulerIdentity(t *testing.T) {
 	h.until(func(s agent.Snapshot) bool { return ready(s, "a", 1) })
 }
 
+func TestReregisterAfterDroppedRegistration(t *testing.T) {
+	h := newHarness(t)
+	// The stub scheduler drops the initial registration without acknowledging it.
+	h.until(func(agent.Snapshot) bool {
+		for _, m := range h.messages {
+			if _, ok := m.(api.RegisterHost); ok {
+				return true
+			}
+		}
+		return false
+	})
+	cmd := start("a", 4)
+	cmd.Epoch = 17
+	cmd.IdempotencyKey = "original-key"
+	cmd.RequestHash = "original-hash"
+	h.send(cmd)
+	h.until(func(s agent.Snapshot) bool { return ready(s, "a", 4) })
+	h.d.FillDisk(true)
+	before := len(h.messages)
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 18, Reregister: true})
+	count := func() int {
+		n := 0
+		for _, m := range h.messages[before:] {
+			if r, ok := m.(api.RegisterHost); ok {
+				n++
+				if r.HostID != "h1" || r.Rack != "r1" || r.Slots != 2 || r.Epoch != 18 || !r.DiskFull || len(r.Inventory) != 1 {
+					t.Fatalf("incomplete recovery registration: %+v", r)
+				}
+				want := api.InventoryItem{VMID: "a", Generation: 4, State: api.VMReady, Pool: cmd.Spec.Pool, IdempotencyKey: cmd.IdempotencyKey, RequestHash: cmd.RequestHash}
+				if r.Inventory[0] != want {
+					t.Fatalf("recovery inventory: got %+v, want %+v", r.Inventory[0], want)
+				}
+			}
+		}
+		return n
+	}
+	h.until(func(agent.Snapshot) bool { return count() >= 1 })
+	// A lower epoch or a different host's ack cannot stop retries.
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 17})
+	h.send(api.HeartbeatAck{HostID: "other", Epoch: 19})
+	n := count()
+	h.until(func(agent.Snapshot) bool { return count() > n })
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 19})
+	h.until(func(s agent.Snapshot) bool { return s.Epoch == 19 })
+	n = count()
+	for range 3 {
+		h.step(h.cfg.HostHeartbeat)
+		h.snapshot()
+	}
+	if count() != n {
+		t.Fatal("normal acknowledgment did not stop re-registration")
+	}
+}
+
 func TestCompromiseUsesRealEndpointAndStops(t *testing.T) {
 	for _, cause := range []string{"stop", "crash", "quarantine"} {
 		t.Run(cause, func(t *testing.T) {
