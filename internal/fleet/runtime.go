@@ -358,7 +358,7 @@ func (r *runtime) Apply(ctx context.Context, action string, req api.ChaosRequest
 	_, err := r.call(ctx, func(ctx context.Context) (any, error) { return nil, r.apply(ctx, action, req) })
 	return err
 }
-func (r *runtime) apply(ctx context.Context, a string, q api.ChaosRequest) error {
+func (r *runtime) apply(ctx context.Context, a string, q api.ChaosRequest) (err error) {
 	param := func(k string, def float64) float64 {
 		if v, ok := q.Params[k]; ok {
 			return v
@@ -448,9 +448,33 @@ func (r *runtime) apply(ctx context.Context, a string, q api.ChaosRequest) error
 	if h == nil {
 		return &api.Error{Status: 404, Msg: "host or placed VM not found"}
 	}
-	if !slices.Contains(h.faults, a) {
-		h.faults = append(h.faults, a)
+	// Only persistent host conditions belong in Faults, never VM actions or
+	// the recovery commands themselves. Failed actions don't change badges.
+	fault, on := "", false
+	switch a {
+	case "kill-host", "pause-heartbeats", "cordon":
+		fault, on = a, true
+	case "resume-heartbeats":
+		fault = "pause-heartbeats"
+	case "uncordon":
+		fault = "cordon"
+	case "clock-skew":
+		fault, on = a, param("ms", 30000) != 0
+	case "fill-disk", "one-way-partition":
+		fault, on = a, param("on", 1) != 0
+	case "slow-boot":
+		fault, on = a, param("factor", 3) != 1
 	}
+	defer func() {
+		if err != nil || fault == "" {
+			return
+		}
+		if !on {
+			h.faults = slices.DeleteFunc(h.faults, func(x string) bool { return x == fault })
+		} else if !slices.Contains(h.faults, fault) {
+			h.faults = append(h.faults, fault)
+		}
+	}()
 	switch a {
 	case "kill-host":
 		return h.agent.Kill(ctx)
@@ -464,7 +488,6 @@ func (r *runtime) apply(ctx context.Context, a string, q api.ChaosRequest) error
 	case "pause-heartbeats":
 		return h.agent.PauseHeartbeats(ctx, true)
 	case "resume-heartbeats":
-		h.faults = slices.DeleteFunc(h.faults, func(x string) bool { return x == "pause-heartbeats" || x == "resume-heartbeats" })
 		return h.agent.PauseHeartbeats(ctx, false)
 	case "clock-skew":
 		ms := param("ms", 30000)
@@ -475,9 +498,6 @@ func (r *runtime) apply(ctx context.Context, a string, q api.ChaosRequest) error
 	case "fill-disk":
 		on := param("on", 1) != 0
 		h.driver.FillDisk(on)
-		if !on {
-			h.faults = slices.DeleteFunc(h.faults, func(x string) bool { return x == "fill-disk" })
-		}
 	case "cordon", "uncordon":
 		h.admin = api.AdminCordoned
 		if a == "uncordon" {
@@ -488,7 +508,11 @@ func (r *runtime) apply(ctx context.Context, a string, q api.ChaosRequest) error
 		}
 		return r.scheduler.SetHostAdmin(ctx, h.addr.ID, h.admin)
 	case "one-way-partition":
-		if param("reverse", 0) != 0 {
+		if param("on", 1) == 0 {
+			// Off heals either direction, including both injected together.
+			r.net.PartitionOneWay(h.addr, schedulerAddr, false)
+			r.net.PartitionOneWay(schedulerAddr, h.addr, false)
+		} else if param("reverse", 0) != 0 {
 			r.net.PartitionOneWay(schedulerAddr, h.addr, true)
 		} else {
 			r.net.PartitionOneWay(h.addr, schedulerAddr, true)

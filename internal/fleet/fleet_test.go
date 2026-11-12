@@ -120,6 +120,62 @@ func TestDiskHealRestoresPublishedCapacity(t *testing.T) {
 	}
 }
 
+func TestPublishedHostFaultsAreActiveConditions(t *testing.T) {
+	c := clock.NewScaled(time.Unix(0, 0), 1)
+	c.Pause()
+	f, err := New(t.Context(), Options{Clock: c, Racks: 1, HostsPerRack: 1, SchedulerFactory: newStandIn})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	for _, tc := range []struct {
+		fault, heal string
+		params      map[string]float64
+	}{
+		{"kill-host", "restart-host", nil},
+		{"cordon", "uncordon", nil},
+		{"pause-heartbeats", "resume-heartbeats", nil},
+		{"fill-disk", "fill-disk", map[string]float64{"on": 0}},
+		{"clock-skew", "clock-skew", map[string]float64{"ms": 0}},
+		{"slow-boot", "slow-boot", map[string]float64{"factor": 1}},
+		{"one-way-partition", "one-way-partition", map[string]float64{"on": 0}},
+		{"one-way-partition", "restart-host", nil},
+	} {
+		t.Run(tc.fault+"/"+tc.heal, func(t *testing.T) {
+			for i, action := range []string{tc.fault, tc.fault, tc.heal, tc.heal} {
+				var params map[string]float64
+				want := []string{tc.fault}
+				if i >= 2 {
+					params, want = tc.params, nil
+				}
+				if err := f.runtime.Apply(t.Context(), action, api.ChaosRequest{Target: "r1-h1", Params: params}); err != nil {
+					t.Fatal(err)
+				}
+				s, err := f.runtime.Snapshot(t.Context())
+				if err != nil || len(s.Hosts) != 1 || !slices.Equal(s.Hosts[0].Faults, want) {
+					t.Fatalf("%s: hosts=%+v err=%v want=%v", action, s.Hosts, err, want)
+				}
+			}
+		})
+	}
+	for _, action := range []string{"kill-guestd", "crash-vm", "hang-next-boot"} {
+		if err := f.runtime.Apply(t.Context(), action, api.ChaosRequest{Target: "r1-h1"}); err != nil {
+			t.Fatal(err)
+		}
+		s, err := f.runtime.Snapshot(t.Context())
+		if err != nil || len(s.Hosts[0].Faults) != 0 {
+			t.Fatal("VM action became a host fault", action, s.Hosts, err)
+		}
+	}
+	if err := f.runtime.Apply(t.Context(), "slow-boot", api.ChaosRequest{Target: "r1-h1", Params: map[string]float64{"factor": 0}}); err == nil {
+		t.Fatal("invalid fault accepted")
+	}
+	s, err := f.runtime.Snapshot(t.Context())
+	if err != nil || len(s.Hosts[0].Faults) != 0 {
+		t.Fatal("failed action became a host fault", s.Hosts, err)
+	}
+}
+
 type drainScheduler struct {
 	standIn
 	mu    sync.Mutex
