@@ -16,6 +16,17 @@ type System interface {
 	api.SnapshotSource
 }
 
+// FromFleet combines the separate surfaces exported by fleet.Fleet as
+// f.Control, f.Chaos and f. It deliberately depends only on frozen contracts,
+// so the runner can compile before the assembled fleet lands on main.
+func FromFleet(control api.ControlPlane, chaos api.ChaosEngine, source api.SnapshotSource) System {
+	return struct {
+		api.ControlPlane
+		api.ChaosEngine
+		api.SnapshotSource
+	}{control, chaos, source}
+}
+
 type Topology struct{ Racks, Hosts, Slots int }
 type Load struct {
 	Count    int

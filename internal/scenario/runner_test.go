@@ -52,7 +52,8 @@ func TestRunnerRecordsFirstViolationAndPostFaultRecovery(t *testing.T) {
 			}
 			s := Scenario{Name: "fault", Topology: Topology{1, 1, 2}, Duration: 4 * time.Second, Timeline: []Step{{2 * time.Second, func(context.Context, System) error { return nil }}}, Expect: []Check{Always("safe", NoInvariantViolations), Eventually(4*time.Second, "recovered", AllDesiredVMsReady), Metric("p99_recover_ms", 2500)}}
 			factory := func(context.Context, Scenario, int64, float64) (System, func(), error) {
-				return &fakeFleet{initial: snapshot(0, api.VMReady), frames: frames}, func() {}, nil
+				f := &fakeFleet{initial: snapshot(0, api.VMReady), frames: frames}
+				return FromFleet(f, f, f), func() {}, nil
 			}
 			dir := t.TempDir()
 			r, err := Run(context.Background(), s, factory, 17, 50, dir)
