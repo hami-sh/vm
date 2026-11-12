@@ -140,6 +140,129 @@ func TestBadDayReportsNeverReadyLossWithoutHidingReadyLoss(t *testing.T) {
 	}
 }
 
+func TestNaturalChurnChecksRecordedEndingsAndRecovery(t *testing.T) {
+	for _, fault := range []string{"", "race boundary", "race too old", "Lost delete", "duplicate marker", "missing delete", "missing marker", "not Terminated", "Failed then Terminated", "no reuse", "too few idle", "shed", "429", "unrelated loss", "equal counts wrong IDs", "real recovery"} {
+		t.Run(fault, func(t *testing.T) {
+			run := naturalChurn().NewRun()
+			run.Topology, run.Timeline = Topology{1, 1, 2}, nil
+			initial, final := snapshot(0, api.VMReady), snapshot(90000, api.VMReady)
+			initial.VMs, final.VMs = nil, nil
+			var events []api.Event
+			transition := func(id string, at int64, from, to api.VMState) {
+				events = append(events, api.Event{Kind: api.EventTransition, VMID: id, At: at, From: from, To: to})
+			}
+			for i := range 6 {
+				id := fmt.Sprintf("ended-%d", i)
+				transition(id, 1000, api.VMPending, api.VMBooting)
+				transition(id, 2000, api.VMBooting, api.VMReady)
+			}
+			admit := func(at int64) {
+				for i := range 3 {
+					id := fmt.Sprintf("reused-%d", i)
+					transition(id, at, api.VMPending, api.VMBooting)
+					transition(id, at+1000, api.VMBooting, api.VMReady)
+					final.VMs = append(final.VMs, api.VM{ID: id, Desired: api.DesiredRunning, State: api.VMReady})
+				}
+			}
+			if fault == "no reuse" {
+				admit(3000)
+			}
+			for i := range 6 {
+				id, reason := fmt.Sprintf("ended-%d", i), "completed"
+				if i >= 3 && !(fault == "too few idle" && i == 5) {
+					reason = "idle"
+				}
+				marker := api.Event{Kind: api.EventWorkload, VMID: id, At: 11000, Detail: reason}
+				if i%2 == 0 { // Successful publishers may arrive in either order.
+					events = append(events, marker)
+				}
+				from := api.VMReady
+				if i == 0 {
+					switch fault {
+					case "race boundary", "race too old", "equal counts wrong IDs":
+						at := int64(10900) // Exactly one engine tick must pass.
+						if fault == "race too old" {
+							at--
+						}
+						transition(id, at, api.VMReady, api.VMUnhealthy)
+						from = api.VMUnhealthy
+					case "Lost delete":
+						transition(id, 10999, api.VMReady, api.VMLost)
+						from = api.VMLost
+					case "Failed then Terminated":
+						transition(id, 10999, api.VMReady, api.VMFailed)
+					case "real recovery":
+						transition(id, 8000, api.VMReady, api.VMLost)
+						transition(id, 10000, api.VMLost, api.VMReady)
+					}
+				}
+				if fault != "missing delete" || i != 0 {
+					transition(id, 11000, from, api.VMTerminating)
+				}
+				transition(id, 12000, api.VMTerminating, api.VMTerminated)
+				if i%2 != 0 {
+					events = append(events, marker)
+				}
+				if fault == "duplicate marker" && i == 0 {
+					events = append(events, marker)
+				}
+				state := api.VMTerminated
+				if fault == "not Terminated" && i == 0 {
+					state = api.VMTerminating
+				}
+				final.VMs = append(final.VMs, api.VM{ID: id, Desired: api.DesiredDeleted, State: state})
+			}
+			if fault != "no reuse" {
+				admit(20000)
+			}
+			if fault == "missing marker" {
+				transition("unmarked", 32000, api.VMReady, api.VMTerminating)
+				transition("unmarked", 33000, api.VMTerminating, api.VMTerminated)
+				final.VMs = append(final.VMs, api.VM{ID: "unmarked", Desired: api.DesiredDeleted, State: api.VMTerminated})
+			}
+			if fault == "unrelated loss" || fault == "equal counts wrong IDs" {
+				transition("reused-0", 30000, api.VMReady, api.VMLost)
+			}
+			if fault == "equal counts wrong IDs" {
+				// Both numeric counts are one, but the unrecovered ID is not
+				// the tolerated delete's ID: a count-only gate would pass.
+				transition("ended-0", 31000, api.VMTerminated, api.VMReady)
+			}
+			middle := snapshot(40000, api.VMReady)
+			middle.VMs = nil
+			if fault == "shed" {
+				middle.Counters.Shed = 1
+			}
+			if fault == "429" {
+				middle.Counters.Rejected429 = 1
+			}
+			f := &fakeFleet{initial: initial, frames: []api.Snapshot{middle, final}, events: events}
+			r, err := Run(context.Background(), run, func(context.Context, Scenario, int64, float64) (System, func(), error) { return f, func() {}, nil }, 1, 5, t.TempDir())
+			wantPass := fault == "" || fault == "race boundary" || fault == "real recovery"
+			if err != nil || r.Passed != wantPass {
+				t.Fatalf("fault=%s report=%+v err=%v", fault, r, err)
+			}
+			if fault == "equal counts wrong IDs" {
+				found := false
+				for _, check := range r.Checks {
+					if check.Name == "unrecovered IDs exactly match tolerated workload-delete races" {
+						found = !check.Passed
+					}
+				}
+				if !found || r.Metrics["recovery_failures"] != 1 || r.Metrics["workload_delete_race"] != 1 {
+					t.Fatalf("equal-count mismatched IDs were not rejected: %+v", r)
+				}
+			}
+			if fault == "race boundary" && (r.Metrics["workload_delete_race"] != 1 || r.Metrics["recovery_failures"] != 1 || r.Metrics["recovery_samples"] != 0) {
+				t.Fatalf("race fabricated recovery: %+v", r.Metrics)
+			}
+			if fault == "real recovery" && (r.Metrics["recovery_failures"] != 0 || r.Metrics["recovery_samples"] != 1 || r.Metrics["p99_recover_ms"] != 2000) {
+				t.Fatalf("recovery evidence lost: %+v", r.Metrics)
+			}
+		})
+	}
+}
+
 func TestBadDayPostRestartAdmission(t *testing.T) {
 	for _, fault := range []string{"", "healed scheduler outage", "excluded chaos only", "no post-restart placement", "late placement", "lower class", "wrong host", "no final Ready", "unrelated loss"} {
 		t.Run(fault, func(t *testing.T) {
@@ -532,7 +655,12 @@ func TestHostileTenantEvidenceBasedQuarantine(t *testing.T) {
 func TestWipeLateHostRetryIdentityContract(t *testing.T) {
 	for _, fault := range []string{"", "late adopted", "key moves after heal", "reachable identity lost", "missing Ready"} {
 		t.Run(fault, func(t *testing.T) {
-			s := Catalog()[len(Catalog())-1]
+			var s Scenario
+			for _, candidate := range Catalog() {
+				if candidate.Name == "wipe-late-host" {
+					s = candidate
+				}
+			}
 			newRun := s.NewRun
 			s.NewRun = func() Scenario {
 				run := newRun()
