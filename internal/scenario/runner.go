@@ -340,7 +340,7 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 			elapsed := time.Duration(snap.At-origin) * time.Millisecond
 			for next < len(steps) && elapsed >= steps[next].At {
 				step := steps[next]
-				if e := step.Do(ctx, scripts); e != nil && !errors.Is(e, errScriptedUnavailable) {
+				if e := step.Do(scriptContext(ctx, speed), scripts); e != nil && !errors.Is(e, errScriptedUnavailable) {
 					return report, fmt.Errorf("at %s: %w", step.At, e)
 				}
 				marker := api.Event{Seq: snap.Seq, At: snap.At, Kind: api.EventChaos, Detail: fmt.Sprintf("scenario %s step %d", s.Name, next)}

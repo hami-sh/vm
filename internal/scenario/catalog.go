@@ -175,18 +175,18 @@ func victimRecovery(base Scenario, pick func(api.VM) bool, first, maintenance bo
 		victims := map[string]api.VM{}
 		action := run.Timeline[0].Do
 		run.Timeline[0].Do = func(ctx context.Context, f System) error {
-			for _, v := range f.Latest().VMs {
-				if v.State == api.VMReady && pick(v) {
-					victims[v.ID] = v
-					if first {
-						break
+			return selectTargets(ctx, f, func(s api.Snapshot) bool {
+				clear(victims)
+				for _, v := range s.VMs {
+					if v.State == api.VMReady && pick(v) {
+						victims[v.ID] = v
+						if first {
+							break
+						}
 					}
 				}
-			}
-			if len(victims) == 0 {
-				return fmt.Errorf("no Ready victims before %s", run.Name)
-			}
-			return action(ctx, f)
+				return len(victims) > 0
+			}, func(ctx context.Context, _ api.Snapshot) error { return action(ctx, f) })
 		}
 		run.Expect = append(append([]Check(nil), base.Expect...), Eventually(run.Duration, "every affected VM recovered at a higher generation", func(s api.Snapshot) bool {
 			recovered := 0
@@ -461,19 +461,29 @@ func hostileTenant(base Scenario) Scenario {
 			{10 * time.Second, Chaos("flood", "", map[string]float64{"count": 60})},
 			{11 * time.Second, Chaos("packet-loss", "", map[string]float64{"percent": 25})},
 			{11 * time.Second, func(ctx context.Context, f System) error {
-				for _, v := range f.Latest().VMs {
-					if v.State != api.VMReady {
-						continue
+				return selectTargets(ctx, f, func(s api.Snapshot) bool {
+					count := 0
+					for _, v := range s.VMs {
+						if v.State == api.VMReady {
+							count++
+						}
 					}
-					victims[v.ID] = v.Generation
-					if _, err := f.Do(ctx, "compromise", api.ChaosRequest{Target: v.ID}); err != nil {
-						return err
+					return count >= 3
+				}, func(ctx context.Context, s api.Snapshot) error {
+					for _, v := range s.VMs {
+						if v.State != api.VMReady {
+							continue
+						}
+						victims[v.ID] = v.Generation
+						if _, err := f.Do(ctx, "compromise", api.ChaosRequest{Target: v.ID}); err != nil {
+							return err
+						}
+						if len(victims) == 3 {
+							return nil
+						}
 					}
-					if len(victims) == 3 {
-						return nil
-					}
-				}
-				return fmt.Errorf("hostile tenant needs 3 Ready VMs, found %d", len(victims))
+					return fmt.Errorf("hostile tenant needs 3 Ready VMs, found %d", len(victims))
+				})
 			}},
 			{40 * time.Second, Chaos("packet-loss", "", map[string]float64{"percent": 0})},
 		}

@@ -13,6 +13,37 @@ import (
 
 var errScriptedUnavailable = errors.New("scripted action could not reach scheduler")
 
+type scriptDeadlineKey struct{}
+
+func scriptContext(ctx context.Context, speed float64) context.Context {
+	if ctx.Value(scriptDeadlineKey{}) != nil {
+		return ctx
+	}
+	cfg := config.Default()
+	return context.WithValue(ctx, scriptDeadlineKey{}, WallClock.Now().Add(time.Duration(float64(cfg.AmbientHealAfter+cfg.BootDeadline)/speed)))
+}
+
+// Selection and the subsequent calls share one action budget. Re-read the
+// published view while unavailable; never choose targets from a frozen outage.
+func selectTargets(ctx context.Context, f System, ready func(api.Snapshot) bool, action func(context.Context, api.Snapshot) error) error {
+	c, ok := f.(*scriptedClient)
+	if !ok {
+		c = &scriptedClient{System: f, speed: 1}
+	}
+	ctx = scriptContext(ctx, c.speed)
+	s, err := retryCall(ctx, c, config.Default().SnapshotEvery, func() (api.Snapshot, error) {
+		s := f.Latest()
+		if s.Scheduler != api.SchedulerUp || !ready(s) {
+			return s, &api.Error{Status: 503, Msg: "target selection awaits an up scheduler and eligible candidates"}
+		}
+		return s, nil
+	})
+	if err != nil {
+		return err
+	}
+	return action(ctx, s)
+}
+
 // Scripted calls retry individual rejected requests, not whole multi-call
 // actions. Successful mutations must not be replayed when a later call fails.
 type scriptedClient struct {
@@ -30,8 +61,11 @@ func (c *scriptedClient) unavailable(err error) error {
 }
 
 func scriptCall[T any](ctx context.Context, c *scriptedClient, call func() (T, error)) (T, error) {
-	cfg := config.Default()
-	deadline := WallClock.Now().Add(time.Duration(float64(cfg.AmbientHealAfter+cfg.BootDeadline) / c.speed))
+	return retryCall(ctx, c, config.Default().HostHeartbeat, call)
+}
+
+func retryCall[T any](ctx context.Context, c *scriptedClient, interval time.Duration, call func() (T, error)) (T, error) {
+	deadline := scriptContext(ctx, c.speed).Value(scriptDeadlineKey{}).(time.Time)
 	for {
 		value, err := call()
 		var rejected *api.Error
@@ -42,7 +76,7 @@ func scriptCall[T any](ctx context.Context, c *scriptedClient, call func() (T, e
 		if remaining <= 0 {
 			return value, c.unavailable(err)
 		}
-		wait := cfg.HostHeartbeat
+		wait := interval
 		if rejected.RetryAfterS > 0 {
 			wait = time.Duration(rejected.RetryAfterS) * time.Second
 		}

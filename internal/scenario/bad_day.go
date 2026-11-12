@@ -2,7 +2,6 @@ package scenario
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/hami-sh/vm/internal/api"
@@ -14,26 +13,28 @@ func badDayProgress(run Scenario) Scenario {
 	cfg := config.Default()
 	deleted := map[string]bool{}
 	run.Timeline = append(run.Timeline, Step{45 * time.Second, func(ctx context.Context, f System) error {
-		s := f.Latest()
-		if len(s.Queue) < 2 {
-			return fmt.Errorf("bad-day needs queued work before releasing post-restart capacity")
-		}
-		usable := map[string]bool{}
-		for _, h := range s.Hosts {
-			usable[h.ID] = h.Lease == api.LeaseHealthy && h.AdminState == api.AdminActive
-		}
-		for _, v := range s.VMs {
-			if v.State == api.VMReady && usable[v.HostID] && len(deleted) < 2 {
+		var candidates []api.VM
+		return selectTargets(ctx, f, func(s api.Snapshot) bool {
+			candidates = nil
+			usable := map[string]bool{}
+			for _, h := range s.Hosts {
+				usable[h.ID] = h.Lease == api.LeaseHealthy && h.AdminState == api.AdminActive
+			}
+			for _, v := range s.VMs {
+				if v.State == api.VMReady && usable[v.HostID] {
+					candidates = append(candidates, v)
+				}
+			}
+			return len(s.Queue) >= 2 && len(candidates) >= 2
+		}, func(ctx context.Context, _ api.Snapshot) error {
+			for _, v := range candidates[:2] {
 				if _, err := f.DeleteVM(ctx, v.ID); err != nil {
 					return err
 				}
 				deleted[v.ID] = true
 			}
-		}
-		if len(deleted) != 2 {
-			return fmt.Errorf("bad-day needs two Ready VMs on healthy active hosts")
-		}
-		return nil
+			return nil
+		})
 	}})
 	for i := range run.Expect {
 		if run.Expect[i].Name == "previously Ready VMs recovered" {

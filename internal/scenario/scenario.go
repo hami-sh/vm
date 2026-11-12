@@ -2,7 +2,6 @@ package scenario
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/hami-sh/vm/internal/api"
@@ -136,17 +135,18 @@ func Chaos(action, target string, params map[string]float64) Action {
 		// VM IDs are assigned by the implementation; select an actual Ready VM.
 		if target == "@ready" {
 			targetID := ""
-			for _, v := range f.Latest().VMs {
-				if v.State == api.VMReady {
-					targetID = v.ID
-					break
+			return selectTargets(ctx, f, func(s api.Snapshot) bool {
+				for _, v := range s.VMs {
+					if v.State == api.VMReady {
+						targetID = v.ID
+						return true
+					}
 				}
-			}
-			if targetID == "" {
-				return fmt.Errorf("%s: no Ready VM", action)
-			}
-			_, err := f.Do(ctx, action, api.ChaosRequest{Target: targetID, Params: params})
-			return err
+				return false
+			}, func(ctx context.Context, _ api.Snapshot) error {
+				_, err := f.Do(ctx, action, api.ChaosRequest{Target: targetID, Params: params})
+				return err
+			})
 		}
 		_, err := f.Do(ctx, action, api.ChaosRequest{Target: target, Params: params})
 		return err

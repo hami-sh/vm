@@ -90,6 +90,37 @@ func TestScriptedClientRetriesWithoutAbortingRecording(t *testing.T) {
 	}
 }
 
+func TestScriptedSelectionSharesActionBudget(t *testing.T) {
+	for _, heals := range []bool{false, true} {
+		t.Run(fmt.Sprint(heals), func(t *testing.T) {
+			previous := WallClock
+			c := retryClock{clock.NewFake(time.Unix(0, 0))}
+			WallClock = c
+			defer func() { WallClock = previous }()
+			f := &fakeFleet{initial: snapshot(0, api.VMReady), frames: []api.Snapshot{snapshot(1000, api.VMReady), snapshot(90000, api.VMReady)}}
+			f.latest = func() api.Snapshot {
+				s := f.initial
+				s.Scheduler = api.SchedulerDown
+				if heals && c.Now().UnixNano() >= int64(20*time.Millisecond) {
+					s.Scheduler = api.SchedulerUp
+				}
+				return s
+			}
+			f.delete = func(string) (api.VM, error) { return api.VM{}, &api.Error{Status: 503, RetryAfterS: 7} }
+			s := Scenario{Name: "selection-budget", Duration: 90 * time.Second, Topology: Topology{1, 1, 2}, Timeline: []Step{{time.Second, func(ctx context.Context, f System) error {
+				return selectTargets(ctx, f, func(api.Snapshot) bool { return true }, func(ctx context.Context, _ api.Snapshot) error { _, err := f.DeleteVM(ctx, "a"); return err })
+			}}}}
+			r, err := Run(context.Background(), s, func(context.Context, Scenario, int64, float64) (System, func(), error) { return f, func() {}, nil }, 1, 1000, t.TempDir())
+			if err != nil || r.Passed || c.Now().UnixNano() != int64(25*time.Millisecond) || r.Checks[len(r.Checks)-1].Name != errScriptedUnavailable.Error() {
+				t.Fatalf("time=%v report=%+v err=%v", c.Now(), r, err)
+			}
+			if _, ok := r.Metrics["recovery_failures"]; !ok {
+				t.Fatal("missing final metrics")
+			}
+		})
+	}
+}
+
 func TestBadDayReportsNeverReadyLossWithoutHidingReadyLoss(t *testing.T) {
 	for _, readyLost := range []bool{false, true} {
 		initial, final := snapshot(0, api.VMReady), snapshot(90000, api.VMReady)
@@ -110,7 +141,7 @@ func TestBadDayReportsNeverReadyLossWithoutHidingReadyLoss(t *testing.T) {
 }
 
 func TestBadDayPostRestartAdmission(t *testing.T) {
-	for _, fault := range []string{"", "late placement", "lower class", "wrong host", "no final Ready", "unrelated loss"} {
+	for _, fault := range []string{"", "healed scheduler outage", "late placement", "lower class", "wrong host", "no final Ready", "unrelated loss"} {
 		t.Run(fault, func(t *testing.T) {
 			initial := snapshot(0, api.VMReady)
 			initial.Hosts[0].Lease, initial.Hosts[0].AdminState = api.LeaseHealthy, api.AdminActive
@@ -158,6 +189,36 @@ func TestBadDayPostRestartAdmission(t *testing.T) {
 				events[9].HostID = "r1-h2"
 			}
 			f := &overloadFleet{fakeFleet: &fakeFleet{initial: initial, frames: []api.Snapshot{initial, final}, events: events}}
+			var scripts System = f
+			if fault == "healed scheduler outage" {
+				previous := WallClock
+				c := retryClock{clock.NewFake(time.Unix(0, 0))}
+				WallClock = c
+				defer func() { WallClock = previous }()
+				f.latest = func() api.Snapshot {
+					s := f.initial
+					s.Hosts = append([]api.Host(nil), s.Hosts...)
+					s.Scheduler = api.SchedulerDown
+					if c.Now().UnixNano() >= int64(4*time.Millisecond) {
+						s.Scheduler = api.SchedulerReconciling
+					}
+					if c.Now().UnixNano() >= int64(6*time.Millisecond) {
+						s.Scheduler = api.SchedulerUp
+					}
+					if c.Now().UnixNano() < int64(10*time.Millisecond) {
+						for i := range s.Hosts {
+							s.Hosts[i].Lease = api.LeaseSuspect
+						}
+					}
+					return s
+				}
+				scripts = &scriptedClient{System: f, speed: 1000}
+				// Successful deletes occur after healing; their unchanged admission
+				// deadline must not be measured from the original 45s attempt.
+				for i := 4; i <= 9; i++ {
+					events[i].At += 10000
+				}
+			}
 			run := Catalog()[13].NewRun()
 			// Populate shared action state before buffered event delivery, as the
 			// real Timeline does. This fixture emits no unrelated chaos actions.
@@ -165,7 +226,7 @@ func TestBadDayPostRestartAdmission(t *testing.T) {
 				f.initial.At = at.Milliseconds()
 				for _, step := range run.Timeline {
 					if step.At == at {
-						if err := step.Do(context.Background(), f); err != nil {
+						if err := step.Do(context.Background(), scripts); err != nil {
 							t.Fatal(err)
 						}
 					}
@@ -176,7 +237,7 @@ func TestBadDayPostRestartAdmission(t *testing.T) {
 			r, err := Run(context.Background(), run, func(context.Context, Scenario, int64, float64) (System, func(), error) {
 				return f, func() {}, nil
 			}, 1, 5, t.TempDir())
-			if err != nil || r.Passed != (fault == "") || f.deleted != 2 {
+			if err != nil || r.Passed != (fault == "" || fault == "healed scheduler outage") || f.deleted != 2 {
 				t.Fatalf("fault=%s deleted=%d checks=%+v err=%v", fault, f.deleted, r.Checks, err)
 			}
 		})
@@ -757,6 +818,7 @@ func TestBundleSelectsAndThinsWithoutLosingMarkers(t *testing.T) {
 type fakeFleet struct {
 	System
 	initial api.Snapshot
+	latest  func() api.Snapshot
 	frames  []api.Snapshot
 	events  []api.Event
 	create  func(string) (api.CreateVMResponse, error)
@@ -764,7 +826,12 @@ type fakeFleet struct {
 	delete  func(string) (api.VM, error)
 }
 
-func (f *fakeFleet) Latest() api.Snapshot { return f.initial }
+func (f *fakeFleet) Latest() api.Snapshot {
+	if f.latest != nil {
+		return f.latest()
+	}
+	return f.initial
+}
 func (f *fakeFleet) DeleteVM(_ context.Context, id string) (api.VM, error) {
 	return f.delete(id)
 }

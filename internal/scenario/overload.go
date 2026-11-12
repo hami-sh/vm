@@ -20,26 +20,32 @@ func overload(base Scenario) Scenario {
 		cfg := config.Default()
 		deleted := map[string]bool{}
 		run.Timeline = append(run.Timeline, Step{20 * time.Second, func(ctx context.Context, f System) error {
-			s := f.Latest()
-			interactive := false
-			for _, q := range s.Queue {
-				interactive = interactive || q.Priority == api.PriorityInteractive
-			}
-			if len(s.Queue) != cfg.QueueCap || !interactive {
-				return fmt.Errorf("overload needs a full queue with interactive demand before releasing slots")
-			}
-			for _, v := range s.VMs {
-				if v.State == api.VMReady && len(deleted) < 4 {
-					if _, err := f.DeleteVM(ctx, v.ID); err != nil {
-						return err
+			return selectTargets(ctx, f, func(s api.Snapshot) bool {
+				interactive := false
+				ready := 0
+				for _, v := range s.VMs {
+					if v.State == api.VMReady {
+						ready++
 					}
-					deleted[v.ID] = true
 				}
-			}
-			if len(deleted) != 4 {
-				return fmt.Errorf("overload needs four Ready VMs to release")
-			}
-			return nil
+				for _, q := range s.Queue {
+					interactive = interactive || q.Priority == api.PriorityInteractive
+				}
+				return len(s.Queue) == cfg.QueueCap && interactive && ready >= 4
+			}, func(ctx context.Context, s api.Snapshot) error {
+				for _, v := range s.VMs {
+					if v.State == api.VMReady && len(deleted) < 4 {
+						if _, err := f.DeleteVM(ctx, v.ID); err != nil {
+							return err
+						}
+						deleted[v.ID] = true
+					}
+				}
+				if len(deleted) != 4 {
+					return fmt.Errorf("overload needs four Ready VMs to release")
+				}
+				return nil
+			})
 		}}, Step{35 * time.Second, func(ctx context.Context, f System) error {
 			// Refill the four queue positions consumed by queued placements.
 			for i := range 4 {
