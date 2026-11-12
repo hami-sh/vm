@@ -59,6 +59,8 @@ type state struct {
 	emit             func(api.Event)
 	status           api.SimStatus
 	rng              *rand.Rand
+	lifetimeRNG      *rand.Rand
+	workloads        map[string]*workload
 	idle             time.Time
 	mix              [3]float64
 	credit           float64
@@ -73,6 +75,7 @@ type state struct {
 func New(ctx context.Context, cfg config.Config, c clock.Controllable, b Backend, seed int64, emit func(api.Event)) *Engine {
 	e := &Engine{ctx: ctx, inbox: make(chan request), done: make(chan struct{}), changes: make(chan struct{}, 1)}
 	s := &state{cfg: cfg, clock: c, wall: clock.Real{}, backend: b, emit: emit, status: api.SimStatus{Seed: seed}, rng: rand.New(rand.NewSource(seed)), mix: cfg.LoadPriorityMix, previous: c.Now()}
+	s.lifetimeRNG = rand.New(rand.NewSource(seed))
 	s.idle = s.wall.Now()
 	go func() {
 		defer close(e.done)
@@ -183,6 +186,7 @@ func (s *state) handle(now time.Time, r request) response {
 	status := s.status
 	status.Filters = slices.Clone(status.Filters)
 	status.Racks = slices.Clone(status.Racks)
+	status.Workloads = s.workloadStatus()
 	return response{result: api.ChaosResult{Action: r.action, Target: r.chaos.Target, Detail: "applied"}, status: status, err: err}
 }
 func (s *state) sim(action string, r api.SimRequest) error {
@@ -191,6 +195,7 @@ func (s *state) sim(action string, r api.SimRequest) error {
 	case "seed":
 		s.status.Seed = r.Seed
 		s.rng = rand.New(rand.NewSource(r.Seed))
+		s.lifetimeRNG = rand.New(rand.NewSource(r.Seed))
 	case "pause":
 		s.clock.Pause()
 	case "play":
@@ -218,6 +223,13 @@ func (s *state) sim(action string, r api.SimRequest) error {
 		if r.LoadRate != nil && (!finite(*r.LoadRate) || *r.LoadRate < 0 || *r.LoadRate > float64(s.cfg.MaxVMs)) {
 			return invalid("invalid load rate")
 		}
+		if r.Lifetime != nil && r.Lifetime.MaxMs != 0 {
+			p := *r.Lifetime
+			minMs, maxMs := s.cfg.LifetimeMin.Milliseconds(), s.cfg.LifetimeMax.Milliseconds()
+			if p.MinMs < minMs || p.MinMs > p.MaxMs || p.MaxMs > maxMs || p.IdleMs < minMs || p.IdleMs > maxMs || !finite(p.ReleaseP) || p.ReleaseP < 0 || p.ReleaseP > 1 {
+				return invalid("lifetime outside configured bounds")
+			}
+		}
 		for _, f := range r.Filters {
 			if !slices.ContainsFunc(catalogue, func(a api.ChaosAction) bool { return a.Name == f && a.Ambient }) {
 				return invalid("unknown ambient filter: " + f)
@@ -234,6 +246,13 @@ func (s *state) sim(action string, r api.SimRequest) error {
 		}
 		if r.Racks != nil {
 			s.status.Racks = slices.Clone(r.Racks)
+		}
+		if r.Lifetime != nil {
+			s.status.Lifetime = *r.Lifetime
+			if r.Lifetime.MaxMs == 0 {
+				s.status.Lifetime = api.Lifetime{}
+				s.workloads = nil
+			}
 		}
 	default:
 		return invalid("unknown sim action")
@@ -257,8 +276,11 @@ func (s *state) reset(ctx context.Context) error {
 	s.status.Intensity = 0
 	s.status.LoadRate = 0
 	s.status.Scenario = ""
+	s.status.Lifetime = api.Lifetime{}
+	s.workloads = nil
 	s.previous = s.clock.Now()
 	s.rng = rand.New(rand.NewSource(s.status.Seed))
+	s.lifetimeRNG = rand.New(rand.NewSource(s.status.Seed))
 	s.idle = s.wall.Now()
 	s.event("reset", "")
 	return nil
@@ -346,10 +368,19 @@ func (s *state) create(ctx context.Context) error {
 		p = "standard"
 	}
 	s.serial++
-	_, err := s.backend.ControlPlane().CreateVM(ctx, fmt.Sprintf("chaos-%d-%d", s.status.Seed, s.serial), api.CreateVMRequest{Pool: config.Pools[0].Name, Priority: p})
+	v, err := s.backend.ControlPlane().CreateVM(ctx, fmt.Sprintf("chaos-%d-%d", s.status.Seed, s.serial), api.CreateVMRequest{Pool: config.Pools[0].Name, Priority: p})
+	if err == nil && s.status.Lifetime.MaxMs != 0 {
+		if s.workloads == nil {
+			s.workloads = map[string]*workload{}
+		}
+		if _, tracked := s.workloads[v.ID]; !tracked {
+			s.workloads[v.ID] = &workload{Workload: api.Workload{VMID: v.ID}, policy: s.status.Lifetime}
+		}
+	}
 	return err
 }
 func (s *state) tick(ctx context.Context, now time.Time) {
+	s.workloadTick(ctx, now)
 	dt := now.Sub(s.previous).Seconds()
 	s.previous = now
 	s.maintenanceTick(ctx, now)
