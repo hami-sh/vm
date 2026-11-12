@@ -28,11 +28,13 @@ type Step struct {
 }
 type Predicate func(api.Snapshot) bool
 type Check struct {
-	Name   string
-	Until  time.Duration // zero means Always, otherwise satisfied by the deadline
-	Test   Predicate
-	Metric string
-	Limit  float64
+	Name  string
+	Until time.Duration // zero means Always, otherwise satisfied by the deadline
+	Test  Predicate
+	// NewTest allocates observation state separately for each parallel run.
+	NewTest func() Predicate
+	Metric  string
+	Limit   float64
 }
 type Scenario struct {
 	Name     string

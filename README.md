@@ -75,12 +75,16 @@ These are intended contracts, not claims that the current health-only deployment
 | --- | --- | --- | --- |
 | guestd dies | Agent guest lease expires | Unhealthy; recycle on the same host | Only checked, Ready VMs receive work |
 | Boot hangs | Boot deadline | Stop, back off, retry elsewhere; fail after bounded attempts | Bounded boot time and attempts |
-| Host dies | Scheduler host lease expires | Suspect → Lost; replace at generation +1 | Desired VMs are not forgotten |
+| Host powers off | Scheduler host lease expires; its VMs die with the host | Suspect → Lost; re-place each affected VM at generation +1 in replacement class 0, ahead of queued work | Replacement priority; no stale copy remains to stop on return |
 | Overload | Slot pressure and bounded queue | Priority admission, batch shedding, 429 + Retry-After | Bounded queue memory; interactive work prioritized |
 | Rack partition / heal | All rack host leases expire | Replace elsewhere; fence stale inventory on heal | One authoritative copy; eventual stale-copy stop |
+| Gray failure / restart-host | Heartbeats stop while VM copies keep running; old inventory returns | Replace at newer generations; fence and stop stale copies on reconnection | Retained old copies cannot remain authoritative |
 | Scheduler crash | Scheduler unavailable / restart | Creates return 503; running guests continue; reconcile inventory | Data plane survives control-plane outage |
+| Wipe store | Fresh store; hosts report surviving inventory | Adopt only Ready VMs with pool metadata; restore their idempotency keys and request hashes; stop unknown booting copies | Queued and booting work is lost, not recovered; retried creates for adopted Ready VMs return the same VM |
 | Concurrent duplicate create | Atomic idempotency lookup | Return the same VM | Exactly one logical VM per key |
 | Impostor guest | Channel/token/generation mismatch | Reject, count, log; repeated abuse quarantined | Claimed message identity cannot mark another VM Ready |
+
+Power-off is not a fencing test: the original VMs are gone. Stale-copy fencing is exercised by partition/heal, paused heartbeats (gray failure), and restart-host with retained VM copies. Store-wipe adoption follows the [coordination policy](COORDINATION.md): only an unknown Ready VM with pool metadata can be adopted into a fresh store; unknown booting or pool-less copies are stopped, and unknown copies in a non-fresh store are never adopted. During the initial host-lease recovery window, creates return 503 + Retry-After so live hosts can report their surviving keys before retries are accepted. A VM lost together with its host at the time of the wipe cannot be adopted.
 
 The six scenario presets are split brain, gray failure, thundering herd, rolling maintenance, hostile tenant and bad day. See `internal/scenario` for their explicit timelines. These are integration specifications; passing the harness's fake-fleet unit tests does not certify the system against them.
 

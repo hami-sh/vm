@@ -159,8 +159,13 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 		}
 	}
 	results := make([]api.CheckResult, len(s.Expect))
+	tests := make([]Predicate, len(s.Expect))
 	for i, c := range s.Expect {
 		results[i] = api.CheckResult{Name: c.Name, Passed: c.Until == 0 && c.Metric == ""}
+		tests[i] = c.Test
+		if c.NewTest != nil {
+			tests[i] = c.NewTest()
+		}
 	}
 	report.Checks = results
 	lastAction := time.Duration(0)
@@ -227,7 +232,7 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 				if c.Metric != "" {
 					continue
 				}
-				good := c.Test(snap)
+				good := tests[i](snap)
 				if c.Until == 0 && !good && results[i].Passed {
 					results[i].Passed = false
 					results[i].FirstBadSeq = snap.Seq

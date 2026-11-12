@@ -21,7 +21,7 @@ func Catalog() []Scenario {
 	s := []Scenario{
 		base("guestd-dies", Step{10 * sec, Chaos("kill-guestd", "@ready", nil)}),
 		base("boot-hangs", Step{0, Chaos("hang-next-boot", "r1-h1", nil)}),
-		base("host-dies", Step{10 * sec, Chaos("kill-host", "r1-h1", nil)}),
+		base("host-dies", Step{10 * sec, queueBatch}, Step{11 * sec, Chaos("kill-host", "r1-h1", nil)}, Step{30 * sec, addRack("r4")}),
 		base("overload", Step{10 * sec, Chaos("flood", "", map[string]float64{"count": 60})}),
 		base("rack-partition", Step{10 * sec, Chaos("partition-rack", "r2", nil)}, Step{40 * sec, Chaos("heal-rack", "r2", nil)}),
 		base("scheduler-crash", Step{10 * sec, Chaos("kill-scheduler", "", nil)}, Step{15 * sec, unavailableCreate}, Step{20 * sec, Chaos("restart-scheduler", "", nil)}),
@@ -48,7 +48,14 @@ func Catalog() []Scenario {
 		s[i].Expect = append(s[i].Expect, Eventually(60*sec, "attacks blocked", func(s api.Snapshot) bool { return s.Security.Blocked > 0 && s.Security.Succeeded == 0 }))
 	}
 	s[10].Load.Count = 20
-	for _, i := range []int{0, 2, 4, 8, 9} {
+	// Power-off destroys the old copies. Saturate capacity, queue batch work,
+	// then add capacity only after replacement priority has been observable.
+	s[2].Load.Count = cfg.Racks * cfg.HostsPerRack * cfg.SlotsPerHost
+	s[2].Expect = []Check{Always("invariants", NoInvariantViolations), {
+		Name: "powered-off VMs replaced at gen+1 ahead of batch", Until: 90 * sec,
+		NewTest: func() Predicate { return hostReplacement("r1-h1") },
+	}}
+	for _, i := range []int{0, 4, 8, 9} {
 		s[i].Expect = append(s[i].Expect, Eventually(90*sec, "new generation Ready", func(s api.Snapshot) bool {
 			for _, v := range s.VMs {
 				if v.Generation > 1 && v.State == api.VMReady {
@@ -76,6 +83,59 @@ func Catalog() []Scenario {
 	s[11].Expect = append(s[11].Expect, Eventually(90*sec, "maintenance recovered", AllDesiredVMsReady))
 	s[8].Expect = append(s[8].Expect, Metric("p99_recover_ms", 20000))
 	return s
+}
+
+// Observe the exact victims before power-off; unrelated recoveries, skipped
+// generations, normal-priority retries and a reversed queue must not pass.
+func hostReplacement(host string) Predicate {
+	victims := map[string]int64{}
+	priorityObserved := false
+	return func(s api.Snapshot) bool {
+		for _, v := range s.VMs {
+			if v.HostID == host && v.State == api.VMReady {
+				if _, ok := victims[v.ID]; !ok {
+					victims[v.ID] = v.Generation
+				}
+			}
+		}
+		if len(victims) == 0 {
+			return false
+		}
+		queued := 0
+		normalAhead := false
+		for _, q := range s.Queue {
+			if _, ok := victims[q.VMID]; ok {
+				if normalAhead || q.Reason != api.QueueReplace || q.Priority != api.PriorityReplacement || q.EffectivePriority != api.PriorityReplacement {
+					return false
+				}
+				queued++
+			} else if q.Reason != api.QueueReplace {
+				normalAhead = true
+			}
+		}
+		if queued == len(victims) {
+			priorityObserved = true
+		}
+		if !priorityObserved {
+			return false
+		}
+		replaced := 0
+		for _, v := range s.VMs {
+			if gen, ok := victims[v.ID]; ok && v.Generation == gen+1 && v.State == api.VMReady && v.HostID != "" && v.HostID != host {
+				replaced++
+			}
+		}
+		return replaced == len(victims)
+	}
+}
+
+func queueBatch(ctx context.Context, f System) error {
+	for i := 0; i < 8; i++ {
+		if _, err := f.CreateVM(ctx, fmt.Sprintf("queued-batch-%d", i), api.CreateVMRequest{Pool: "ios-xcode16-m", Priority: "batch"}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func duplicateCreate(ctx context.Context, f System) error {

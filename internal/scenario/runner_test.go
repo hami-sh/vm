@@ -138,3 +138,55 @@ func TestSSEContract(t *testing.T) {
 		t.Fatalf("calls %d err %v", calls, err)
 	}
 }
+
+func TestPoweredOffHostReplacementContract(t *testing.T) {
+	for _, fault := range []string{"", "wrong class", "batch ahead", "one victim missing", "skipped generation", "same host", "unrelated recovery"} {
+		t.Run(fault, func(t *testing.T) {
+			s := Catalog()[2]
+			s.Topology = Topology{1, 1, 2}
+			s.Load.Count = 0
+			// Exercise the catalog's checks through the runner, with the fault
+			// already modeled in snapshots rather than invoking a fake driver.
+			s.Timeline = []Step{{30 * time.Second, func(context.Context, System) error { return nil }}}
+			f := func(_ context.Context, _ Scenario, seed int64, _ float64) (System, func(), error) {
+				before := snapshot(1000, api.VMReady)
+				before.VMs = []api.VM{
+					{ID: "a", HostID: "r1-h1", Generation: seed + 7, State: api.VMReady},
+					{ID: "b", HostID: "r1-h1", Generation: seed + 3, State: api.VMReady},
+					{ID: "other", HostID: "r2-h1", Generation: 1, State: api.VMReady},
+				}
+				queued := snapshot(24000, api.VMLost)
+				queued.Queue = []api.QueueEntry{
+					{VMID: "a", Priority: api.PriorityReplacement, EffectivePriority: api.PriorityReplacement, Reason: api.QueueReplace},
+					{VMID: "b", Priority: api.PriorityReplacement, EffectivePriority: api.PriorityReplacement, Reason: api.QueueReplace},
+					{VMID: "batch", Priority: api.PriorityBatch, EffectivePriority: api.PriorityBatch, Reason: api.QueueNew},
+				}
+				after := snapshot(90000, api.VMReady)
+				after.VMs = []api.VM{
+					{ID: "a", HostID: "r4-h1", Generation: seed + 8, State: api.VMReady},
+					{ID: "b", HostID: "r4-h2", Generation: seed + 4, State: api.VMReady},
+					{ID: "other", HostID: "r2-h1", Generation: 2, State: api.VMReady},
+				}
+				switch fault {
+				case "wrong class":
+					queued.Queue[0].Priority = api.PriorityStandard
+				case "batch ahead":
+					queued.Queue[0], queued.Queue[2] = queued.Queue[2], queued.Queue[0]
+				case "one victim missing":
+					after.VMs = append(after.VMs[:1], after.VMs[2:]...)
+				case "skipped generation":
+					after.VMs[0].Generation++
+				case "same host":
+					after.VMs[0].HostID = "r1-h1"
+				case "unrelated recovery":
+					after.VMs = after.VMs[2:]
+				}
+				return &fakeFleet{initial: snapshot(0, api.VMReady), frames: []api.Snapshot{before, queued, after}}, func() {}, nil
+			}
+			reports, err := Suite(context.Background(), []Scenario{s}, f, Options{Repeat: 3, Parallel: 3, Seed: 1, Speed: 50, Output: t.TempDir()}, io.Discard)
+			if (err == nil) != (fault == "") {
+				t.Fatalf("fault %q: err=%v reports=%+v", fault, err, reports)
+			}
+		})
+	}
+}
