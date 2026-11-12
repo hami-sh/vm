@@ -101,6 +101,78 @@ func wantStatus(t *testing.T, rec *httptest.ResponseRecorder, status int) {
 	}
 }
 
+type presetSnapshots struct {
+	initial api.Snapshot
+	frames  []api.Snapshot
+	done    chan struct{}
+}
+
+func (p presetSnapshots) Latest() api.Snapshot { return p.initial }
+func (p presetSnapshots) Subscribe() (<-chan api.Snapshot, <-chan api.Event, func()) {
+	snaps := make(chan api.Snapshot, len(p.frames))
+	for _, f := range p.frames {
+		snaps <- f
+	}
+	return snaps, make(chan api.Event), func() { p.done <- struct{}{} }
+}
+
+// Exercise the HTTP contract: starting a preset records real snapshot data,
+// ignores old violations, preserves new violations and lists the finished run.
+func TestDashboardPresetRecording(t *testing.T) {
+	for _, mode := range []string{"pass", "violation", "reset"} {
+		t.Run(mode, func(t *testing.T) {
+			initial := api.Snapshot{At: 1000, Sim: api.SimStatus{Seed: 42, Speed: 2},
+				Invariants: []api.InvariantStatus{{Name: api.InvSlotCapacity, Violations: 3}},
+				Recent:     []api.Event{{Seq: 6, At: 1000, Kind: api.EventInvariant, Detail: "old violation"}}}
+			// Default split-brain horizon: 30s heal + 15s boot + 6s lease.
+			final := api.Snapshot{At: 52000, Sim: initial.Sim,
+				Invariants: []api.InvariantStatus{{Name: api.InvSlotCapacity, Violations: 3}},
+				Recent:     append(append([]api.Event{}, initial.Recent...), api.Event{Seq: 7, At: 1100, Kind: api.EventChaos, Detail: "partition-rack"})}
+			if mode == "violation" {
+				final.Invariants[0].Violations = 4
+				final.Invariants[0].LastDetail = "capacity exceeded"
+				final.Recent = append(final.Recent, api.Event{Seq: 8, At: 1200, Kind: api.EventInvariant, Detail: "capacity exceeded"})
+			}
+			src := presetSnapshots{initial: initial, done: make(chan struct{}, 4)}
+			if mode != "reset" {
+				src.frames = []api.Snapshot{final}
+			}
+			h := newHarness(t, func(o *Options) { o.Snapshots = src; o.Config.ChaosPerIP = 0 })
+			wantStatus(t, h.do("POST", "/v1/chaos/split-brain", `{}`), 200)
+			if mode == "reset" {
+				wantStatus(t, h.do("POST", "/v1/chaos/gray-failure", `{}`), 409)
+				wantStatus(t, h.do("POST", "/v1/chaos/reset", `{}`), 200)
+			}
+			timer := (clock.Real{}).NewTimer(5 * time.Second)
+			defer timer.Stop()
+			select {
+			case <-src.done:
+			case <-timer.C():
+				t.Fatal("recording did not finish")
+			}
+			list := decodeBody[[]api.RunSummary](t, h.do("GET", "/v1/runs", ""))
+			if len(list) != 1 {
+				t.Fatalf("runs: %+v", list)
+			}
+			r := decodeBody[api.RunReport](t, h.do("GET", "/v1/runs/"+list[0].ID, ""))
+			if r.Scenario != "split-brain" || r.Seed != 42 || r.Passed != (mode == "pass") {
+				t.Fatalf("report: %+v", r)
+			}
+			if mode == "violation" && (r.Violations != 1 || len(r.Markers) != 2 || r.Checks[3].Passed) {
+				t.Fatalf("new violation missing: %+v", r)
+			}
+			if mode != "reset" && (r.DurationMs != 51000 || r.Checks[0].Passed != true) {
+				t.Fatalf("horizon: %+v", r)
+			}
+			frames := h.do("GET", "/v1/runs/"+r.ID+"/snapshots", "")
+			wantStatus(t, frames, 200)
+			if !strings.Contains(frames.Body.String(), `"at":1000`) {
+				t.Fatal("initial frame missing")
+			}
+		})
+	}
+}
+
 func TestCreateVM(t *testing.T) {
 	plane := &stubPlane{}
 	h := newHarness(t, func(o *Options) { o.ControlPlane = plane })

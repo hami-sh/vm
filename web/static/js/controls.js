@@ -33,21 +33,22 @@ function load(s) {
   const pools = (s.pools || []).map((p) => p.name);
   form.pool = keep(form.pool, pools);
   return `<div class="ctl">
-    <div class="ctl-title"><h2>Load</h2><span class="dim">creates through the public API</span></div>
-    <div class="ctl-row"><span class="lbl">Rate</span>
+    <div class="ctl-title"><h2>VM requests</h2></div>
+    <div class="ctl-row"><span class="lbl">Automatic requests per sim-second</span>
       <input type="range" min="0" max="${MAX_RATE}" step="0.1" value="${rate}" data-input="slide" data-unit="/s" data-digits="1" data-change="load-rate" aria-label="Sustained create rate">
       <output>${rate.toFixed(1)}/s</output></div>
-    <div class="ctl-row"><span class="lbl">Mix</span>
+    <div class="ctl-row"><span class="lbl">Automatic request priorities</span>
       <div class="seg">${Object.entries(MIXES)
         .map(([key, m]) => `<button data-act="mix" data-mix="${key}" class="${form.mix === key ? 'on' : ''}">${m.label}</button>`)
         .join('')}</div></div>
-    <div class="ctl-row"><span class="lbl">One VM</span>
-      <select class="input" data-change="form" data-key="pool" aria-label="Pool">${options(pools.map((p) => [p, p]), form.pool)}</select>
-      <select class="input" data-change="form" data-key="priority" aria-label="Priority">${options(PRIORITIES.slice(1).map((p) => [p.key, p.label]), form.priority)}</select>
-      <button class="btn primary" data-act="create-vm">Create</button></div>
-    <div class="ctl-row"><span class="lbl">Burst</span>
-      <button class="btn" data-act="flood" data-count="60" title="60 creates at once. The queue holds ${s.counters.queue_cap}; the rest are refused with 429.">Flood 60</button>
-      <button class="btn" data-act="flood" data-count="10">Flood 10</button></div>
+    <div class="create-form">
+      <label>VM pool<select class="input" data-change="form" data-key="pool" aria-label="VM pool">${options(pools.map((p) => [p, p]), form.pool)}</select></label>
+      <label>Request priority<select class="input" data-change="form" data-key="priority" aria-label="Request priority">${options(PRIORITIES.slice(1).map((p) => [p.key, p.label]), form.priority)}</select></label>
+      <button class="btn primary" data-act="create-vm" title="Request one VM with the pool and priority above">Create VM</button>
+    </div>
+    <div class="ctl-row"><span class="lbl">Burst requests · tests queue admission</span>
+      <button class="btn" data-act="flood" data-count="60" title="Send 60 requests at once. Up to ${s.counters.queue_cap} wait; excess requests are refused.">Request 60</button>
+      <button class="btn" data-act="flood" data-count="10" title="Send 10 requests at once">Request 10</button></div>
   </div>`;
 }
 
@@ -94,7 +95,7 @@ function chaos(s, catalog) {
     .map((r) => `<button class="chip${scope.includes(r.id) ? ' on' : ''}" data-act="scope" data-rack="${esc(r.id)}">${esc(r.id)}</button>`)
     .join('');
   return `<div class="ctl">
-    <div class="ctl-title"><h2>Ambient chaos</h2><span class="dim">seeded random faults · seed ${s.sim.seed}</span></div>
+    <div class="ctl-title"><h2>Ambient chaos</h2><span class="dim">seeded random faults</span></div>
     <div class="ctl-row"><span class="lbl">Intensity</span>
       <input type="range" min="0" max="100" step="1" value="${Math.round(intensity * 100)}" data-input="slide" data-unit="%" data-digits="0" data-change="intensity" aria-label="Ambient chaos intensity">
       <output>${Math.round(intensity * 100)}%</output></div>
@@ -106,9 +107,10 @@ function chaos(s, catalog) {
 
 function presets(catalog) {
   return `<div class="ctl wide">
-    <div class="ctl-row"><h2>Scenarios</h2>
+    <div class="ctl-title"><h2>Scenarios</h2><span class="dim">Start a fault sequence and record it</span></div>
+    <div class="ctl-row">
       <div class="presets">${catalog.presets
-        .map((p) => `<button class="btn" data-act="preset" data-name="${esc(p.name)}">${esc(p.label)}</button>`)
+        .map((p) => `<button class="btn" data-act="preset" data-name="${esc(p.name)}" title="Start ${esc(p.label)}; view the recording in Runs after completion">${esc(p.label)}</button>`)
         .join('')}</div>
       </div>
   </div>`;
@@ -121,7 +123,7 @@ export function render(st, v) {
     mount(el, '');
     return;
   }
-  mount(el, load(s) + presets(st.catalog) + `<div class="ctl"><button class="btn" data-act="controls-more" aria-expanded="${!!st.controlsMore}">${st.controlsMore ? 'Hide' : 'Show'} advanced controls</button><span class="dim">Topology, ambient chaos and network faults</span></div>` + (st.controlsMore ? topology(s) + chaos(s, st.catalog) + '<div class="ctl"><button class="btn" data-act="open-menu" data-kind="global">Network faults…</button></div>' : ''));
+  mount(el, load(s) + presets(st.catalog) + '<h2 class="advanced-title">Advanced controls</h2><div class="advanced-controls" aria-label="Advanced controls">' + topology(s) + chaos(s, st.catalog) + '<div class="ctl"><button class="btn" data-act="open-menu" data-kind="global" title="Inject latency, packet loss, duplication or reordering">Network faults…</button></div></div>');
 }
 
 // After a slider request the panel is redrawn from the snapshot even if the
@@ -156,7 +158,6 @@ export const changes = {
 };
 
 export const actions = {
-  'controls-more': () => update((st) => (st.controlsMore = !st.controlsMore)),
   async mix(el) {
     const key = el.dataset.mix;
     const { label, ...weights } = MIXES[key];

@@ -1,7 +1,7 @@
 // The rack / host / VM grid. It is the control surface: every rack head, host
 // card, VM chip and the scheduler box carries data-act="pick", which selects
 // it for the detail panel and (on the live fleet) opens its chaos menu.
-import { $, esc, mount, stateVar, prio, dur, plural, vmName } from './util.js';
+import { $, esc, mount, stateVar, stateMeaning, prio, dur, plural, vmName } from './util.js';
 
 const LEASE = { healthy: 'var(--ok)', suspect: 'var(--warn)', lost: 'var(--bad)' };
 const SCHED = { up: 'var(--ok)', reconciling: 'var(--warn)', down: 'var(--bad)' };
@@ -24,8 +24,8 @@ export function vmChip(vm, st, slotState) {
       : '';
   return `<button class="${cls.join(' ')}" style="--c:${stateVar(vm.state)}" data-act="pick" data-kind="vm" data-id="${esc(vm.id)}"
     title="${esc(vm.id)} · ${esc(vm.state)} · gen ${vm.gen} · ${p.label}${note ? ' · ' + esc(note) : ''}">
-    <span class="vm-top"><span class="vm-id">${esc(vmName(vm.id))}</span><span class="vm-gen">g${vm.gen}</span><span class="vm-prio" style="--p:${p.color}">${p.short}</span></span>
-    <span class="vm-bot"><span class="vm-state">${esc(vm.state)}</span>${note ? `<span class="vm-note">${esc(note)}</span>` : ''}</span>
+    <span class="vm-top"><span class="vm-id">${esc(vmName(vm.id))}</span></span>
+    <span class="vm-bot"><span class="vm-state" title="${esc(stateMeaning(vm.state))}">${esc(vm.state)}</span><span class="vm-gen" title="Generation: increases on re-placement">g${vm.gen}</span><span class="vm-prio" title="Priority: ${p.label}" style="--p:${p.color}">${p.short}</span></span>
   </button>`;
 }
 
@@ -38,8 +38,8 @@ function slot(sl, vms, st) {
 }
 
 function leaseText(h) {
-  if (h.lease === 'healthy') return `heartbeat ${dur(h.lease_age_ms)}`;
-  return `${h.lease} · ${dur(h.lease_age_ms)} silent`;
+  if (h.lease === 'healthy') return '';
+  return `No response for ${dur(h.lease_age_ms)}`;
 }
 
 function hostCard(h, vms, st) {
@@ -51,10 +51,10 @@ function hostCard(h, vms, st) {
   const stale = (h.stale || [])
     .map((s) => `<span class="stale" title="A copy the scheduler has fenced: its generation is older than the authoritative one.">stale copy <b>${esc(vmName(s.vm_id))}</b> g${s.gen}</span>`)
     .join('');
-  return `<div class="${cls.join(' ')}" style="--lease:${LEASE[h.lease] || 'var(--faint)'}" data-act="pick" data-kind="host" data-id="${esc(h.id)}">
+  return `<div class="${cls.join(' ')}" style="--lease:${LEASE[h.lease] || 'var(--faint)'}">
     <div class="host-head">
-      <button class="host-id">${esc(h.id)}</button>
-      <span class="lease"><i></i>${esc(leaseText(h))}</span>
+      <button class="host-id" data-act="pick" data-kind="host" data-id="${esc(h.id)}" aria-label="Inspect ${esc(h.id)} and host actions" title="${esc(h.id)} · ${esc(h.lease)} · last response ${dur(h.lease_age_ms)} ago. Click for host actions and history.">${esc(h.id)} <span aria-hidden="true">⋯</span></button>
+      <span class="lease" title="${esc(h.lease)} · last heartbeat ${dur(h.lease_age_ms)} ago"><i></i>${esc(leaseText(h))}</span>
       <span class="tags">${tags.join('')}</span>
     </div>
     <div class="slots" style="--n:${Math.max(1, h.slots.length)}">${h.slots.map((sl) => slot(sl, vms, st)).join('')}</div>
@@ -75,13 +75,14 @@ function rackCol(r, hosts, vms, st) {
       <span class="rack-id">Rack ${esc(r.id)}</span>
       <span class="rack-meta">${plural(mine.length, 'host')} · ${used}/${total} slots${down ? ` · <span class="bad">${down} down</span>` : ''}</span>
       ${r.partitioned ? '<span class="tag fault">partitioned</span>' : ''}
+      <span class="action-cue" aria-hidden="true">⋯</span>
     </button>
     ${mine.map((h) => hostCard(h, vms, st)).join('') || '<div class="empty">No hosts</div>'}
   </div>`;
 }
 
 function unplaced(s, st) {
-  const loose = s.vms.filter((v) => !v.host);
+  const loose = s.vms.filter((v) => !v.host && v.state !== 'Pending');
   if (!loose.length) return '';
   const order = [...UNPLACED, ...new Set(loose.map((v) => v.state).filter((x) => !UNPLACED.includes(x)))];
   const groups = order
@@ -114,12 +115,12 @@ export function render(st, v) {
   mount(
     el,
     `<header class="panel-head">
-      <h2>Fleet</h2>
-      <span class="dim">${plural(s.racks.length, 'rack')} · ${plural(s.hosts.filter((h) => h.admin_state !== 'removed').length, 'host')} · ${plural(s.vms.filter((x) => x.host).length, 'VM')} placed</span>
+      <h2>${st.source?.startsWith('Fixture') ? 'Fixture fleet' : 'Fleet'}</h2>
+      <span class="dim">${plural(s.racks.length, 'rack')} · ${plural(s.hosts.filter((h) => h.admin_state !== 'removed').length, 'host')}</span>
       <span class="spacer"></span>
-      ${v.playback ? '' : '<span class="hint">Click anything to break it</span>'}
       <button class="sched${isSel(st, 'scheduler', 'scheduler') ? ' sel' : ''}" style="--c:${SCHED[sched] || 'var(--faint)'}" data-act="pick" data-kind="scheduler" data-id="scheduler">
         <i></i><span>Scheduler</span><b>${esc(sched)}</b><span class="dim">epoch ${s.epoch}</span>
+        <span aria-hidden="true">⋯</span>
       </button>
     </header>
     <div class="racks">${s.racks.map((r) => rackCol(r, hosts, vms, st)).join('')}</div>

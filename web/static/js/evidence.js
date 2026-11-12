@@ -18,13 +18,13 @@ const CHECKS = {
 // Short names for the lights; the full name and the rule show on click.
 const SHORT = {
   one_authoritative_copy: 'One live copy',
-  stale_copy_stopped: 'Stale copy stopped',
+  stale_copy_stopped: 'Stale copies',
   slot_capacity: 'Slot capacity',
   generation_monotonic: 'Generations rise',
   legal_transitions: 'Legal transitions',
   queue_bounded: 'Queue bounded',
-  no_successful_attack: 'No attack succeeds',
-  pending_placed_promptly: 'Prompt placement',
+  no_successful_attack: 'No attacks',
+  pending_placed_promptly: 'Prompt starts',
 };
 
 function invariants(s, st) {
@@ -36,7 +36,7 @@ function invariants(s, st) {
       if (x.violations) cls.push('bad');
       if (st.invariant === x.name) cls.push('on');
       return `<button class="${cls.join(' ')}" data-act="invariant" data-name="${esc(x.name)}" title="${esc(INVARIANTS[x.name] || title(x.name))}: ${esc(CHECKS[x.name] || '')}">
-        <i></i><span class="name">${esc(SHORT[x.name] || INVARIANTS[x.name] || title(x.name))}</span><span class="count">${x.violations}</span></button>`;
+        <i></i><span class="name">${esc(SHORT[x.name] || INVARIANTS[x.name] || title(x.name))}</span>${x.violations ? `<span class="count">${x.violations}</span>` : ''}</button>`;
     })
     .join('');
   const open = list.find((x) => x.name === st.invariant);
@@ -162,9 +162,8 @@ function chart(s, st, v) {
     <div class="chart-legend">
       <span><i style="--c:var(--booting)"></i>p50 <b>${now.samples ? secs(now.p50_ms) : '–'}</b></span>
       <span><i style="--c:#e8edf4"></i>p99 <b class="${over ? 'over' : ''}">${now.samples ? secs(now.p99_ms) : '–'}</b></span>
-      ${target ? `<span><i style="--c:var(--warn)"></i>target <b>${secs(target)}</b></span>` : ''}
-      <span><i class="box" style="--c:var(--terminating)"></i>queue <b>${s.counters.queue_depth}</b></span>
-      <span><i class="box" style="--c:var(--warn)"></i>chaos <b>${Math.round((s.sim.intensity || 0) * 100)}%</b></span>
+      <span><i class="box" style="--c:var(--terminating)"></i>queue history</span>
+      <span><i class="box" style="--c:var(--warn)"></i>chaos intensity</span>
       <span class="faint">${now.samples} sample${now.samples === 1 ? '' : 's'}</span>
     </div>
   </div>`;
@@ -181,20 +180,10 @@ function headroom(s) {
       : n === 0
         ? 'Losing the busiest rack would use every free slot.'
         : 'Free slots left after re-placing every VM from the busiest rack.';
-  const bars = s.racks
-    .map((r) => {
-      const hosts = s.hosts.filter((h) => h.rack === r.id && h.admin_state !== 'removed');
-      const slots = hosts.flatMap((h) => h.slots);
-      const used = slots.filter((sl) => sl.vm_id).length;
-      const down = r.partitioned || (hosts.length > 0 && hosts.every((h) => h.lease === 'lost'));
-      return `<div class="rackbar${down ? ' down' : ''}"><span>${esc(r.id)}</span><span class="bar"><i style="width:${slots.length ? (used / slots.length) * 100 : 0}%"></i></span><span>${used}/${slots.length}</span></div>`;
-    })
-    .join('');
   const rec = c.recoveries || {};
   return `<div class="ev-section">
     <div class="ev-title"><h2>Rack-loss headroom</h2></div>
     <div class="headroom${cls}"><span class="big">${n > 0 ? '+' : ''}${n}</span><p>${text}</p></div>
-    <div class="rackbars">${bars}</div>
     <div class="recov"><span>recoveries</span>${['recycle', 'replace', 'retry'].map((k) => `<span>${k} <b>${rec[k] || 0}</b></span>`).join('')}</div>
   </div>`;
 }

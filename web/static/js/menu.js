@@ -91,7 +91,7 @@ function item(a, recover) {
   if (recover) cls.push('suggested');
   if (DESTRUCTIVE.has(a.name)) cls.push('danger');
   return `<div class="${cls.join(' ')}">
-    <button data-act="chaos" data-action="${esc(a.name)}"><span>${esc(a.label)}</span>${params || off ? '' : `<span class="menu-code">${esc(a.name)}</span>`}</button>${params}${off}
+    <button data-act="chaos" data-action="${esc(a.name)}"><span>${esc(a.label)}</span></button>${params}${off}
   </div>`;
 }
 

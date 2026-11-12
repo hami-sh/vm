@@ -1,20 +1,7 @@
 // The detail panel for whatever is selected: a VM (with its last 20
-// transitions), a host, a rack or the scheduler. With nothing selected it is
-// the legend for the grid.
-import { $, esc, mount, clock, dur, badge, prio, stateVar, STATES, EVENT_KINDS, vmName, shorten, plural } from './util.js';
+// transitions), a host, a rack or the scheduler. Hidden until selected.
+import { $, esc, mount, clock, dur, badge, prio, stateVar, EVENT_KINDS, vmName, shorten } from './util.js';
 import { update } from './store.js';
-import { vmChip } from './grid.js';
-
-const MEANING = {
-  Pending: 'Queued, waiting for a free slot',
-  Booting: 'Slot reserved, guest starting',
-  Ready: 'guestd proved the VM is usable',
-  Unhealthy: 'Guest stopped answering its host',
-  Lost: 'Host lease expired; being replaced',
-  Terminating: 'Stop sent, slot still held',
-  Terminated: 'Deleted, slot released',
-  Failed: 'Gave up after repeated attempts',
-};
 const LEASE = { healthy: 'var(--ok)', suspect: 'var(--warn)', lost: 'var(--bad)' };
 const SCHED = { up: 'var(--ok)', reconciling: 'var(--warn)', down: 'var(--bad)' };
 
@@ -25,8 +12,8 @@ const kv = (pairs) =>
     .join('')}</div>`;
 
 const head = (name, tag) =>
-  `<header class="panel-head"><h2>Detail</h2><span class="detail-title">${esc(name)}</span>${tag}<span class="spacer"></span>
-    <button class="btn ghost sm" data-act="deselect" aria-label="Clear selection">Clear</button></header>`;
+  `<header class="panel-head"><span class="detail-title">${esc(name)}</span>${tag}<span class="spacer"></span>
+    <button class="btn sm" data-act="deselect" aria-label="Close inspector">Close ×</button></header>`;
 
 function eventRows(list, empty) {
   if (!list.length) return `<div class="empty">${empty}</div>`;
@@ -77,8 +64,6 @@ function vmDetail(id, s, v) {
 function hostDetail(id, s, v, st) {
   const h = s.hosts.find((x) => x.id === id);
   if (!h) return `${head(id, badge('gone', 'var(--faint)'))}<div class="detail-body"><div class="empty">This host is no longer in the fleet.</div></div>`;
-  const vms = new Map(s.vms.map((x) => [x.id, x]));
-  const here = h.slots.map((sl) => vms.get(sl.vm_id)).filter(Boolean);
   const used = h.slots.filter((sl) => sl.vm_id).length;
   const stale = (h.stale || []).map((x) => `${esc(vmName(x.vm_id))} g${x.gen}`).join(', ');
   const events = last(v.events, 20, (e) => e.host_id === id);
@@ -92,7 +77,6 @@ function hostDetail(id, s, v, st) {
       ['Faults', (h.faults || []).length ? `<span class="bad">${esc(h.faults.join(', '))}</span>` : '<span class="faint">none</span>', true],
       stale ? ['Stale copies (fenced)', `<span class="bad">${stale}</span>`, true] : null,
     ])}
-    ${here.length ? `<div class="sub-head">VMs</div><div class="detail-vms">${here.map((x) => vmChip(x, st)).join('')}</div>` : ''}
     <div class="sub-head">Recent events</div>${eventRows(events, 'None in the log window.')}</div>`;
 }
 
@@ -132,31 +116,17 @@ function schedulerDetail(s, v) {
     <div class="sub-head">Reconcile, fencing and alerts</div>${eventRows(events, 'None in the log window.')}</div>`;
 }
 
-function legend(playback) {
-  return `<header class="panel-head"><h2>Detail</h2><span class="dim">${playback ? 'Select' : 'Click'} a VM, host, rack or the scheduler</span></header>
-    <div class="detail-body"><div class="legend">${STATES.map(
-      (name) => `<div class="legend-item" style="--c:${stateVar(name)}"><i class="dot"></i><b>${name}</b><span>${MEANING[name]}</span></div>`,
-    ).join('')}</div>
-    <div class="sub-head">On the grid</div>
-    <div class="legend">
-      <div class="legend-item"><i class="dot" style="--c:var(--ok)"></i><b style="color:var(--text)">Host edge</b><span>Lease: green healthy, amber suspect, red lost</span></div>
-      <div class="legend-item"><i class="dot" style="--c:var(--bad)"></i><b style="color:var(--text)">Stale copy</b><span>An old generation still running; fenced</span></div>
-      <div class="legend-item"><i class="dot" style="--c:var(--dim)"></i><b style="color:var(--text)">g3</b><span>Generation: rises on every re-placement</span></div>
-      <div class="legend-item"><i class="dot" style="--c:var(--accent)"></i><b style="color:var(--text)">R I S B</b><span>Replacement, interactive, standard, batch</span></div>
-    </div></div>`;
-}
-
 export function render(st, v) {
   const el = $('#detail');
   const s = v.snapshot;
   const sel = st.selection;
-  if (!s) {
+  el.hidden = !s || !sel;
+  if (!s || !sel) {
     mount(el, '');
     return;
   }
   let html;
-  if (!sel) html = legend(v.playback);
-  else if (sel.kind === 'vm') html = vmDetail(sel.id, s, v);
+  if (sel.kind === 'vm') html = vmDetail(sel.id, s, v);
   else if (sel.kind === 'host') html = hostDetail(sel.id, s, v, st);
   else if (sel.kind === 'rack') html = rackDetail(sel.id, s, v);
   else html = schedulerDetail(s, v);

@@ -57,12 +57,17 @@ type Options struct {
 // chaos engine already resets itself after config.IdleResetAfter of wall time
 // without chaos, and a second timer in this package would reset twice.
 type Server struct {
-	o       Options
-	mux     *http.ServeMux
-	hub     *hub
-	limiter *ipLimiter
-	cancel  context.CancelFunc
-	done    chan struct{} // closed when the hub has stopped
+	o         Options
+	mux       *http.ServeMux
+	hub       *hub
+	limiter   *ipLimiter
+	cancel    context.CancelFunc
+	done      chan struct{} // closed when the hub has stopped
+	ctx       context.Context
+	runMu     sync.Mutex
+	runCancel context.CancelFunc
+	runWG     sync.WaitGroup
+	closing   bool
 }
 
 // New builds a Server and starts its SSE hub. Call Close to stop the hub.
@@ -83,7 +88,7 @@ func New(o Options) *Server {
 		o.Config = config.Default()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Server{o: o, mux: http.NewServeMux(), cancel: cancel, done: make(chan struct{}),
+	s := &Server{o: o, mux: http.NewServeMux(), ctx: ctx, cancel: cancel, done: make(chan struct{}),
 		limiter: newIPLimiter(o.Config.ChaosPerIP)}
 	s.hub = newHub(o.Snapshots, o.Clock, o.Config.SSEEvery)
 	go func() {
@@ -96,8 +101,12 @@ func New(o Options) *Server {
 
 // Close stops the SSE hub; open event streams end.
 func (s *Server) Close() {
+	s.runMu.Lock()
+	s.closing = true
 	s.cancel()
+	s.runMu.Unlock()
 	<-s.done
+	s.runWG.Wait()
 }
 
 // ServeHTTP implements http.Handler.
@@ -333,10 +342,27 @@ func (s *Server) chaosDo(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	res, err := s.o.Chaos.Do(r.Context(), r.PathValue("action"), req)
+	action := r.PathValue("action")
+	if slices.ContainsFunc(s.o.Chaos.Catalog().Presets, func(p api.ChaosAction) bool { return p.Name == action }) {
+		res, err := s.startPreset(r.Context(), action, req)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+		return
+	}
+	res, err := s.o.Chaos.Do(r.Context(), action, req)
 	if err != nil {
 		writeError(w, err)
 		return
+	}
+	if action == "reset" {
+		s.runMu.Lock()
+		if s.runCancel != nil {
+			s.runCancel()
+		}
+		s.runMu.Unlock()
 	}
 	writeJSON(w, http.StatusOK, res)
 }

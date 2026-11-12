@@ -12,7 +12,7 @@
 .sched b { color: var(--c); font-weight: 600; }
 .sched.sel { box-shadow: 0 0 0 2px var(--accent); }
 
-.racks { display: grid; grid-template-columns: repeat(auto-fit, minmax(248px, 1fr)); gap: 10px; padding: 12px; }
+.racks { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px; padding: 10px; }
 .rack { display: grid; align-content: start; gap: 6px; padding: 0 6px 6px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; min-width: 0; }
 .rack.sel { border-color: var(--accent); }
 .rack.partitioned {
@@ -23,12 +23,14 @@
   display: flex; align-items: center; gap: 8px; width: 100%; padding: 9px 6px 3px;
   font: inherit; color: var(--text); text-align: left; background: none; border: 0; cursor: pointer; border-radius: 6px;
 }
+.rack-head { border: 1px solid var(--line-2); margin: 6px 0 2px; padding: 7px; background: var(--raise); }
+.rack-head:hover { border-color: var(--accent); }
 .rack-head:hover .rack-id { color: var(--accent); }
 .rack-id { font-weight: 600; letter-spacing: .02em; }
 .rack-meta { flex: 1; color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .host {
-  padding: 6px 7px 7px; background: var(--bg); cursor: pointer; min-width: 0;
+  padding: 6px 7px 7px; background: var(--bg); min-width: 0;
   border: 1px solid var(--line); border-radius: 6px;
 }
 .host:hover { border-color: var(--line-2); }
@@ -36,7 +38,8 @@
 .host.lease-lost { background: repeating-linear-gradient(135deg, rgba(255, 93, 108, .06) 0 6px, transparent 6px 12px), var(--bg); }
 .host.admin-cordoned, .host.admin-draining { border-top-style: dashed; border-right-style: dashed; border-bottom-style: dashed; }
 .host-head { display: flex; align-items: center; gap: 8px; min-height: 18px; }
-.host-id { flex: none; white-space: nowrap; padding: 0; font: 600 12px var(--mono); color: var(--text); background: none; border: 0; cursor: pointer; }
+.host-id { flex: none; white-space: nowrap; padding: 2px 5px; font: 600 12px var(--mono); color: var(--text); background: var(--raise); border: 1px solid var(--line-2); border-radius: 4px; cursor: pointer; }
+.host-id:hover { border-color: var(--accent); }
 .lease { min-width: 0; display: inline-flex; align-items: center; gap: 5px; color: var(--dim); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .lease i { width: 6px; height: 6px; border-radius: 50%; background: var(--lease); flex: none; }
 .host.lease-suspect .lease, .host.lease-lost .lease { color: var(--lease); }

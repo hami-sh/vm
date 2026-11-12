@@ -16,6 +16,13 @@ export function mount(el, html) {
 }
 
 export const STATES = ['Pending', 'Booting', 'Ready', 'Unhealthy', 'Lost', 'Terminating', 'Terminated', 'Failed'];
+const STATE_MEANINGS = {
+  Pending: 'Queued, waiting for a free slot', Booting: 'Slot reserved, guest starting',
+  Ready: 'guestd proved the VM is usable', Unhealthy: 'Guest stopped answering its host',
+  Lost: 'Host lease expired; being replaced', Terminating: 'Stop sent, slot still held',
+  Terminated: 'Deleted, slot released', Failed: 'Gave up after repeated attempts',
+};
+export const stateMeaning = (name) => STATE_MEANINGS[name] || name;
 export const stateVar = (s) => `var(--${String(s || 'pending').toLowerCase()})`;
 
 // Priority classes by their wire number. 0 is internal: replacements for
