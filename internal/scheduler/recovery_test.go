@@ -9,6 +9,138 @@ import (
 	"github.com/hami-sh/vm/internal/api"
 )
 
+func TestRegistrationAbsencePreservesUnadmittedBoot(t *testing.T) {
+	for _, state := range []string{"unadmitted", "admitted", "ready", "unhealthy"} {
+		t.Run(state, func(t *testing.T) {
+			h := newHarness(t)
+			h.register("a", "r1", 1)
+			v := h.create("K", "standard")
+			original := h.s.state.reservations[v.ID]
+			if state != "unadmitted" {
+				h.agent("a", "r1", api.StartVMResult{VMID: v.ID, Generation: v.Generation, HostID: "a", Admitted: true})
+			}
+			if state == "ready" || state == "unhealthy" {
+				h.ready(v)
+			}
+			if state == "unhealthy" {
+				r := h.s.state.data.VMs[v.ID]
+				r.VM.State = api.VMUnhealthy
+				h.s.state.data.VMs[v.ID] = r
+			}
+			// Registration was captured before StartVM arrived, but reaches
+			// the scheduler after the placement was committed and sent.
+			h.c.Advance(400 * time.Millisecond)
+			registration := h.register("a", "r1", 1)
+			got := h.s.state.data.VMs[v.ID].VM
+			if state != "unadmitted" {
+				lost := false
+				for _, event := range registration.events {
+					lost = lost || event.VMID == v.ID && event.To == api.VMLost && event.Detail == "missing from inventory"
+				}
+				if !lost {
+					t.Fatalf("authoritative absence ignored: %+v", got)
+				}
+				return
+			}
+			if got.State != api.VMBooting || got.Generation != v.Generation || got.Attempts != v.Attempts || h.s.state.reservations[v.ID] != original {
+				t.Fatalf("in-flight boot abandoned or deadline reset: %+v", got)
+			}
+			e := h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: 1})
+			resent := false
+			for _, d := range e.sends {
+				if command, ok := d.msg.(api.StartVM); ok && command == original.command {
+					resent = true
+				}
+			}
+			if !resent {
+				t.Fatal("missing inventory did not resend original StartVM")
+			}
+			h.ready(v)
+			if got := h.s.state.data.VMs[v.ID].VM; got.State != api.VMReady || got.Generation != v.Generation {
+				t.Fatalf("delayed boot did not complete: %+v", got)
+			}
+		})
+	}
+}
+
+func TestRepeatedInFlightRecoveryPlacementsSurviveRegistration(t *testing.T) {
+	h := newHarness(t)
+	h.s.cfg.BackoffBase = 0
+	h.register("a", "r1", 1)
+	v := h.create("K", "standard")
+	h.ready(v)
+	h.agent("a", "r1", api.UnhealthyReport{HostID: "a", VMID: v.ID, Generation: v.Generation, Reason: api.ReasonGuestLease})
+	for attempt := 1; attempt <= 3; attempt++ {
+		boot := h.s.state.data.VMs[v.ID].VM
+		if boot.State != api.VMBooting || boot.Generation != int64(attempt+1) || boot.Attempts != attempt {
+			t.Fatalf("unexpected recovery placement: %+v", boot)
+		}
+		h.c.Advance(400 * time.Millisecond)
+		h.register("a", "r1", 1)
+		if got := h.s.state.data.VMs[v.ID].VM; got.State != api.VMBooting || got.Generation != boot.Generation || got.Attempts != attempt {
+			t.Fatalf("registration consumed recovery budget: %+v", got)
+		}
+		if attempt < 3 {
+			h.agent("a", "r1", api.StartVMResult{HostID: "a", VMID: v.ID, Generation: boot.Generation, Admitted: true})
+			h.agent("a", "r1", api.StoppedReport{HostID: "a", VMID: v.ID, Generation: boot.Generation})
+		} else {
+			h.ready(boot)
+		}
+	}
+	if got := h.s.state.data.VMs[v.ID].VM; got.State != api.VMReady || got.Generation != 4 {
+		t.Fatalf("recovery did not finish: %+v", got)
+	}
+}
+
+func TestHealedHostRestoresReplacementBeforeDemand(t *testing.T) {
+	h := newHarness(t)
+	h.register("a", "r1", 1)
+	h.register("b", "r2", 1)
+	v := h.create("recovery", "batch")
+	h.ready(v)
+	other := h.create("occupied", "standard")
+	h.ready(other)
+	demand := h.create("queued", "interactive")
+	h.c.Advance(h.s.cfg.HostLeaseTTL + h.s.cfg.HostLostGrace)
+	h.agent("b", "r2", api.HostHeartbeat{HostID: "b", Seq: 1, Inventory: []api.InventoryItem{{VMID: other.ID, Generation: other.Generation, State: api.VMReady}}})
+	h.step(tick{})
+	if got := h.s.state.data.Queue[v.ID]; got.Reason != api.QueueReplace {
+		t.Fatalf("host loss did not queue replacement: %+v", got)
+	}
+	h.register("a", "r1", 1)
+	got := h.s.state.data.VMs[v.ID].VM
+	if got.State != api.VMBooting || got.HostID != "a" || got.Generation != v.Generation+1 || h.s.state.data.VMs[demand.ID].VM.State != api.VMPending {
+		t.Fatalf("healed slot stolen: recovery=%+v demand=%+v", got, h.s.state.data.VMs[demand.ID].VM)
+	}
+}
+
+func TestHealedHostNoLongerAvoidedAfterLoss(t *testing.T) {
+	h := newHarness(t)
+	h.register("a", "r1", 1)
+	v := h.create("recovery", "batch")
+	h.ready(v)
+	h.c.Advance(h.s.cfg.HostLeaseTTL + h.s.cfg.HostLostGrace)
+	h.step(tick{})
+	// Keep the replacement queued across recovery, then expose two equally
+	// suitable hosts. The healed host must participate in normal spreading
+	// again, rather than remaining only a last-resort fallback.
+	q := h.s.state.data.Queue[v.ID]
+	q.NotBefore = h.c.Now().Add(time.Second).UnixMilli()
+	h.s.state.data.Queue[v.ID] = q
+	h.register("a", "r1", 1)
+	h.register("b", "r1", 1)
+	demand := h.create("queued", "interactive")
+	h.c.Advance(time.Second)
+	h.step(tick{})
+	got := h.s.state.data.VMs[v.ID].VM
+	if got.HostID != "a" || got.Generation != v.Generation+1 || got.State != api.VMBooting {
+		t.Fatalf("healed host still avoided: %+v", got)
+	}
+	if got := h.s.state.data.VMs[demand.ID].VM; got.State != api.VMBooting || got.HostID != "b" {
+		t.Fatalf("demand did not follow replacement: %+v", got)
+	}
+}
+
 func TestQuarantinedStopCannotBecomeReplacement(t *testing.T) {
 	for _, state := range []api.VMState{api.VMReady, api.VMUnhealthy} {
 		t.Run(string(state), func(t *testing.T) {
