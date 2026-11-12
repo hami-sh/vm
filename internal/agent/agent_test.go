@@ -534,7 +534,7 @@ func TestBlockedGuestLeaseExpiry(t *testing.T) {
 				if recent {
 					return len(s.Inventory) == 1 && s.Inventory[0].State == api.VMFailed
 				}
-				return len(s.Actual) == 0 && len(s.Inventory) == 0
+				return len(s.Actual) == 0 && len(s.Inventory) == 1 && s.Inventory[0].State == api.VMUnhealthy
 			})
 			if recent {
 				if len(s.Actual) != 0 || s.Inventory[0].State != api.VMFailed {
@@ -595,7 +595,9 @@ func TestRecycleRecoversLostGuestRegistration(t *testing.T) {
 	h := newHarness(t)
 	h.boot("a", 1)
 	h.d.KillGuest("a")
-	h.until(func(s agent.Snapshot) bool { return len(s.Actual) == 0 && len(s.Inventory) == 0 })
+	h.until(func(s agent.Snapshot) bool {
+		return len(s.Actual) == 0 && len(s.Inventory) == 1 && s.Inventory[0].State == api.VMUnhealthy
+	})
 	placed := h.c.Now()
 	h.send(start("a", 2))
 	h.until(func(s agent.Snapshot) bool {
@@ -960,8 +962,8 @@ func TestGuestLeaseStopsWithoutSchedulerDelivery(t *testing.T) {
 				h.step(100 * time.Millisecond)
 			}
 			s := h.snapshot()
-			if len(s.Actual) != 0 || len(s.Inventory) != 0 {
-				t.Fatalf("expired guest still occupies driver/inventory without scheduler delivery: %+v", s)
+			if len(s.Actual) != 0 || len(s.Inventory) != 1 || s.Inventory[0].State != api.VMUnhealthy || s.Host.Slots[0].State != api.SlotReleasing {
+				t.Fatalf("expired guest must be stopped but retain Unhealthy inventory and capacity: %+v", s)
 			}
 			unhealthy, stopped := false, false
 			for _, m := range h.messages {
@@ -972,16 +974,15 @@ func TestGuestLeaseStopsWithoutSchedulerDelivery(t *testing.T) {
 					stopped = stopped || r.VMID == "a" && r.Generation == 1 && r.Reason == api.ReasonGuestLease
 				}
 			}
-			if unhealthy != !loseReports || stopped != !loseReports {
+			if unhealthy != !loseReports || stopped {
 				t.Fatalf("unexpected lease reports: unhealthy=%v stopped=%v lost=%v", unhealthy, stopped, loseReports)
 			}
-			// Even when both reports were lost, a healed inventory shows
-			// the missing copy, so the stub scheduler can recover it.
+			// Lost reports/acks cannot erase the in-place recovery signal.
 			h.n.PartitionOneWay(h.host, h.scheduler.Addr(), false)
 			before := len(h.messages)
 			h.until(func(agent.Snapshot) bool {
 				for _, m := range h.messages[before:] {
-					if hb, ok := m.(api.HostHeartbeat); ok && len(hb.Inventory) == 0 {
+					if hb, ok := m.(api.HostHeartbeat); ok && len(hb.Inventory) == 1 && hb.Inventory[0].State == api.VMUnhealthy {
 						return true
 					}
 				}
@@ -991,6 +992,43 @@ func TestGuestLeaseStopsWithoutSchedulerDelivery(t *testing.T) {
 			h.send(start("a", 2))
 			h.until(func(s agent.Snapshot) bool { return ready(s, "a", 2) })
 		})
+	}
+}
+
+func TestGuestLeaseHoldRequiresMatchingAck(t *testing.T) {
+	h := newHarness(t)
+	cmd := start("a", 1)
+	cmd.IdempotencyKey, cmd.RequestHash = "lease-key", "lease-hash"
+	h.send(cmd)
+	h.until(func(s agent.Snapshot) bool { return ready(s, "a", 1) })
+	h.d.KillGuest("a")
+	h.until(func(s agent.Snapshot) bool {
+		return len(s.Actual) == 0 && len(s.Inventory) == 1 && s.Inventory[0].State == api.VMUnhealthy
+	})
+	h.boot("b", 1)
+	h.send(api.StopVM{VMID: "a", Generation: 1, Epoch: 1, Reason: api.ReasonDeleted})
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 0, Stale: []api.InventoryItem{{VMID: "a", Generation: 1}}})
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 1, Stale: []api.InventoryItem{{VMID: "a", Generation: 0}, {VMID: "a", Generation: 2}}})
+	h.send(start("c", 1))
+	s := h.until(func(agent.Snapshot) bool {
+		for _, m := range h.messages {
+			if r, ok := m.(api.StartVMResult); ok && r.VMID == "c" {
+				if r.Admitted || r.Reason != "full" {
+					t.Fatalf("unacknowledged hold lost capacity: %+v", r)
+				}
+				return true
+			}
+		}
+		return false
+	})
+	want := api.InventoryItem{VMID: "a", Generation: 1, State: api.VMUnhealthy, Pool: cmd.Spec.Pool, IdempotencyKey: cmd.IdempotencyKey, RequestHash: cmd.RequestHash}
+	if len(s.Actual) != 1 || len(s.Inventory) != 2 || s.Inventory[0] != want {
+		t.Fatalf("stop or non-matching ack erased the stopped recovery hold: %+v", s)
+	}
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 1, Stale: []api.InventoryItem{{VMID: "a", Generation: 1}}})
+	h.boot("c", 1)
+	if s := h.snapshot(); len(s.Inventory) != 2 || !ready(s, "b", 1) {
+		t.Fatalf("matching ack did not release only the held slot: %+v", s)
 	}
 }
 
@@ -1018,6 +1056,7 @@ func TestGuestLeaseReleaseRetainsCapacityAndPendingStart(t *testing.T) {
 		t.Fatalf("expired guest was not releasing locally: %+v", s)
 	}
 	h.send(start("a", 2))
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 1, Stale: []api.InventoryItem{{VMID: "a", Generation: 1}}})
 	h.send(start("c", 1))
 	h.until(func(agent.Snapshot) bool {
 		for _, m := range h.messages {
@@ -1050,7 +1089,9 @@ func TestGuestLeaseAndControlPlaneOutage(t *testing.T) {
 		}
 	}
 	h.d.KillGuest("a")
-	h.until(func(s agent.Snapshot) bool { return len(s.Actual) == 0 && len(s.Inventory) == 0 })
+	h.until(func(s agent.Snapshot) bool {
+		return len(s.Actual) == 0 && len(s.Inventory) == 1 && s.Inventory[0].State == api.VMUnhealthy
+	})
 	h.n.PartitionRack("r1", false)
 	h.send(start("a", 2))
 	h.until(func(s agent.Snapshot) bool { return ready(s, "a", 2) })

@@ -25,6 +25,7 @@ type instance struct {
 	cancel    context.CancelFunc
 	bootDone  chan struct{}
 	recovered bool
+	stopped   bool
 	pending   *api.StartVM
 	reason    string
 }
@@ -260,11 +261,13 @@ func (a *Agent) start(now time.Time, m api.StartVM) []Effect {
 		if m.Generation == v.start.Generation {
 			return []Effect{a.result(m, v.slot != api.SlotReleasing, api.ReasonStale)}
 		}
-		if v.pending == nil || m.Generation > v.pending.Generation {
-			copy := m
-			v.pending = &copy
+		if !v.stopped {
+			if v.pending == nil || m.Generation > v.pending.Generation {
+				copy := m
+				v.pending = &copy
+			}
+			return a.release(v, api.ReasonStale)
 		}
-		return a.release(v, api.ReasonStale)
 	}
 	if m.Generation <= a.highest[m.VMID] {
 		return []Effect{a.result(m, false, api.ReasonStale)}
@@ -275,7 +278,7 @@ func (a *Agent) start(now time.Time, m api.StartVM) []Effect {
 	if a.diskFull() {
 		return []Effect{a.result(m, false, "disk_full")}
 	}
-	if len(a.vms) >= min(2, a.cfg.SlotsPerHost) {
+	if a.vms[m.VMID] == nil && len(a.vms) >= min(2, a.cfg.SlotsPerHost) {
 		return []Effect{a.result(m, false, "full")}
 	}
 	bootCtx, cancel := context.WithCancel(a.ctx)
@@ -298,12 +301,18 @@ func (a *Agent) start(now time.Time, m api.StartVM) []Effect {
 	}}}
 }
 func (a *Agent) release(v *instance, reason string) []Effect {
+	if v.stopped {
+		return []Effect{a.report(api.StoppedReport{HostID: a.ep.Addr().ID, VMID: v.start.VMID, Generation: v.start.Generation, Reason: reason})}
+	}
 	if v.slot == api.SlotReleasing {
 		return nil
 	}
 	v.cancel()
 	v.slot = api.SlotReleasing
 	v.state = api.VMTerminating
+	if reason == api.ReasonGuestLease {
+		v.state = api.VMUnhealthy
+	}
 	v.reason = reason
 	id, gen, done := v.start.VMID, v.start.Generation, v.bootDone
 	revision := a.revision
@@ -396,7 +405,17 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 				for _, stale := range cmd.Stale {
 					delete(a.quarantined, vmGeneration{stale.VMID, stale.Generation})
 					if v := a.vms[stale.VMID]; v != nil && v.start.Generation <= stale.Generation {
-						out = append(out, a.release(v, api.ReasonStale)...)
+						if v.reason == api.ReasonGuestLease && v.start.Generation == stale.Generation {
+							if v.stopped {
+								delete(a.vms, stale.VMID)
+							} else {
+								// Acknowledge now, but retain capacity until Stop finishes.
+								v.reason = api.ReasonStale
+								v.state = api.VMTerminating
+							}
+						} else {
+							out = append(out, a.release(v, api.ReasonStale)...)
+						}
 					}
 				}
 				return out
@@ -467,6 +486,17 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 			if m.err != nil {
 				return nil
 			} // Never reclaim a disk whose cleanup failed.
+			if v.reason == api.ReasonGuestLease {
+				// Driver cleanup is complete, but the slot and Unhealthy inventory
+				// remain until a newer start or matching Stale acknowledgment.
+				// A StoppedReport here would prematurely free scheduler capacity.
+				v.stopped = true
+				if pending := v.pending; pending != nil {
+					v.pending = nil
+					return a.start(now, *pending)
+				}
+				return nil
+			}
 			delete(a.vms, m.id)
 			if v.reason == api.ReasonQuarantined {
 				a.quarantined[vmGeneration{m.id, m.gen}] = api.InventoryItem{VMID: m.id, Generation: m.gen, State: api.VMFailed, Pool: v.start.Spec.Pool, IdempotencyKey: v.start.IdempotencyKey, RequestHash: v.start.RequestHash}
