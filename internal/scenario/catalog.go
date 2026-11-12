@@ -439,6 +439,10 @@ func addRack(rack string) Action {
 	}
 }
 func unavailableCreate(ctx context.Context, f System) error {
+	// This is an explicit negative probe, not a client trying to create work.
+	if client, ok := f.(*scriptedClient); ok {
+		f = client.System
+	}
 	_, err := f.CreateVM(ctx, "during-outage", api.CreateVMRequest{Pool: "ios-xcode16-m"})
 	if e, ok := err.(*api.Error); ok && e.Status == 503 {
 		return nil

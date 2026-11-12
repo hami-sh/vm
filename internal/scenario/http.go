@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -51,10 +52,11 @@ func (f *HTTPSystem) request(ctx context.Context, method, path, key string, in, 
 	if resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		var detail api.ErrorResponse
+		retryAfter, _ := strconv.Atoi(resp.Header.Get("Retry-After"))
 		if json.Unmarshal(b, &detail) == nil && detail.Error != "" {
-			return &api.Error{Status: resp.StatusCode, Msg: detail.Error, RetryAfterS: detail.RetryAfterS}
+			return &api.Error{Status: resp.StatusCode, Msg: detail.Error, RetryAfterS: max(retryAfter, detail.RetryAfterS)}
 		}
-		return &api.Error{Status: resp.StatusCode, Msg: string(b)}
+		return &api.Error{Status: resp.StatusCode, Msg: string(b), RetryAfterS: retryAfter}
 	}
 	if out != nil {
 		return json.NewDecoder(resp.Body).Decode(out)

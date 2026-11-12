@@ -3,6 +3,7 @@ package scenario
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -142,6 +143,8 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 		return report, e
 	}
 	defer closeFleet()
+	scripts := &scriptedClient{System: f, speed: speed}
+	defer func() { report.Checks = append(report.Checks, scripts.failures...) }()
 	rawSnapshots, rawEvents, cancel := f.Subscribe()
 	defer cancel()
 	// Drain the fleet while a synchronous action (e.g. a 60-create flood)
@@ -217,15 +220,18 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 	next := 0
 	// Time-zero injections (e.g. hang-next-boot) must precede initial load.
 	for next < len(steps) && steps[next].At == 0 {
-		if e := steps[next].Do(ctx, f); e != nil {
+		if e := steps[next].Do(ctx, scripts); e != nil && !errors.Is(e, errScriptedUnavailable) {
 			return report, e
 		}
 		next++
 	}
 	cohort := map[string]bool{}
 	for i := 0; i < s.Load.Count; i++ {
-		created, e := f.CreateVM(ctx, fmt.Sprintf("seed-%d-%d", seed, i), api.CreateVMRequest{Pool: "ios-xcode16-m", Priority: s.Load.Priority})
+		created, e := scripts.CreateVM(ctx, fmt.Sprintf("seed-%d-%d", seed, i), api.CreateVMRequest{Pool: "ios-xcode16-m", Priority: s.Load.Priority})
 		if e != nil {
+			if errors.Is(e, errScriptedUnavailable) {
+				continue
+			}
 			return report, e
 		}
 		cohort[created.ID] = true
@@ -241,6 +247,10 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 	}
 	report.Checks = results
 	lost := map[string]int64{}
+	everReady := map[string]bool{}
+	for _, v := range initial.VMs {
+		everReady[v.ID] = v.State == api.VMReady
+	}
 	createdAt := map[string]int64{}
 	firstReady := map[string]int64{}
 	var recoveries []int64
@@ -267,6 +277,9 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 			report.Markers = append(report.Markers, ev)
 		}
 		if ev.Kind == api.EventTransition {
+			if ev.To == api.VMReady {
+				everReady[ev.VMID] = true
+			}
 			if ev.To == api.VMReady && cohort[ev.VMID] {
 				if _, ok := firstReady[ev.VMID]; !ok {
 					firstReady[ev.VMID] = ev.At
@@ -312,6 +325,9 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 				return report, e
 			}
 			for _, v := range snap.VMs {
+				if v.State == api.VMReady {
+					everReady[v.ID] = true
+				}
 				if cohort[v.ID] {
 					if _, ok := createdAt[v.ID]; !ok {
 						createdAt[v.ID] = v.CreatedAt
@@ -324,7 +340,7 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 			elapsed := time.Duration(snap.At-origin) * time.Millisecond
 			for next < len(steps) && elapsed >= steps[next].At {
 				step := steps[next]
-				if e := step.Do(ctx, f); e != nil {
+				if e := step.Do(ctx, scripts); e != nil && !errors.Is(e, errScriptedUnavailable) {
 					return report, fmt.Errorf("at %s: %w", step.At, e)
 				}
 				marker := api.Event{Seq: snap.Seq, At: snap.At, Kind: api.EventChaos, Detail: fmt.Sprintf("scenario %s step %d", s.Name, next)}
@@ -389,7 +405,18 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 						delete(lost, v.ID)
 					}
 				}
-				report.Metrics["recovery_failures"] = float64(len(lost))
+				if s.Name == "bad-day" {
+					neverReadyLost := 0
+					for id := range lost {
+						if !everReady[id] {
+							neverReadyLost++
+						}
+					}
+					report.Metrics["never_ready_lost"] = float64(neverReadyLost)
+					report.Metrics["recovery_failures"] = float64(len(lost) - neverReadyLost)
+				} else {
+					report.Metrics["recovery_failures"] = float64(len(lost))
+				}
 				report.Metrics["recovery_samples"] = float64(len(recoveries))
 				// Target attainment is evidence, never a pass/fail check. Count
 				// only first Ready for the initial interactive cohort; lost or

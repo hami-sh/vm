@@ -110,6 +110,8 @@ Rack spreading reduces correlated loss; reserve headroom operationally if a rack
 
 An accepted create still Booting when its rack dies is re-queued as ordinary demand and can be shed when the queue is full; the herd reports keep this visible as `recovery_failures=1` (deferred review finding 19).
 
+Bad-day gates recovery of previously Ready VMs; never-Ready losses remain visible separately as `never_ready_lost`, while `recovery_failures` counts unresolved losses of previously Ready VMs. Scripted client requests retry 503/429 responses with Retry-After for at most AmbientHealAfter + BootDeadline; exhaustion fails the recording with “scripted action could not reach scheduler” while retaining final metrics. Post-restart admission deadlines start at the successful durable deletion, not its scheduled attempt.
+
 ## Simulated versus real
 
 Railway runs a Linux container, **not macOS VMs**. The fake hypervisor models boots, crashes, leases and failure injection on Go goroutines. Real macOS boots take roughly 30–60 seconds, not the shortened simulation timings. Tart / Virtualization.framework integration requires Apple hardware and real guest readiness plumbing. Apple's macOS licence generally permits up to two additional virtual instances on qualifying Apple hardware; check the applicable licence before deployment.

@@ -16,8 +16,98 @@ import (
 	"time"
 
 	"github.com/hami-sh/vm/internal/api"
+	"github.com/hami-sh/vm/internal/clock"
 	"github.com/hami-sh/vm/internal/config"
 )
+
+// Only short retry timers advance automatically; the supervision watchdog
+// remains armed. This keeps Retry-After/budget boundary tests deterministic.
+type retryClock struct{ *clock.Fake }
+
+func (c retryClock) NewTimer(d time.Duration) clock.Timer {
+	timer := c.Fake.NewTimer(d)
+	if d < time.Second {
+		c.Advance(d)
+	}
+	return timer
+}
+
+func TestScriptedClientRetriesWithoutAbortingRecording(t *testing.T) {
+	for _, status := range []int{429, 503} {
+		for _, exhausted := range []bool{false, true} {
+			t.Run(fmt.Sprintf("status%d/exhausted%t", status, exhausted), func(t *testing.T) {
+				previous := WallClock
+				c := retryClock{clock.NewFake(time.Unix(0, 0))}
+				WallClock = c
+				defer func() { WallClock = previous }()
+				var attempts []time.Time
+				firstDeletes := 0
+				f := &fakeFleet{initial: snapshot(0, api.VMReady), frames: []api.Snapshot{snapshot(1000, api.VMReady), snapshot(90000, api.VMReady)}}
+				f.delete = func(id string) (api.VM, error) {
+					if id == "a" {
+						firstDeletes++
+						return api.VM{ID: id}, nil
+					}
+					attempts = append(attempts, c.Now())
+					if exhausted || len(attempts) < 3 {
+						return api.VM{}, &api.Error{Status: status, Msg: "temporarily unavailable", RetryAfterS: 7}
+					}
+					return api.VM{ID: id}, nil
+				}
+				s := Scenario{Name: "scripted-retry", Topology: Topology{1, 1, 2}, Duration: 90 * time.Second,
+					Timeline: []Step{{time.Second, func(ctx context.Context, f System) error {
+						if _, err := f.DeleteVM(ctx, "a"); err != nil {
+							return err
+						}
+						_, err := f.DeleteVM(ctx, "b")
+						return err
+					}}}, Expect: []Check{Always("invariants", NoInvariantViolations), Metric("recovery_failures", 1)}}
+				dir := t.TempDir()
+				r, err := Run(context.Background(), s, func(context.Context, Scenario, int64, float64) (System, func(), error) { return f, func() {}, nil }, 1, 1000, dir)
+				if err != nil || r.Passed == exhausted || firstDeletes != 1 {
+					t.Fatalf("report=%+v firstDeletes=%d err=%v", r, firstDeletes, err)
+				}
+				for i := 1; i < len(attempts); i++ {
+					if attempts[i].Sub(attempts[i-1]) != 7*time.Millisecond {
+						t.Fatal("Retry-After not honoured", attempts)
+					}
+				}
+				if exhausted {
+					if c.Now().Sub(attempts[0]) != 25*time.Millisecond || len(attempts) != 4 || r.Checks[len(r.Checks)-1].Name != "scripted action could not reach scheduler" {
+						t.Fatalf("retry budget/report: times=%v checks=%+v", attempts, r.Checks)
+					}
+				}
+				var metrics map[string]float64
+				b, _ := os.ReadFile(filepath.Join(dir, "metrics.json"))
+				if json.Unmarshal(b, &metrics) != nil {
+					t.Fatal("missing metrics")
+				}
+				if _, ok := metrics["recovery_failures"]; !ok {
+					t.Fatal("exhausted script aborted recording", metrics)
+				}
+			})
+		}
+	}
+}
+
+func TestBadDayReportsNeverReadyLossWithoutHidingReadyLoss(t *testing.T) {
+	for _, readyLost := range []bool{false, true} {
+		initial, final := snapshot(0, api.VMReady), snapshot(90000, api.VMReady)
+		initial.VMs = append(initial.VMs, api.VM{ID: "booting", State: api.VMBooting, Desired: api.DesiredRunning})
+		final.VMs = append(final.VMs, api.VM{ID: "booting", State: api.VMFailed, Desired: api.DesiredRunning, LastReason: api.ReasonShed})
+		events := []api.Event{{Kind: api.EventTransition, VMID: "booting", At: 10000, From: api.VMBooting, To: api.VMLost}}
+		if readyLost {
+			final.VMs[0].State = api.VMPending
+			events = append(events, api.Event{Kind: api.EventTransition, VMID: "vm-1", At: 20000, From: api.VMReady, To: api.VMLost})
+		}
+		f := &fakeFleet{initial: initial, frames: []api.Snapshot{initial, final}, events: events}
+		s := Scenario{Name: "bad-day", Topology: Topology{1, 1, 2}, Duration: 90 * time.Second, Expect: []Check{Metric("recovery_failures", 1)}}
+		r, err := Run(context.Background(), s, func(context.Context, Scenario, int64, float64) (System, func(), error) { return f, func() {}, nil }, 1, 5, t.TempDir())
+		if err != nil || r.Passed == readyLost || r.Metrics["never_ready_lost"] != 1 || r.Metrics["recovery_failures"] != map[bool]float64{false: 0, true: 1}[readyLost] {
+			t.Fatalf("readyLost=%t report=%+v err=%v", readyLost, r, err)
+		}
+	}
+}
 
 func TestBadDayPostRestartAdmission(t *testing.T) {
 	for _, fault := range []string{"", "late placement", "lower class", "wrong host", "no final Ready", "unrelated loss"} {
@@ -671,9 +761,13 @@ type fakeFleet struct {
 	events  []api.Event
 	create  func(string) (api.CreateVMResponse, error)
 	get     func(string) (api.VM, error)
+	delete  func(string) (api.VM, error)
 }
 
 func (f *fakeFleet) Latest() api.Snapshot { return f.initial }
+func (f *fakeFleet) DeleteVM(_ context.Context, id string) (api.VM, error) {
+	return f.delete(id)
+}
 func (f *fakeFleet) Do(context.Context, string, api.ChaosRequest) (api.ChaosResult, error) {
 	return api.ChaosResult{}, nil
 }
@@ -838,16 +932,21 @@ func TestSuiteSeedsAndCalibration(t *testing.T) {
 }
 
 func TestHTTPCreatePreservesAdmissionBackoff(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = w.Write([]byte(`{"error":"mutation rate limit","retry_after_s":1}`))
-	}))
-	defer server.Close()
-	f := &HTTPSystem{URL: server.URL, Client: server.Client()}
-	_, err := f.CreateVM(context.Background(), "k", api.CreateVMRequest{Pool: "ios-xcode16-m"})
-	e, ok := err.(*api.Error)
-	if !ok || e.Status != 429 || e.RetryAfterS != 1 || e.Msg != "mutation rate limit" {
-		t.Fatalf("lost server backoff: %v", err)
+	for header, want := range map[string]int{"": 1, "5": 5} {
+		t.Run(header, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Retry-After", header)
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"error":"mutation rate limit","retry_after_s":1}`))
+			}))
+			defer server.Close()
+			f := &HTTPSystem{URL: server.URL, Client: server.Client()}
+			_, err := f.CreateVM(context.Background(), "k", api.CreateVMRequest{Pool: "ios-xcode16-m"})
+			e, ok := err.(*api.Error)
+			if !ok || e.Status != 429 || e.RetryAfterS != want || e.Msg != "mutation rate limit" {
+				t.Fatalf("lost server backoff: %v", err)
+			}
+		})
 	}
 }
 
