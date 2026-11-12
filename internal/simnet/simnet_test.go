@@ -2,7 +2,6 @@ package simnet_test
 
 import (
 	"errors"
-	"runtime"
 	"testing"
 	"time"
 
@@ -112,15 +111,8 @@ func TestFaultsAndPayloadIsolation(t *testing.T) {
 	msg.Stale[0].VMID = "mutated"
 	empty(h)
 	c.Advance(2 * time.Second)
-	for range 10000 {
-		runtime.Gosched()
-		if len(h.Inbox()) == 2 {
-			break
-		}
-	}
-	if len(h.Inbox()) != 2 {
-		t.Fatalf("delayed duplicates not delivered: %d", len(h.Inbox()))
-	}
+	// Advancing the clock makes packets due, not the network goroutine
+	// finished. Synchronize on delivery instead of counting scheduler yields.
 	for range 2 {
 		e := <-h.Inbox()
 		if e.Msg.(api.HeartbeatAck).Stale[0].VMID != "original" {
@@ -143,15 +135,6 @@ func TestReorderWithoutLatency(t *testing.T) {
 		}
 	}
 	c.Advance(cfg.InvariantEvery)
-	for range 10000 {
-		runtime.Gosched()
-		if len(h.Inbox()) == 20 {
-			break
-		}
-	}
-	if len(h.Inbox()) != 20 {
-		t.Fatal("reordered traffic not delivered")
-	}
 	ordered := true
 	for i := range 20 {
 		if (<-h.Inbox()).Msg.(int) != i {
