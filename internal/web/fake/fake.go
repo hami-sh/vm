@@ -74,6 +74,7 @@ func Catalog() api.ChaosCatalog {
 			a("impostor-register", "Impostor register", "guest", api.TargetVM, false),
 			a("delete", "Delete VM", "guest", api.TargetVM, false),
 			a("reset", "Reset fleet", "control", api.TargetGlobal, false),
+			a("noise", "Ambient chaos", "ambient", api.TargetGlobal, false, "intensity"),
 		},
 		Presets: []api.ChaosAction{
 			a("split-brain", "Split brain", "", api.TargetGlobal, false),
