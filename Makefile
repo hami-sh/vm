@@ -16,6 +16,7 @@ fixture:
 run:
 	go run ./cmd/controlplane
 
-# The one command. W5 extends it with `vmctl verify --repeat 20` and the
-# end-to-end test once they exist; until then it is vet + race tests.
+# This gate intentionally fails against a health-only server stub.
 verify: vet test
+	go run ./cmd/vmctl verify --repeat 20
+	go run ./cmd/vmctl e2e
