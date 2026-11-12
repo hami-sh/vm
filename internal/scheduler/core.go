@@ -28,7 +28,7 @@ func (s *Scheduler) handle(now time.Time, msg any) []Effect {
 	switch m := msg.(type) {
 	case request:
 		e.reply = m.reply
-		if p.down && m.op != "down" && m.op != "snapshot" && m.op != "metrics" {
+		if p.down && m.op != "down" && m.op != "snapshot" && m.op != "metrics" && m.op != "events" {
 			e.response.err = &api.Error{Status: 503, Msg: "scheduler down", RetryAfterS: s.retryAfter()}
 			break
 		}
@@ -64,6 +64,9 @@ func (p *planner) move(id string, to api.VMState, reason string) {
 	if err != nil {
 		panic(err)
 	}
+	if to != api.VMBooting {
+		r.Deadline = 0
+	}
 	p.data.VMs[id] = r
 	p.event(e)
 }
@@ -71,9 +74,9 @@ func (p *planner) event(e api.Event) {
 	p.seq++
 	e.Seq = p.seq
 	p.effect.events = append(p.effect.events, e)
-	p.recent = append(p.recent, e)
-	if len(p.recent) > p.cfg.RecentEventLimit {
-		p.recent = p.recent[len(p.recent)-p.cfg.RecentEventLimit:]
+	p.events = append(p.events, e)
+	if len(p.events) > p.cfg.EventRetention {
+		p.events = p.events[len(p.events)-p.cfg.EventRetention:]
 	}
 }
 func (p *planner) log(kind api.EventKind, id, host, detail string) {
@@ -129,6 +132,11 @@ func (p *planner) request(r request) result {
 		return result{value: p.snapshot()}
 	case "metrics":
 		return result{value: p.prometheus()}
+	case "events":
+		after := r.arg.(int64)
+		start := sort.Search(len(p.events), func(i int) bool { return p.events[i].Seq > after })
+		truncated := len(p.events) > 0 && after < p.events[0].Seq-1
+		return result{value: eventResult{events: append([]api.Event{}, p.events[start:]...), truncated: truncated}}
 	case "delete":
 		r, ok := p.data.VMs[r.id]
 		if !ok {

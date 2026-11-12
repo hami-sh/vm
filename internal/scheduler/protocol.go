@@ -249,6 +249,11 @@ func (p *planner) reconcile(hostID string, inventory []api.InventoryItem, strict
 					p.move(v.ID, api.VMBooting, "adopt higher generation")
 				}
 			}
+			r = p.data.VMs[v.ID]
+			if r.VM.State != api.VMBooting {
+				r.Deadline = 0
+				p.data.VMs[v.ID] = r
+			}
 			v = p.data.VMs[v.ID].VM
 		}
 		claim := p.claims[v.ID]
@@ -271,6 +276,10 @@ func (p *planner) reconcile(hostID string, inventory []api.InventoryItem, strict
 		}
 		p.claims[v.ID] = hostID
 		seen[v.ID] = true
+		if res, ok := p.reservations[v.ID]; ok && res.gen == i.Generation {
+			res.admitted = true
+			p.reservations[v.ID] = res
+		}
 		if i.State == api.VMReady && p.data.VMs[v.ID].VM.State == api.VMBooting {
 			p.ready(v.ID)
 		}

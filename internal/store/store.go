@@ -171,7 +171,7 @@ func (s *Store) Start(ctx context.Context) (Data, int64, error) {
 
 // Commit writes changed intent and its audit trail in one transaction. Every
 // update compares the previous generation; no command is sent on CAS failure.
-func (s *Store) Commit(ctx context.Context, before, after Data, events []api.Event) error {
+func (s *Store) Commit(ctx context.Context, before, after Data, events []api.Event, retention int) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -254,7 +254,7 @@ func (s *Store) Commit(ctx context.Context, before, after Data, events []api.Eve
 			return fmt.Errorf("event: %w", err)
 		}
 	}
-	_, err = tx.ExecContext(ctx, "DELETE FROM events WHERE seq <= (SELECT max(seq)-? FROM events)", config.Default().EventRetention)
+	_, err = tx.ExecContext(ctx, "DELETE FROM events WHERE seq <= (SELECT max(seq)-? FROM events)", retention)
 	if err != nil {
 		return err
 	}

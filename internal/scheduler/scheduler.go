@@ -58,7 +58,7 @@ type state struct {
 	epoch        int64
 	counters     api.Counters
 	metrics      metrics
-	recent       []api.Event
+	events       []api.Event
 	seq          int64
 }
 
@@ -94,7 +94,7 @@ func New(ctx context.Context, cfg config.Config, c clock.Clock, transport api.Tr
 		return nil, err
 	}
 	s := &Scheduler{cfg: cfg, clock: c, store: db, endpoint: ep, inbox: make(chan request, cfg.MaxVMs), done: make(chan struct{})}
-	s.state = newState(d, epoch, c.Now())
+	s.state = newState(d, epoch, c.Now(), cfg)
 	s.state.fresh = db.Fresh()
 	if s.state.fresh {
 		s.state.recoverUntil = c.Now().Add(cfg.HostLeaseTTL).UnixMilli()
@@ -106,20 +106,22 @@ func New(ctx context.Context, cfg config.Config, c clock.Clock, transport api.Tr
 	}
 	if len(events) > 0 {
 		s.state.seq = events[len(events)-1].Seq
-		if len(events) > cfg.RecentEventLimit {
-			events = events[len(events)-cfg.RecentEventLimit:]
+		if len(events) > cfg.EventRetention {
+			events = events[len(events)-cfg.EventRetention:]
 		}
-		s.state.recent = events
+		s.state.events = events
 	}
 	go s.run(ctx)
 	return s, nil
 }
 
-func newState(d store.Data, epoch int64, now time.Time) *state {
+func newState(d store.Data, epoch int64, now time.Time, cfg config.Config) *state {
 	s := &state{data: d, epoch: epoch, hosts: map[string]host{}, reservations: map[string]reservation{}, exclude: map[string]string{}, recovering: map[string]int64{}, replacement: map[string]bool{}, claims: map[string]string{}, metrics: newMetrics()}
 	s.counters.Recoveries = map[string]int{}
 	for id, h := range d.Hosts {
-		s.hosts[id] = host{record: h, lease: api.LeaseSuspect, last: now.UnixMilli()}
+		// These leases are already Suspect: only the fresh lost-grace period
+		// remains, not another healthy TTL followed by that grace period.
+		s.hosts[id] = host{record: h, lease: api.LeaseSuspect, last: now.Add(-cfg.HostLeaseTTL).UnixMilli()}
 	}
 	return s
 }
@@ -139,7 +141,8 @@ func (st *state) clone() *state {
 	n.claims = maps.Clone(st.claims)
 	n.counters.Recoveries = maps.Clone(st.counters.Recoveries)
 	n.metrics = st.metrics.clone()
-	n.recent = append([]api.Event(nil), st.recent...)
+	// Events are append-only; existing elements are never rewritten. Sharing
+	// that prefix avoids copying the retained audit log on every query/tick.
 	return &n
 }
 
@@ -169,7 +172,9 @@ func (s *Scheduler) run(ctx context.Context) {
 			if !reflect.DeepEqual(s.state.data, e.next.data) || len(e.events) > 0 {
 				completed := make(chan error, 1)
 				before, after, events := s.state.data, e.next.data, e.events
-				actor.Work(ctx, completed, func(ctx context.Context) error { return s.store.Commit(ctx, before, after, events) })
+				actor.Work(ctx, completed, func(ctx context.Context) error {
+					return s.store.Commit(ctx, before, after, events, s.cfg.EventRetention)
+				})
 				select {
 				case <-ctx.Done():
 					return
@@ -296,3 +301,18 @@ func (s *Scheduler) SetHostAdmin(ctx context.Context, id string, a api.AdminStat
 	return e
 }
 func (s *Scheduler) Done() <-chan struct{} { return s.done }
+
+type eventResult struct {
+	events    []api.Event
+	truncated bool
+}
+
+// EventsSince provides the retained audit log, independently of the UI tail.
+func (s *Scheduler) EventsSince(ctx context.Context, afterSeq int64) ([]api.Event, bool, error) {
+	v, e := s.call(ctx, request{op: "events", arg: afterSeq})
+	if e != nil {
+		return nil, false, e
+	}
+	r := v.(eventResult)
+	return r.events, r.truncated, nil
+}

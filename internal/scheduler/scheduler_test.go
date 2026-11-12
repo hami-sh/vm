@@ -38,14 +38,14 @@ func newHarness(t *testing.T) *harness {
 	if e != nil {
 		t.Fatal(e)
 	}
-	s := &Scheduler{cfg: config.Default(), clock: c, store: db, state: newState(d, epoch, c.Now())}
+	s := &Scheduler{cfg: config.Default(), clock: c, store: db, state: newState(d, epoch, c.Now(), config.Default())}
 	s.state.fresh = true
 	return &harness{t, s, c, db}
 }
 func (h *harness) step(msg any) Effect {
 	h.t.Helper()
 	e := h.s.handle(h.c.Now(), msg)[0]
-	if err := h.db.Commit(context.Background(), h.s.state.data, e.next.data, e.events); err != nil {
+	if err := h.db.Commit(context.Background(), h.s.state.data, e.next.data, e.events, h.s.cfg.EventRetention); err != nil {
 		h.t.Fatal(err)
 	}
 	h.s.state = e.next
@@ -792,5 +792,130 @@ func TestAdoptedIdempotencyKeyChoosesHighestGeneration(t *testing.T) {
 				t.Fatal("recovered key claim not persisted")
 			}
 		})
+	}
+}
+
+func TestEventsSinceRetentionAndRestart(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cfg := config.Default()
+	cfg.EventRetention = 80
+	c := clock.NewFake(time.Unix(1000, 0))
+	net := &testNetwork{}
+	path := filepath.Join(t.TempDir(), "events.db")
+	db, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, kill := context.WithCancel(ctx)
+	defer kill()
+	s, err := New(runCtx, cfg, c, net, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { kill(); <-s.Done(); db.Close() }()
+	c.Advance(cfg.HostLeaseTTL)
+	ids := []string{}
+	for n := 0; n < 30; n++ {
+		v, e := s.CreateVM(ctx, fmt.Sprint(n), api.CreateVMRequest{Pool: config.Pools[0].Name})
+		if e != nil {
+			t.Fatal(e)
+		}
+		ids = append(ids, v.ID)
+	}
+	events, truncated, err := s.EventsSince(ctx, 0)
+	if err != nil || truncated || len(events) != 60 {
+		t.Fatalf("flood audit incomplete: %d %v %v", len(events), truncated, err)
+	}
+	snap, _ := s.Snapshot(ctx)
+	if len(snap.Recent) != cfg.RecentEventLimit {
+		t.Fatal("UI tail is not capped independently")
+	}
+	for _, id := range ids {
+		if _, err = s.DeleteVM(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events, truncated, err = s.EventsSince(ctx, 0)
+	if err != nil || !truncated || len(events) != 80 {
+		t.Fatalf("retention gap not reported: %d %v %v", len(events), truncated, err)
+	}
+	first, last := events[0].Seq, events[len(events)-1].Seq
+	for i, e := range events {
+		if e.Seq != first+int64(i) {
+			t.Fatal("unordered audit log")
+		}
+	}
+	_, truncated, err = s.EventsSince(ctx, first-1)
+	if err != nil || truncated {
+		t.Fatal("cursor on retention boundary marked truncated")
+	}
+	_, truncated, err = s.EventsSince(ctx, first-2)
+	if err != nil || !truncated {
+		t.Fatal("cursor before retention boundary not marked truncated")
+	}
+	// Returned data must not alias the actor's log.
+	events[0].Detail = "caller mutation"
+	again, _, _ := s.EventsSince(ctx, first-1)
+	if again[0].Detail == "caller mutation" {
+		t.Fatal("audit slice aliases state")
+	}
+	kill()
+	<-s.Done()
+	db.Close()
+	db, err = store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, kill = context.WithCancel(ctx)
+	defer kill()
+	s, err = New(runCtx, cfg, c, net, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, truncated, err = s.EventsSince(ctx, first-1)
+	if err != nil || truncated || len(events) != 80 || events[0].Seq != first || events[len(events)-1].Seq != last {
+		t.Fatal("audit retention not restored")
+	}
+	if _, err = s.CreateVM(ctx, "after-restart", api.CreateVMRequest{Pool: config.Pools[0].Name}); err != nil {
+		t.Fatal(err)
+	}
+	events, truncated, err = s.EventsSince(ctx, last)
+	if err != nil || truncated || len(events) != 2 || events[0].Seq != last+1 {
+		t.Fatalf("sequence repeated after restart: %+v %v %v", events, truncated, err)
+	}
+}
+
+func TestInventoryProvesAdmissionWhenReplyIsLost(t *testing.T) {
+	h := newHarness(t)
+	h.register("a", "r1", 1)
+	v := h.create("v", "standard")
+	h.c.Advance(h.s.cfg.ReservationTTL)
+	h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: 1, Inventory: []api.InventoryItem{{VMID: v.ID, Generation: v.Generation, State: api.VMBooting, Pool: v.Pool}}})
+	h.step(tick{})
+	if got := h.s.state.data.VMs[v.ID].VM; got.State != api.VMBooting || got.Generation != v.Generation {
+		t.Fatalf("running boot retried after lost admit reply: %+v", got)
+	}
+}
+
+func TestRestartSuspectHostGetsFreshLostGrace(t *testing.T) {
+	h := newHarness(t)
+	h.register("a", "r1", 1)
+	v := h.create("v", "standard")
+	h.ready(v)
+	d, epoch, err := h.db.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.s.state = newState(d, epoch, h.c.Now(), h.s.cfg)
+	h.c.Advance(h.s.cfg.HostLostGrace - time.Millisecond)
+	h.step(tick{})
+	if h.s.state.hosts["a"].lease != api.LeaseSuspect || h.s.state.data.VMs[v.ID].VM.State != api.VMReady {
+		t.Fatal("restart grace ended early")
+	}
+	h.c.Advance(time.Millisecond)
+	h.step(tick{})
+	if h.s.state.hosts["a"].lease != api.LeaseLost || h.s.state.data.Queue[v.ID].Reason != api.QueueReplace {
+		t.Fatal("restart gave suspect host another healthy TTL")
 	}
 }

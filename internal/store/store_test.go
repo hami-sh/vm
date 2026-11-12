@@ -23,7 +23,7 @@ func TestAtomicGenerationCASAndQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := Data{Epoch: empty.Epoch, VMs: map[string]Record{"v": {VM: api.VM{ID: "v", Pool: config.Pools[0].Name, State: api.VMPending, Desired: api.DesiredRunning, Priority: 2}, Key: "key", Hash: "hash"}}, Hosts: map[string]HostRecord{"h": {ID: "h", Rack: "r", Slots: 2, Admin: api.AdminActive}}, Queue: map[string]api.QueueEntry{"v": {VMID: "v", Priority: 2, Reason: api.QueueNew}}}
-	if err = s.Commit(ctx, empty, before, nil); err != nil {
+	if err = s.Commit(ctx, empty, before, nil, config.Default().EventRetention); err != nil {
 		t.Fatal(err)
 	}
 	after := Data{Epoch: before.Epoch, VMs: maps.Clone(before.VMs), Hosts: before.Hosts, Queue: map[string]api.QueueEntry{}}
@@ -35,10 +35,10 @@ func TestAtomicGenerationCASAndQueue(t *testing.T) {
 	event := api.Event{Kind: api.EventTransition, VMID: "v", From: api.VMPending, To: api.VMBooting, Generation: 1}
 	// The second writer has the same old generation. It must not dequeue or
 	// append another placement event when the CAS loses.
-	if err = s.Commit(ctx, before, after, []api.Event{event}); err != nil {
+	if err = s.Commit(ctx, before, after, []api.Event{event}, config.Default().EventRetention); err != nil {
 		t.Fatal(err)
 	}
-	if err = s.Commit(ctx, before, after, []api.Event{event}); !errors.Is(err, ErrCAS) {
+	if err = s.Commit(ctx, before, after, []api.Event{event}, config.Default().EventRetention); !errors.Is(err, ErrCAS) {
 		t.Fatalf("stale writer accepted: %v", err)
 	}
 	loaded, _, err := s.Start(ctx)
@@ -60,7 +60,7 @@ func TestAtomicGenerationCASAndQueue(t *testing.T) {
 	r.VM.Desired = api.DesiredDeleted
 	r.VM.State = api.VMTerminating
 	deleted.VMs["v"] = r
-	if err = s.Commit(ctx, loaded, deleted, []api.Event{{Kind: "invalid"}}); err == nil {
+	if err = s.Commit(ctx, loaded, deleted, []api.Event{{Kind: "invalid"}}, config.Default().EventRetention); err == nil {
 		t.Fatal("invalid audit row accepted")
 	}
 	restored, _, err := s.Start(ctx)
