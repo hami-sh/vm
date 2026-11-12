@@ -18,6 +18,8 @@ type Config struct {
 	HostLeaseTTL   time.Duration // healthy -> suspect
 	HostLostGrace  time.Duration // suspect -> lost
 
+	CommandRetryEvery time.Duration // retry unconfirmed commands independently of host heartbeats
+
 	// Boots (real: 30-60 s)
 	BootMin, BootMax time.Duration
 	BootDeadline     time.Duration
@@ -81,6 +83,8 @@ func Default() Config {
 		HostHeartbeat:  2 * time.Second,
 		HostLeaseTTL:   6 * time.Second,
 		HostLostGrace:  6 * time.Second,
+
+		CommandRetryEvery: 500 * time.Millisecond, // HostHeartbeat / 4
 
 		BootMin: 3 * time.Second, BootMax: 6 * time.Second,
 		BootDeadline:   15 * time.Second,

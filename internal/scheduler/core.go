@@ -93,6 +93,7 @@ func (p *planner) send(hostID string, msg any) {
 	p.effect.sends = append(p.effect.sends, delivery{api.Addr{Kind: api.KindAgent, ID: hostID, Host: hostID, Rack: h.record.Rack}, msg})
 }
 func (p *planner) stop(hostID, id string, gen int64, reason string) {
+	p.stops[stoppedCopy{hostID, id, gen}] = stopRetry{reason, p.now.Add(p.cfg.CommandRetryEvery).UnixMilli()}
 	p.send(hostID, api.StopVM{VMID: id, Generation: gen, Epoch: p.epoch, Reason: reason})
 }
 
@@ -422,7 +423,7 @@ func (p *planner) place(id, hostID string) {
 	}
 	pl, _ := pool(v.Pool)
 	command := api.StartVM{VMID: id, Generation: v.Generation, Epoch: p.epoch, Token: uuid.NewString(), Spec: api.VMSpec{Pool: pl.Name, Image: pl.Image, CPUs: pl.CPUs, MemoryMB: pl.MemoryMB}, IdempotencyKey: r.Key, RequestHash: r.Hash}
-	p.reservations[id] = reservation{host: hostID, gen: v.Generation, until: p.now.Add(p.cfg.ReservationTTL).UnixMilli(), command: command}
+	p.reservations[id] = reservation{host: hostID, gen: v.Generation, until: p.now.Add(p.cfg.ReservationTTL).UnixMilli(), command: command, retryAt: p.now.Add(p.cfg.CommandRetryEvery).UnixMilli()}
 	p.send(hostID, command)
 	p.counters.Placed++
 	p.log(api.EventAdmission, id, hostID, "placed")
@@ -594,6 +595,11 @@ func (p *planner) tick() {
 			}
 			continue
 		}
+		if v.State == api.VMTerminating && p.hosts[v.HostID].lease == api.LeaseHealthy {
+			if _, waiting := p.stops[stoppedCopy{v.HostID, id, v.Generation}]; !waiting {
+				p.stop(v.HostID, id, v.Generation, api.ReasonDeleted)
+			}
+		}
 		if v.State != api.VMBooting {
 			continue
 		}
@@ -607,6 +613,29 @@ func (p *planner) tick() {
 		}
 		if res, ok := p.reservations[id]; ok && !res.admitted && now >= res.until {
 			p.retry(id, api.ReasonReservationTTL)
+		}
+	}
+	for id, res := range p.reservations {
+		v := p.data.VMs[id].VM
+		if v.State != api.VMBooting || v.Desired != api.DesiredRunning || v.HostID != res.host || v.Generation != res.gen {
+			delete(p.reservations, id)
+			continue
+		}
+		if !res.admitted && now >= res.retryAt && p.hosts[res.host].lease == api.LeaseHealthy {
+			res.command.Epoch = p.epoch
+			p.send(res.host, res.command)
+			res.retryAt = p.now.Add(p.cfg.CommandRetryEvery).UnixMilli()
+			p.reservations[id] = res
+		}
+	}
+	for copy, retry := range p.stops {
+		v, known := p.data.VMs[copy.id]
+		if known && v.VM.Desired == api.DesiredRunning && v.VM.Generation == copy.gen && v.VM.HostID == copy.host && (v.VM.State == api.VMBooting || v.VM.State == api.VMReady || v.VM.State == api.VMUnhealthy) {
+			delete(p.stops, copy)
+			continue
+		}
+		if now >= retry.at && p.hosts[copy.host].lease == api.LeaseHealthy {
+			p.stop(copy.host, copy.id, copy.gen, retry.reason)
 		}
 	}
 }
