@@ -82,6 +82,7 @@ type Agent struct {
 	epoch            int64
 	seq              uint64
 	paused, cordoned bool
+	reregister       bool
 	down             bool
 	skew             time.Duration
 	security         api.SecurityStatus
@@ -100,7 +101,7 @@ func (a *Agent) Run(ctx context.Context) {
 	defer ticker.Stop()
 	leases := a.clock.NewTicker(a.cfg.InvariantEvery)
 	defer leases.Stop()
-	a.execute([]Effect{a.report(api.RegisterHost{HostID: a.ep.Addr().ID, Rack: a.ep.Addr().Rack, Slots: min(2, a.cfg.SlotsPerHost), DiskFull: a.diskFull(), Inventory: a.inventory(), Epoch: a.epoch})})
+	a.execute([]Effect{a.registration()})
 	for {
 		// Give deadlines priority even with a permanently readable guest inbox.
 		select {
@@ -188,6 +189,9 @@ func (a *Agent) command(ctx context.Context, m any) error {
 func (a *Agent) report(m any) Effect {
 	return Effect{To: a.scheduler, Port: api.PortControl, Message: m}
 }
+func (a *Agent) registration() Effect {
+	return a.report(api.RegisterHost{HostID: a.ep.Addr().ID, Rack: a.ep.Addr().Rack, Slots: min(2, a.cfg.SlotsPerHost), DiskFull: a.diskFull(), Inventory: a.inventory(), Epoch: a.epoch})
+}
 func (a *Agent) diskFull() bool {
 	if d, ok := a.driver.(interface{ DiskFull() bool }); ok {
 		return d.DiskFull()
@@ -207,7 +211,11 @@ func (a *Agent) heartbeat() []Effect {
 		return nil
 	}
 	a.seq++
-	return []Effect{a.report(api.HostHeartbeat{HostID: a.ep.Addr().ID, Seq: a.seq, DiskFull: a.diskFull(), Inventory: a.inventory(), Epoch: a.epoch})}
+	out := []Effect{a.report(api.HostHeartbeat{HostID: a.ep.Addr().ID, Seq: a.seq, DiskFull: a.diskFull(), Inventory: a.inventory(), Epoch: a.epoch})}
+	if a.reregister {
+		out = append(out, a.registration())
+	}
+	return out
 }
 func (a *Agent) execute(effects []Effect) {
 	for _, e := range effects {
@@ -354,7 +362,11 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 					return nil
 				}
 				a.epoch = cmd.Epoch
+				a.reregister = cmd.Reregister
 				var out []Effect
+				if a.reregister {
+					out = append(out, a.registration())
+				}
 				for _, stale := range cmd.Stale {
 					if v := a.vms[stale.VMID]; v != nil && v.start.Generation <= stale.Generation {
 						out = append(out, a.release(v, api.ReasonStale)...)
@@ -479,6 +491,7 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 			a.seq = 0
 			a.paused = false
 			a.cordoned = false
+			a.reregister = false
 			return []Effect{{Work: func(ctx context.Context) any {
 				for _, done := range boots {
 					<-done
@@ -540,7 +553,7 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 		}
 		a.down = false
 		m.reply <- nil
-		return []Effect{a.report(api.RegisterHost{HostID: a.ep.Addr().ID, Rack: a.ep.Addr().Rack, Slots: min(2, a.cfg.SlotsPerHost), DiskFull: a.diskFull(), Inventory: a.inventory(), Epoch: a.epoch})}
+		return []Effect{a.registration()}
 	case query:
 		h := api.Host{ID: a.ep.Addr().ID, Rack: a.ep.Addr().Rack, SlotCount: min(2, a.cfg.SlotsPerHost), AdminState: api.AdminActive, Lease: api.LeaseHealthy}
 		if a.cordoned {
