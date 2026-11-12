@@ -231,6 +231,9 @@ func victimRecovery(base Scenario, pick func(api.VM) bool, first, maintenance bo
 				if _, victim := victims[e.VMID]; victim && replacements[e.VMID] && (e.To == api.VMFailed || e.To == api.VMTerminated || e.Detail == api.ReasonShed) {
 					return false
 				}
+				if e.To == api.VMFailed || e.To == api.VMTerminated {
+					delete(waiting, e.VMID) // Terminal non-victims are no longer queued.
+				}
 				if e.To == api.VMBooting {
 					// No preemption: placements before loss detection are valid.
 					// After loss, every newly available slot serves replacements first.

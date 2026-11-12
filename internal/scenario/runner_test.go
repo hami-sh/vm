@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -277,6 +279,8 @@ func TestHerdDoesNotPreemptButPrioritizesEveryFreedSlot(t *testing.T) {
 				{Kind: api.EventTransition, At: 12000, VMID: "new-before-detection", To: api.VMBooting},
 				{Kind: api.EventTransition, At: 15000, VMID: "victim", To: api.VMLost},
 				{Kind: api.EventTransition, At: 15000, VMID: "victim", To: api.VMPending},
+				{Kind: api.EventTransition, At: 16000, VMID: "unready-flood-request", To: api.VMLost},
+				{Kind: api.EventTransition, At: 17000, VMID: "unready-flood-request", To: api.VMFailed},
 			}
 			switch fault {
 			case "new placement while waiting":
@@ -614,6 +618,20 @@ func TestSuiteSeedsAndCalibration(t *testing.T) {
 	}
 	if _, err := Calibrate(context.Background(), []Scenario{s}, baselineFailure, Options{Repeat: 1, Parallel: 1, Output: t.TempDir()}, io.Discard); err == nil {
 		t.Fatal("discarded a failed 5x baseline because 50x passed")
+	}
+}
+
+func TestHTTPCreatePreservesAdmissionBackoff(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"mutation rate limit","retry_after_s":1}`))
+	}))
+	defer server.Close()
+	f := &HTTPSystem{URL: server.URL, Client: server.Client()}
+	_, err := f.CreateVM(context.Background(), "k", api.CreateVMRequest{Pool: "ios-xcode16-m"})
+	e, ok := err.(*api.Error)
+	if !ok || e.Status != 429 || e.RetryAfterS != 1 || e.Msg != "mutation rate limit" {
+		t.Fatalf("lost server backoff: %v", err)
 	}
 }
 

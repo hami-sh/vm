@@ -99,15 +99,20 @@ func run() error {
 					return fmt.Errorf("SSE closed before create reached Ready")
 				}
 				if created == "" {
-					v, err := f.CreateVM(ctx, "e2e-create", api.CreateVMRequest{Pool: "ios-xcode16-m", Priority: "interactive"})
-					if e, ok := err.(*api.Error); ok && e.Status == 503 {
-						continue // Fresh-store inventory recovery rejects admission.
-					}
+					var v api.CreateVMResponse
+					err := retryUnavailable(ctx, func() error {
+						var err error
+						v, err = f.CreateVM(ctx, "e2e-create", api.CreateVMRequest{Pool: "ios-xcode16-m", Priority: "interactive"})
+						return err
+					})
 					if err != nil {
 						return fmt.Errorf("HTTP create: %w", err)
 					}
 					created = v.ID
-					if _, err := f.Do(ctx, "flood", api.ChaosRequest{Params: map[string]float64{"count": 1}}); err != nil {
+					if err := retryUnavailable(ctx, func() error {
+						_, err := f.Do(ctx, "flood", api.ChaosRequest{Params: map[string]float64{"count": 1}})
+						return err
+					}); err != nil {
 						return fmt.Errorf("HTTP chaos: %w", err)
 					}
 				}
@@ -226,8 +231,14 @@ func serverFactory(binary string) scenario.Factory {
 			stop()
 			return nil, nil, fmt.Errorf("server SSE: %w", err)
 		}
-		if _, err = f.Sim(ctx, "chaos", api.SimRequest{Seed: seed}); err == nil {
-			_, err = f.Sim(ctx, "speed", api.SimRequest{Speed: speed})
+		if err = retryUnavailable(ctx, func() error {
+			_, err := f.Sim(ctx, "chaos", api.SimRequest{Seed: seed})
+			return err
+		}); err == nil {
+			err = retryUnavailable(ctx, func() error {
+				_, err := f.Sim(ctx, "speed", api.SimRequest{Speed: speed})
+				return err
+			})
 		}
 		if err != nil {
 			connectCancel()
@@ -235,5 +246,24 @@ func serverFactory(binary string) scenario.Factory {
 			return nil, nil, err
 		}
 		return f, func() { connectCancel(); stop() }, nil
+	}
+}
+
+// Server setup and the small e2e workload honor explicit admission backoff.
+// Scenario verification actions still expose overload and outage errors.
+func retryUnavailable(ctx context.Context, do func() error) error {
+	for {
+		err := do()
+		e, ok := err.(*api.Error)
+		if !ok || (e.Status != 429 && e.Status != 503) || e.RetryAfterS <= 0 {
+			return err
+		}
+		timer := scenario.WallClock.NewTimer(time.Duration(e.RetryAfterS) * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C():
+		}
 	}
 }
