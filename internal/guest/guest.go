@@ -15,16 +15,20 @@ type loop struct {
 	registered bool
 }
 
-func (g *loop) handle(_ time.Time, _ any) []Effect {
+func (g *loop) handle(_ time.Time, msg any) []Effect {
+	if r, ok := msg.(api.GuestRegisterResult); ok {
+		g.registered = r.Accepted
+		return nil
+	}
 	if !g.registered {
-		g.registered = true
 		return []Effect{{api.GuestRegister{VMID: g.params.VMID, Generation: g.params.Generation, Token: g.params.Token, Checks: []string{"simctl"}}}}
 	}
 	return []Effect{{api.GuestHeartbeat{VMID: g.params.VMID, Generation: g.params.Generation}}}
 }
 
-// Run sends Register once, then heartbeats until cancellation. The caller owns
-// the endpoint; cancelling Run never closes somebody else's connection.
+// Run retries the boot registration until accepted, then sends heartbeats.
+// An authenticated rejection ends this boot's loop. The caller owns the
+// endpoint; cancelling Run never closes somebody else's connection.
 func Run(ctx context.Context, c clock.Clock, cfg config.Config, ep api.Endpoint, p api.BootParams) {
 	RunObserved(ctx, c, cfg, ep, p, nil)
 }
@@ -52,6 +56,12 @@ func RunObserved(ctx context.Context, c clock.Clock, cfg config.Config, ep api.E
 			}
 			if observe != nil {
 				observe(e)
+			}
+			if r, ok := e.Msg.(api.GuestRegisterResult); ok && e.From == host && e.Port == api.PortVsock {
+				if !r.Accepted {
+					return
+				}
+				g.handle(c.Now(), r)
 			}
 		case <-ticker.C():
 			send()
