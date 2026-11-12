@@ -612,6 +612,34 @@ func TestSimAndTopology(t *testing.T) {
 	wantStatus(t, h.do("POST", "/v1/topology/add-host", `{"rack":"r7"}`), http.StatusNotFound)
 }
 
+func TestLifetimeSettingsAndPresetIsolation(t *testing.T) {
+	policy := api.Lifetime{MinMs: 12000, MaxMs: 42000, IdleMs: 8000, ReleaseP: .25}
+	h := newHarness(t, func(o *Options) { o.Config.DemoLifetime = policy })
+	source := decodeBody[struct {
+		Policy api.Lifetime `json:"demo_lifetime"`
+		Min    int64        `json:"lifetime_min_ms"`
+		Max    int64        `json:"lifetime_max_ms"`
+	}](t, h.do("GET", "/v1/source", ""))
+	if source.Policy != policy || source.Min != 5000 || source.Max != 1800000 {
+		t.Fatalf("dashboard defaults must come from config: %+v", source)
+	}
+	body := `{"lifetime":{"min_ms":12000,"max_ms":42000,"idle_ms":8000,"release_p":0.25}}`
+	status := decodeBody[api.SimStatus](t, h.do("POST", "/v1/sim/chaos", body))
+	if status.Lifetime != policy {
+		t.Fatalf("lifetime settings not applied: %+v", status.Lifetime)
+	}
+	wantStatus(t, h.do("POST", "/v1/chaos/gray-failure", `{}`), http.StatusConflict)
+	if runs := decodeBody[[]api.RunSummary](t, h.do("GET", "/v1/runs", "")); len(runs) != 0 {
+		t.Fatalf("incompatible lifetime policy created a recording: %+v", runs)
+	}
+	wantStatus(t, h.do("POST", "/v1/sim/chaos", `{"lifetime":{"max_ms":0}}`), http.StatusOK)
+	wantStatus(t, h.do("POST", "/v1/chaos/gray-failure", `{}`), http.StatusOK)
+	wantStatus(t, h.do("POST", "/v1/sim/chaos", body), http.StatusConflict)
+	if status := h.fleet.Latest().Sim; status.Lifetime.MaxMs != 0 {
+		t.Fatalf("recording must retain disabled lifetimes: %+v", status)
+	}
+}
+
 func TestMutationRoutesShareRateLimit(t *testing.T) {
 	for _, tc := range []struct{ method, path, body string }{
 		{"POST", "/v1/vms", `{"pool":"ios-xcode16-m"}`},

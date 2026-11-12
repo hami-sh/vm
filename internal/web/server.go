@@ -128,7 +128,10 @@ func (s *Server) routes() {
 		if s.o.Fixture {
 			label = "Fixture preview · fabricated data"
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"label": label})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"label": label, "demo_lifetime": s.o.Config.DemoLifetime,
+			"lifetime_min_ms": s.o.Config.LifetimeMin.Milliseconds(), "lifetime_max_ms": s.o.Config.LifetimeMax.Milliseconds(),
+		})
 	})
 	m.HandleFunc("GET /v1/chaos/actions", s.chaosActions)
 	m.HandleFunc("POST /v1/chaos/{action}", s.chaosDo)
@@ -405,6 +408,14 @@ func (s *Server) sim(w http.ResponseWriter, r *http.Request) {
 	if req.LoadRate != nil && *req.LoadRate < 0 {
 		writeError(w, badRequest("load_rate must be >= 0"))
 		return
+	}
+	if req.Lifetime != nil {
+		s.runMu.Lock()
+		defer s.runMu.Unlock()
+		if s.runCancel != nil {
+			writeError(w, &api.Error{Status: 409, Msg: "VM lifetime settings cannot change during a scenario recording"})
+			return
+		}
 	}
 	st, err := s.o.Chaos.Sim(r.Context(), action, req)
 	if err != nil {

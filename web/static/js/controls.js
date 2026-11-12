@@ -21,6 +21,7 @@ const LAYERS = [
 ];
 
 const form = { pool: '', priority: 'standard', mix: 'mixed', rackHosts: 4, addTo: '', drain: '' };
+let lastLifetime;
 
 const options = (list, selected) =>
   list.map(([value, label]) => `<option value="${esc(value)}"${value === selected ? ' selected' : ''}>${esc(label)}</option>`).join('');
@@ -40,7 +41,7 @@ function load(s) {
   </div>`;
 }
 
-function requestSettings(s) {
+function requestSettings(s, st) {
   const rate = s.sim.load_rate || 0;
   const pools = (s.pools || []).map((p) => [p.name, `${p.image.replace(/macos-(\d+)-xcode(\d+)/, 'macOS $1 · Xcode $2')} · ${p.cpus} CPU · ${p.memory_mb / 1024} GB`]);
   return `<div class="ctl">
@@ -57,7 +58,56 @@ function requestSettings(s) {
       <div class="seg">${Object.entries(MIXES)
         .map(([key, m]) => `<button data-act="mix" data-mix="${key}" title="${key === 'mixed' ? '20% urgent, 50% normal, 30% background work' : key === 'interactive' ? 'All requests served ahead of normal or background work' : 'All requests can wait behind other work'}" class="${form.mix === key ? 'on' : ''}">${key === 'interactive' ? 'Urgent' : key === 'batch' ? 'Background' : m.label}</button>`)
         .join('')}</div></div>
+    ${lifetimes(s, st)}
   </div>`;
+}
+
+function lifetimes(s, st) {
+  const enabled = s.sim.lifetime?.max_ms > 0;
+  if (enabled) lastLifetime = s.sim.lifetime;
+  const policy = enabled ? s.sim.lifetime : lastLifetime || st.lifetimeConfig?.demo_lifetime;
+  if (!policy || !st.lifetimeConfig) return '<p class="dim">Loading VM lifetime settings…</p>';
+  const min = st.lifetimeConfig.lifetime_min_ms / 1000;
+  const max = st.lifetimeConfig.lifetime_max_ms / 1000;
+  const slots = s.hosts.filter((h) => h.admin_state !== 'removed').reduce((n, h) => n + h.slots.length, 0);
+  const mean = ((policy.min_ms + policy.max_ms) / 2 + (1 - policy.release_p) * policy.idle_ms) / 1000;
+  const expected = (s.sim.load_rate || 0) * mean;
+  return `<form class="lifetime-settings" id="lifetime-settings" data-submit="lifetime-apply">
+    <label class="lifetime-toggle"><input type="checkbox" data-change="lifetime-toggle" ${enabled ? 'checked' : ''} aria-label="VM lifetimes"> <strong>VM lifetimes</strong><span class="dim">${enabled ? 'On' : 'Off'}</span></label>
+    <p class="dim">Automatic traffic only. Busy time starts at first Ready; idle VMs are reclaimed. All times are simulated.</p>
+    <div class="lifetime-fields">
+      <label>Busy min · seconds<input class="input" type="number" name="min_ms" value="${policy.min_ms / 1000}" min="${min}" max="${max}" step="1" required aria-label="Minimum busy lifetime in seconds"></label>
+      <label>Busy max · seconds<input class="input" type="number" name="max_ms" value="${policy.max_ms / 1000}" min="${min}" max="${max}" step="1" required aria-label="Maximum busy lifetime in seconds"></label>
+      <label>Idle timeout · seconds<input class="input" type="number" name="idle_ms" value="${policy.idle_ms / 1000}" min="0" max="${max}" step="1" required aria-label="Idle timeout in seconds"></label>
+      <label>Release at finish · %<input class="input" type="number" name="release_p" value="${policy.release_p * 100}" min="0" max="100" step="1" required aria-label="Release probability percent"></label>
+    </div>
+    <button class="btn sm" type="button" data-act="lifetime-apply" ${enabled ? '' : 'disabled'}>Apply lifetimes</button>
+    <p class="lifetime-estimate ${enabled && expected > slots ? 'over' : ''}">${enabled ? `Expected steady state ≈ ${expected.toFixed(1)} VMs / ${slots} slots` : 'Off · VMs keep running until explicitly deleted'}<br><span class="dim">${(s.sim.load_rate || 0).toFixed(1)}/s × ${mean.toFixed(1)} s mean lifetime (busy + idle). Excludes boot and recovery time; not a capacity guarantee.</span></p>
+  </form>`;
+}
+
+async function applyLifetime(enabled) {
+  const fields = $('#lifetime-settings');
+  const maximum = fields.elements.max_ms;
+  maximum.setCustomValidity('');
+  if (Number(maximum.value) < Number(fields.elements.min_ms.value)) maximum.setCustomValidity('Maximum must be at least the minimum.');
+  if (enabled && !fields.reportValidity()) {
+    fields.querySelector('[data-change="lifetime-toggle"]').checked = sim().lifetime?.max_ms > 0;
+    return;
+  }
+  const lifetime = {
+    min_ms: Number(fields.elements.min_ms.value) * 1000,
+    max_ms: enabled ? Number(maximum.value) * 1000 : 0,
+    idle_ms: Number(fields.elements.idle_ms.value) * 1000,
+    release_p: Number(fields.elements.release_p.value) / 100,
+  };
+  const scroll = $('.advanced-controls').scrollTop;
+  await settle(attempt(enabled ? 'VM lifetimes on' : 'VM lifetimes off', async () => {
+    const status = await api.sim('chaos', { lifetime });
+    update((st) => Object.assign(st.live.snapshot.sim, status));
+    return status;
+  }));
+  $('.advanced-controls').scrollTop = scroll;
 }
 
 function topology(s) {
@@ -122,12 +172,13 @@ const SCENARIOS = {
   'bad-day': 'Combine random faults, network delay, a request burst and a scheduler restart',
 };
 
-function presets(catalog, ready) {
+function presets(catalog, ready, lifetimeOn) {
+  const blocked = lifetimeOn ? 'Turn off VM lifetimes before starting a scenario' : !ready ? 'Scheduler is recovering; scenarios start once it accepts work' : '';
   return `<div class="ctl wide">
     <div class="ctl-title"><h2>Scenarios</h2><span class="dim">Start a fault sequence and record it</span></div>
     <div class="ctl-row">
       <div class="presets">${catalog.presets
-        .map((p) => `<button class="btn" data-act="preset" data-name="${esc(p.name)}" ${ready ? '' : 'disabled'} title="${ready ? `${esc(SCENARIOS[p.name] || `Start ${p.label}`)}. Records a run for playback and inspection in Runs.` : 'Scheduler is recovering; scenarios start once it accepts work'}">${esc(p.label)}</button>`)
+        .map((p) => `<button class="btn" data-act="preset" data-name="${esc(p.name)}" ${blocked ? 'disabled' : ''} title="${blocked || `${esc(SCENARIOS[p.name] || `Start ${p.label}`)}. Records a run for playback and inspection in Runs.`}">${esc(p.label)}</button>`)
         .join('')}</div>
       </div>
   </div>`;
@@ -140,7 +191,7 @@ export function render(st, v) {
     mount(el, '');
     return;
   }
-  mount(el, load(s) + presets(st.catalog, s.scheduler === 'up') + '<h2 class="advanced-title">Advanced controls</h2><div class="advanced-controls" aria-label="Advanced controls">' + requestSettings(s) + topology(s) + chaos(s, st.catalog) + '<div class="ctl"><button class="btn" data-act="open-menu" data-kind="global" title="Inject latency, packet loss, duplication or reordering">Network faults…</button></div></div>');
+  mount(el, load(s) + presets(st.catalog, s.scheduler === 'up', s.sim.lifetime?.max_ms > 0) + '<h2 class="advanced-title">Advanced controls</h2><div class="advanced-controls" aria-label="Advanced controls">' + requestSettings(s, st) + topology(s) + chaos(s, st.catalog) + '<div class="ctl"><button class="btn" data-act="open-menu" data-kind="global" title="Inject latency, packet loss, duplication or reordering">Network faults…</button></div></div>');
 }
 
 // After a slider request the panel is redrawn from the snapshot even if the
@@ -160,6 +211,7 @@ export const inputs = {
 };
 
 export const changes = {
+  'lifetime-toggle': (el) => applyLifetime(el.checked),
   form(el) {
     form[el.dataset.key] = el.type === 'number' ? Math.max(1, Math.min(8, Number(el.value) || 1)) : el.value;
     update();
@@ -175,6 +227,7 @@ export const changes = {
 };
 
 export const actions = {
+  'lifetime-apply': () => sim().lifetime?.max_ms > 0 && applyLifetime(true),
   async mix(el) {
     const key = el.dataset.mix;
     const { label, ...weights } = MIXES[key];

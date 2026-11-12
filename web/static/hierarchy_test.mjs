@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { render as grid } from './js/grid.js';
 import { render as detail } from './js/detail.js';
 import { render as menu } from './js/menu.js';
+import { render as controls } from './js/controls.js';
 
 const fleet = { innerHTML: '', classList: { toggle() {} } };
 let body = { scrollTop: 0 };
@@ -15,7 +16,8 @@ const inspector = {
   querySelector: () => body,
 };
 const actions = { innerHTML: '', firstElementChild: null };
-globalThis.document = { querySelector: (selector) => ({ '#fleet': fleet, '#detail': inspector, '#menu': actions })[selector] };
+const controlPanel = { innerHTML: '' };
+globalThis.document = { querySelector: (selector) => ({ '#fleet': fleet, '#detail': inspector, '#menu': actions, '#controls': controlPanel })[selector] };
 
 function snapshot() {
   const host = (id, gen, lease = 'healthy') => ({ id, rack: id, lease, lease_age_ms: 0, admin_state: 'active', slots: [{ vm_id: 'vm-a', gen, state: 'occupied' }] });
@@ -40,7 +42,7 @@ test('guest action history is not shown as a host fault, while persistent host f
     { name: 'slow-boot', target: 'host', layer: 'guest' },
     { name: 'fill-disk', target: 'host', layer: 'host' },
   ] };
-  for (const mode of [{ catalog, playback: false }, { catalog, playback: true }, { playback: true }, { catalog: { actions: [] }, playback: true }]) {
+  for (const mode of [{ catalog, playback: false }, { catalog, playback: true }, { playback: true }, { playback: false }, { catalog: { actions: [] }, playback: false }, { catalog: { actions: [] }, playback: true }]) {
     s.hosts[0].faults = [...vmActions, 'future-vm-action', 'slow-boot', 'fill-disk'];
     grid({ catalog: mode.catalog }, { snapshot: s, playback: mode.playback });
     const results = [hostHTML('current')];
@@ -63,6 +65,25 @@ test('guest action history is not shown as a host fault, while persistent host f
   s.hosts[0].faults = ['crash-vm'];
   grid({ catalog: { actions: [{ name: 'crash-vm', target: 'host', layer: 'guest' }] } }, { snapshot: s, playback: true });
   assert.match(hostHTML('current'), /crash-vm/);
+});
+
+test('cordon history follows current admin state and stopped agents remain explicit', () => {
+  const s = snapshot();
+  s.hosts[0].faults = ['cordon', 'uncordon', 'kill-host'];
+  for (const admin of ['cordoned', 'active']) {
+    s.hosts[0].admin_state = admin;
+    grid({}, { snapshot: s });
+    const html = hostHTML('current');
+    assert.doesNotMatch(html, /tag fault">(?:cordon|uncordon)</);
+    assert.match(html, /Host agent · stopped/);
+    if (admin === 'cordoned') assert.match(html, /Cordoned · no new VMs/);
+    else assert.doesNotMatch(html, /Cordoned · no new VMs/);
+    detail({ selection: { kind: 'agent', id: 'current' } }, { snapshot: s, events: [] });
+    assert.match(inspector.innerHTML, /Stopped by Kill host/);
+  }
+  s.hosts[0].faults = [];
+  grid({}, { snapshot: s });
+  assert.doesNotMatch(hostHTML('current'), /Host agent · stopped/);
 });
 
 test('host slots show their own generation and physical guest target, never another incarnation’s Ready state', () => {
@@ -124,4 +145,41 @@ test('snapshot redraws preserve inspector scroll; a new selection starts at the 
   assert.equal(body.scrollTop, 144);
   detail({ selection: { kind: 'agent', id: 'old' } }, { snapshot: s, events: [] });
   assert.equal(body.scrollTop, 0);
+});
+
+test('workload phases and ending history render in live and playback without attaching to old copies', () => {
+  const s = snapshot();
+  s.sim = { workloads: [{ vm_id: 'vm-a', phase: 'busy', ends_at: 17000 }] };
+  const events = [{ kind: 'workload', vm_id: 'vm-a', at: 8000, detail: 'completed' }, { kind: 'workload', vm_id: 'vm-a', at: 9000, detail: 'idle' }];
+  for (const playback of [false, true]) {
+    grid({}, { snapshot: s, playback });
+    assert.match(hostHTML('current'), />Busy</);
+    assert.doesNotMatch(hostHTML('old'), /workload-chip/);
+    detail({ selection: { kind: 'vm', id: 'vm-a' } }, { snapshot: s, events, playback });
+    assert.match(inspector.innerHTML, /Busy, ends in 7.0 s/);
+    assert.match(inspector.innerHTML, /workload completed/);
+    assert.match(inspector.innerHTML, /idle reclaimed/);
+    if (playback) assert.doesNotMatch(inspector.innerHTML, /data-act="open-menu"/);
+  }
+  s.sim.workloads[0].phase = 'idle';
+  grid({}, { snapshot: s });
+  assert.match(hostHTML('current'), />Idle</);
+  s.vms[0].state = 'Unhealthy';
+  s.at = 17001;
+  detail({ selection: { kind: 'vm', id: 'vm-a' } }, { snapshot: s, events });
+  assert.match(inspector.innerHTML, /Idle, overdue; waits for Ready/);
+});
+
+test('lifetime controls use supplied defaults, include idle time in occupancy and disappear in playback', () => {
+  const s = snapshot();
+  const policy = { min_ms: 12000, max_ms: 42000, idle_ms: 8000, release_p: .25 };
+  s.sim = { load_rate: .2, lifetime: policy };
+  const st = { catalog: { actions: [], presets: [{ name: 'gray-failure', label: 'Gray failure' }] }, lifetimeConfig: { demo_lifetime: policy, lifetime_min_ms: 5000, lifetime_max_ms: 1800000 } };
+  controls(st, { snapshot: s });
+  assert.match(controlPanel.innerHTML, /name="min_ms" value="12"/);
+  assert.match(controlPanel.innerHTML, /name="release_p" value="25"/);
+  assert.match(controlPanel.innerHTML, /≈ 6.6 VMs \/ 4 slots/);
+  assert.match(controlPanel.innerHTML, /Turn off VM lifetimes before starting a scenario/);
+  controls(st, { snapshot: s, playback: true });
+  assert.equal(controlPanel.innerHTML, '');
 });

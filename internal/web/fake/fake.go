@@ -20,6 +20,7 @@ import (
 
 	"github.com/hami-sh/vm/internal/api"
 	"github.com/hami-sh/vm/internal/clock"
+	"github.com/hami-sh/vm/internal/config"
 )
 
 // LoadFixture reads a snapshot such as fixtures/snapshot.json.
@@ -188,6 +189,34 @@ func (f *Fleet) advanceLocked(d time.Duration) {
 		} else {
 			h.LeaseAgeMs += d.Milliseconds()
 		}
+	}
+	// Only explicitly seeded fixture workloads participate. This previews phase
+	// changes and ending events; W3 owns the real load-generator lifecycle.
+	if s.Sim.Lifetime.MaxMs > 0 {
+		workloads := s.Sim.Workloads[:0]
+		for _, workload := range s.Sim.Workloads {
+			vm, ok := f.vmLocked(workload.VMID)
+			if !ok || vm.Desired == api.DesiredDeleted || vm.State == api.VMFailed || vm.State == api.VMTerminated {
+				continue
+			}
+			if workload.EndsAt <= s.At && vm.State == api.VMReady && s.Scheduler == api.SchedulerUp {
+				if workload.Phase == api.WorkloadBusy && f.rng.Float64() >= s.Sim.Lifetime.ReleaseP {
+					workload.Phase = api.WorkloadIdle
+					workload.EndsAt = s.At + s.Sim.Lifetime.IdleMs
+				} else {
+					reason := "completed"
+					if workload.Phase == api.WorkloadIdle {
+						reason = "idle"
+					}
+					if _, err := f.deleteLocked(vm.ID); err == nil {
+						f.emitLocked(api.Event{Kind: api.EventWorkload, VMID: vm.ID, HostID: vm.HostID, Generation: vm.Generation, Detail: reason})
+						continue
+					}
+				}
+			}
+			workloads = append(workloads, workload)
+		}
+		s.Sim.Workloads = workloads
 	}
 	// Sustained load: occasionally admit a new VM to the queue.
 	if s.Sim.LoadRate > 0 && f.rng.Float64() < s.Sim.LoadRate*d.Seconds() {
@@ -638,6 +667,25 @@ func (f *Fleet) Sim(_ context.Context, action string, req api.SimRequest) (api.S
 		}
 		f.advanceLocked(time.Duration(req.StepMs) * time.Millisecond)
 	case "chaos":
+		if req.Lifetime != nil {
+			p := *req.Lifetime
+			cfg := config.Default()
+			if p.MaxMs != 0 && (p.MinMs < cfg.LifetimeMin.Milliseconds() || p.MaxMs > cfg.LifetimeMax.Milliseconds() || p.MinMs > p.MaxMs || p.IdleMs < 0 || p.IdleMs > cfg.LifetimeMax.Milliseconds() || math.IsNaN(p.ReleaseP) || p.ReleaseP < 0 || p.ReleaseP > 1) {
+				return *st, invalid("invalid lifetime policy")
+			}
+			st.Lifetime = p
+			if p.MaxMs == 0 {
+				st.Workloads = nil
+			} else if len(st.Workloads) == 0 {
+				st.Workloads = slices.Clone(f.base.Sim.Workloads)
+				for i := range st.Workloads {
+					st.Workloads[i].EndsAt = f.s.At + p.MinMs
+					if st.Workloads[i].Phase == api.WorkloadIdle {
+						st.Workloads[i].EndsAt = f.s.At + p.IdleMs
+					}
+				}
+			}
+		}
 		if req.Intensity != nil {
 			st.Intensity = *req.Intensity
 		}

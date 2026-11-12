@@ -9,7 +9,7 @@ const MAX_UNPLACED = 6;
 
 const isSel = (st, kind, id) => st.selection?.kind === kind && st.selection.id === id;
 
-export function vmChip(vm, st, slotState) {
+export function vmChip(vm, st, slotState, workload) {
   const cls = ['vm', `s-${vm.state.toLowerCase()}`];
   if (vm.compromised) cls.push('compromised');
   if (slotState === 'reserved' || slotState === 'releasing') cls.push(slotState);
@@ -25,14 +25,15 @@ export function vmChip(vm, st, slotState) {
     title="Inspect VM ${esc(vm.id)} and its history · ${esc(vm.state)} · gen ${vm.gen} · ${p.label}${note ? ' · ' + esc(note) : ''}">
     <span class="vm-top"><span class="vm-id">${esc(vmName(vm.id))}</span></span>
     <span class="vm-bot"><span class="vm-state" title="${esc(stateMeaning(vm.state))}">${esc(vm.state)}</span><span class="vm-gen" title="Generation: increases on re-placement">g${vm.gen}</span><span class="vm-prio" title="Priority: ${p.label}" style="--p:${p.color}">${p.short}</span></span>
+    ${workload ? `<span class="workload-chip ${esc(workload.phase)}" title="Simulated tenant workload, not VM health">${workload.phase === 'idle' ? 'Idle' : 'Busy'}</span>` : ''}
   </button>`;
 }
 
-function slot(sl, h, vms, st) {
+function slot(sl, h, vms, st, workloads) {
   if (!sl.vm_id) return `<span class="slot-free" title="An available VM slot on this physical host">Empty VM slot</span>`;
   const vm = vms.get(sl.vm_id);
   if (vm && vm.host === h.id && vm.gen === sl.gen && h.lease === 'healthy') return `<div class="vm-instance${isSel(st, 'guest', vm.id) && st.selection.host === h.id && st.selection.gen === sl.gen ? ' guest-selected' : ''}">
-    ${vmChip(vm, st, sl.state)}
+    ${vmChip(vm, st, sl.state, workloads.get(vm.id))}
     <button class="guest-node" data-act="pick" data-kind="guest" data-id="${esc(vm.id)}" data-host="${esc(h.id)}" data-gen="${sl.gen}" title="Inspect guestd inside ${esc(vmName(vm.id))}. It reports readiness and heartbeats to this host’s agent, not the scheduler."><span aria-hidden="true">↳</span> guestd <span aria-hidden="true">›</span></button>
   </div>`;
   // Slot inventory is host-local evidence, not the logical VM's current incarnation.
@@ -46,27 +47,28 @@ function slot(sl, h, vms, st) {
   </div>`;
 }
 
-function hostCard(h, vms, st, playback) {
+function hostCard(h, vms, st, workloads) {
   const cls = ['host', `lease-${h.lease}`, `admin-${h.admin_state}`];
   if (isSel(st, 'host', h.id) || isSel(st, 'agent', h.id)) cls.push('sel');
   const tags = [];
-  if (h.admin_state !== 'active') tags.push(`<span class="tag admin">${esc(h.admin_state)}</span>`);
-  for (const f of hostFaults(h, st.catalog, playback)) tags.push(`<span class="tag fault">${esc(f)}</span>`);
+  const agentStopped = (h.faults || []).some((f) => f === 'kill-host' || f === 'killed');
+  if (h.admin_state !== 'active') tags.push(`<span class="tag admin" title="${h.admin_state === 'cordoned' ? 'Cordoned: no new VMs are placed here; existing VMs keep running. Uncordon allows placements again.' : 'Host is not accepting new VM placements.'}">${h.admin_state === 'cordoned' ? 'Cordoned · no new VMs' : esc(h.admin_state)}</span>`);
+  for (const f of hostFaults(h, st.catalog)) tags.push(`<span class="tag fault">${esc(f)}</span>`);
   const stale = (h.stale || [])
     .map((s) => `<span class="stale" title="A copy the scheduler has fenced: its generation is older than the authoritative one.">stale copy <b>${esc(vmName(s.vm_id))}</b> g${s.gen}</span>`)
     .join('');
   return `<section class="${cls.join(' ')}" aria-label="Host ${esc(h.id)}" style="--lease:${LEASE[h.lease] || 'var(--faint)'}">
     <div class="host-head">
       <button class="host-id" data-act="pick" data-kind="host" data-id="${esc(h.id)}" title="Inspect physical host ${esc(h.id)} · ${h.slots.length} VM slots">Host ${esc(h.id)}</button>
-      <button class="agent-node${isSel(st, 'agent', h.id) ? ' sel' : ''}" data-act="pick" data-kind="agent" data-id="${esc(h.id)}" title="Inspect the host agent on ${esc(h.id)} · lease ${esc(h.lease)} · last accepted heartbeat ${dur(h.lease_age_ms)} ago. Admits VMs, owns the driver and receives guestd reports."><i></i>Host agent${h.lease !== 'healthy' ? ` · ${esc(h.lease)}` : ''}<span aria-hidden="true">›</span></button>
+      <button class="agent-node${agentStopped ? ' stopped' : ''}${isSel(st, 'agent', h.id) ? ' sel' : ''}" data-act="pick" data-kind="agent" data-id="${esc(h.id)}" title="${agentStopped ? 'Host agent stopped by Kill host; restart host to resume. ' : ''}Inspect the host agent on ${esc(h.id)} · lease ${esc(h.lease)} · last accepted heartbeat ${dur(h.lease_age_ms)} ago. Admits VMs, owns the driver and receives guestd reports."><i></i>Host agent${agentStopped ? ' · stopped' : h.lease !== 'healthy' ? ` · ${esc(h.lease)}` : ''}<span aria-hidden="true">›</span></button>
     </div>
     ${tags.length ? `<div class="tags">${tags.join('')}</div>` : ''}
-    <div class="slots" style="--n:${Math.max(1, h.slots.length)}">${h.slots.map((sl) => slot(sl, h, vms, st)).join('')}</div>
+    <div class="slots" style="--n:${Math.max(1, h.slots.length)}">${h.slots.map((sl) => slot(sl, h, vms, st, workloads)).join('')}</div>
     ${stale ? `<div class="stales">${stale}</div>` : ''}
   </section>`;
 }
 
-function rackCol(r, hosts, vms, st, playback) {
+function rackCol(r, hosts, vms, st, workloads) {
   const mine = r.hosts.map((id) => hosts.get(id)).filter((h) => h && h.admin_state !== 'removed');
   const used = mine.reduce((n, h) => n + h.slots.filter((s) => s.vm_id).length, 0);
   const total = mine.reduce((n, h) => n + h.slots.length, 0);
@@ -80,7 +82,7 @@ function rackCol(r, hosts, vms, st, playback) {
       <span class="rack-meta">${plural(mine.length, 'host')}<br>${used}/${total} slots${down ? ` · <span class="bad">${down} down</span>` : ''}</span>
       <span class="action-cue" aria-hidden="true">›</span>
     </button>
-    ${mine.map((h) => hostCard(h, vms, st, playback)).join('') || '<div class="empty">No hosts</div>'}
+    ${mine.map((h) => hostCard(h, vms, st, workloads)).join('') || '<div class="empty">No hosts</div>'}
   </section>`;
 }
 
@@ -114,6 +116,7 @@ export function render(st, v) {
   }
   const vms = new Map(s.vms.map((x) => [x.id, x]));
   const hosts = new Map(s.hosts.map((h) => [h.id, h]));
+  const workloads = new Map((s.sim?.workloads || []).map((w) => [w.vm_id, w]));
   const sched = s.scheduler || 'down';
   mount(
     el,
@@ -128,7 +131,7 @@ export function render(st, v) {
       </button>
       <div class="fleet-relationship"><span>↓ commands to host agents</span><span>↑ host inventory &amp; heartbeats</span></div>
     </div>
-    <div class="racks">${s.racks.map((r) => rackCol(r, hosts, vms, st, v.playback)).join('')}</div>
+    <div class="racks">${s.racks.map((r) => rackCol(r, hosts, vms, st, workloads)).join('')}</div>
     ${unplaced(s, st)}`,
   );
   el.classList.toggle('has-overflow', el.scrollHeight > el.clientHeight + 8);

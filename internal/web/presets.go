@@ -48,6 +48,9 @@ func (s *Server) startPreset(ctx context.Context, action string) (api.ChaosResul
 		return api.ChaosResult{}, err
 	}
 	initial.Sim = status
+	if status.Lifetime.MaxMs > 0 {
+		return api.ChaosResult{}, &api.Error{Status: 409, Msg: "turn off VM lifetimes before starting a scenario"}
+	}
 	id := "dashboard-" + action + "-" + uuid.NewString()
 	w, err := recording.Create(filepath.Join(s.o.RunsDir, id))
 	if err != nil {

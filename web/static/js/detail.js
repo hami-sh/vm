@@ -1,6 +1,6 @@
 // The detail panel for whatever is selected: a VM (with its last 20
 // transitions), a host, a rack or the scheduler. Hidden until selected.
-import { $, esc, mount, clock, dur, badge, prio, stateVar, EVENT_KINDS, vmName, shorten, hostFaults } from './util.js';
+import { $, esc, mount, clock, dur, badge, prio, stateVar, EVENT_KINDS, vmName, shorten, hostFaults, eventDetail } from './util.js';
 import { update } from './store.js';
 const LEASE = { healthy: 'var(--ok)', suspect: 'var(--warn)', lost: 'var(--bad)' };
 const SCHED = { up: 'var(--ok)', reconciling: 'var(--warn)', down: 'var(--bad)' };
@@ -39,7 +39,7 @@ function eventRows(list, empty) {
   return list
     .map((e) => {
       const move = e.to ? `<span class="st" style="--c:${stateVar(e.to)}">${esc(e.from || '—')} → ${esc(e.to)}</span> ` : `${badge(e.kind, EVENT_KINDS[e.kind] || 'var(--dim)')} `;
-      return `<div class="trans"><span class="t">${clock(e.at)}</span><span>${move}${e.gen ? `<span class="faint mono">g${e.gen}</span> ` : ''}<span class="dim">${esc(shorten(e.detail))}</span></span></div>`;
+      return `<div class="trans"><span class="t">${clock(e.at)}</span><span>${move}${e.gen ? `<span class="faint mono">g${e.gen}</span> ` : ''}<span class="dim">${esc(shorten(eventDetail(e)))}</span></span></div>`;
     })
     .join('');
 }
@@ -58,20 +58,26 @@ function vmDetail(id, s, v, guest) {
       <p class="component-role">This selection is the last-reported guestd in ${esc(vmName(id))}, generation ${guest.gen}, on ${esc(guest.host)}. Its current status is not verified. This inspector does not follow a replacement process. Fault actions are unavailable for an unverified or replaced generation.</p>
       ${vm ? `<div class="detail-links">${link('vm', id, `Current logical VM · g${vm.gen} · ${vm.host || 'unplaced'}`)}</div>` : ''}</div>`;
   }
-  const history = last(v.events, 20, (e) => e.vm_id === id && e.kind === 'transition');
-  const title = `<div class="sub-head">Last ${history.length || ''} transitions</div>`;
+  const history = last(v.events, 20, (e) => e.vm_id === id && ['transition', 'workload'].includes(e.kind));
+  const title = `<div class="sub-head">Recent VM history</div>`;
   if (!vm) {
     return `${head(vmName(id), badge('gone', 'var(--faint)'))}<div class="detail-body">
       <div class="detail-id">${esc(id)}</div><div class="empty">This VM is no longer in the fleet.</div>${title}${eventRows(history, 'None in the log window.')}</div>`;
   }
   const p = prio(vm.priority);
   const queued = (s.queue || []).findIndex((q) => q.vm_id === id);
+  const workload = (s.sim?.workloads || []).find((w) => w.vm_id === id);
+  const phase = workload?.phase === 'idle' ? 'Idle' : 'Busy';
+  const workloadStatus = workload && (workload.ends_at > s.at
+    ? `${phase}, ${phase === 'Idle' ? 'reclaimed' : 'ends'} in ${dur(workload.ends_at - s.at)}`
+    : `${phase}, ${vm.state !== 'Ready' ? 'overdue; waits for Ready' : 'ending now'}`);
   return `${head(guest ? 'guestd' : vmName(id), badge(vm.state, stateVar(vm.state)) + (vm.compromised ? badge('compromised', 'var(--bad)', 'solid') : ''), guest ? 'guest' : 'vm', id, v.playback, guest)}
     <div class="detail-body">
     <p class="component-role">${guest ? 'Runs inside this VM. Proves readiness and sends heartbeats to its local host agent, never directly to the scheduler. The state below is the scheduler’s VM state; a separate guest heartbeat age is not published.' : 'A macOS VM in a slot on its physical host. Its guestd process reports readiness to the host agent.'}</p>
     ${!guest && vm.host ? `<div class="detail-links">${link('guest', id, 'Inspect guestd', vm)} ${link('agent', vm.host, 'Inspect host agent')}</div>` : ''}
     <div class="detail-id">${esc(id)}</div>
     ${kv([
+      workload ? ['Workload', esc(workloadStatus), true] : null,
       ['Generation', vm.gen],
       ['Attempts', vm.attempts],
       ['Host', vm.host ? esc(vm.host) : '<span class="faint">none</span>'],
@@ -91,7 +97,7 @@ function hostDetail(id, s, v, catalog, agent = false) {
   const h = s.hosts.find((x) => x.id === id);
   if (!h) return `${head(id, badge('gone', 'var(--faint)'))}<div class="detail-body"><div class="empty">This host is no longer in the fleet.</div></div>`;
   const used = h.slots.filter((sl) => sl.vm_id).length;
-  const faults = hostFaults(h, catalog, v.playback);
+  const faults = hostFaults(h, catalog);
   const stale = (h.stale || []).map((x) => `${esc(vmName(x.vm_id))} g${x.gen}`).join(', ');
   const events = last(v.events, 20, (e) => e.host_id === id);
   return `${head(agent ? 'Host agent' : `Host ${id}`, badge(`lease ${h.lease}`, LEASE[h.lease] || 'var(--faint)'), agent ? 'agent' : 'host', id, v.playback)}
@@ -100,7 +106,8 @@ function hostDetail(id, s, v, catalog, agent = false) {
     <div class="detail-links">${agent ? link('host', id, `Inspect host ${id}`) : link('agent', id, 'Inspect host agent')}</div>
     ${kv([
       ['Rack', esc(h.rack)],
-      ['Admin state', esc(h.admin_state)],
+      ['Admin state', h.admin_state === 'cordoned' ? 'Cordoned · no new VMs; existing VMs keep running' : esc(h.admin_state), true],
+      ['Host agent', faults.some((f) => f === 'kill-host' || f === 'killed') ? 'Stopped by Kill host; restart host to resume' : h.lease === 'healthy' ? 'Reporting heartbeats' : 'Not reporting; agent or connection unavailable', true],
       [h.lease === 'healthy' ? 'Last heartbeat' : 'Silent for', dur(h.lease_age_ms)],
       ['Slots', `${used} of ${h.slots.length} used`],
       ['Faults', faults.length ? `<span class="bad">${esc(faults.join(', '))}</span>` : '<span class="faint">none</span>', true],
