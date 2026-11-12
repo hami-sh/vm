@@ -1,19 +1,8 @@
 // The evidence panel: what turns "it seems to work" into something checked.
 // Invariant lights, the attack counter, time to Ready against its target,
 // and how much room is left to absorb a rack failure.
-import { $, esc, mount, clock, dur, secs, badge, INVARIANTS, PRIORITIES, title } from './util.js';
+import { $, esc, mount, clock, dur, secs, badge, INVARIANTS, INVARIANT_HINTS as CHECKS, PRIORITIES, title } from './util.js';
 import { update } from './store.js';
-
-const CHECKS = {
-  one_authoritative_copy: 'At most one copy of a VM is authoritative: current generation and Ready in the scheduler.',
-  stale_copy_stopped: 'A copy with an old generation is stopped within one heartbeat of its host reconnecting.',
-  slot_capacity: 'No host runs more VMs than it has slots, counting slots still releasing.',
-  generation_monotonic: "A VM's generation never decreases, including across scheduler restarts.",
-  legal_transitions: 'Every transition in the event log is in the legal-move table.',
-  queue_bounded: 'The queue never exceeds its cap, and a replacement is never shed.',
-  no_successful_attack: 'Zero successful attacks from a malicious guest.',
-  pending_placed_promptly: 'A Pending VM is placed within 2 s of capacity being free.',
-};
 
 // Short names for the lights; the full name and the rule show on click.
 const SHORT = {
@@ -25,6 +14,7 @@ const SHORT = {
   queue_bounded: 'Queue bounded',
   no_successful_attack: 'No attacks',
   pending_placed_promptly: 'Prompt starts',
+  idempotency_unique: 'One VM per key',
 };
 
 function invariants(s, st) {

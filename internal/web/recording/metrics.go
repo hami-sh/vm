@@ -19,6 +19,7 @@ func DeriveMetrics(dir string, report *api.RunReport) error {
 	created := map[string]int64{}
 	events := map[int64]api.Event{}
 	excluded := map[int64]bool{}
+	var final api.Snapshot
 	var start int64
 	first := true
 	read := func(name string, decode func(*json.Decoder) error) error {
@@ -59,6 +60,7 @@ func DeriveMetrics(dir string, report *api.RunReport) error {
 		for _, v := range s.VMs {
 			created[v.ID] = v.CreatedAt
 		}
+		final = s
 		for _, e := range s.Recent {
 			add(e)
 		}
@@ -114,6 +116,13 @@ func DeriveMetrics(dir string, report *api.RunReport) error {
 	if report.Metrics == nil {
 		report.Metrics = map[string]float64{}
 	}
+	// Quarantine is intentional termination, not an unfulfilled recovery.
+	for _, v := range final.VMs {
+		if v.State == api.VMFailed && v.LastReason == api.ReasonQuarantined {
+			delete(lost, v.ID)
+		}
+	}
+	report.Metrics["recovery_failures"] = float64(len(lost))
 	for name, samples := range map[string][]int64{"recover": recoveries, "ready": boots} {
 		value := int64(0)
 		if len(samples) > 0 {
@@ -122,6 +131,9 @@ func DeriveMetrics(dir string, report *api.RunReport) error {
 		}
 		report.Metrics["p99_"+name+"_ms"] = float64(value)
 		if name == "recover" {
+			if len(samples) == 0 {
+				delete(report.Metrics, "p99_recover_ms")
+			}
 			report.P99RecoverMs = value
 			report.Metrics["recovery_samples"] = float64(len(samples))
 		} else {

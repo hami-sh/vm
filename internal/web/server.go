@@ -355,7 +355,7 @@ func (s *Server) chaosDo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if preset {
-		res, err := s.startPreset(r.Context(), action, req)
+		res, err := s.startPreset(r.Context(), action)
 		if err != nil {
 			writeError(w, err)
 			return

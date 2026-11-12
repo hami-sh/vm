@@ -107,6 +107,8 @@ func wantStatus(t *testing.T, rec *httptest.ResponseRecorder, status int) {
 type presetSnapshots struct {
 	initial api.Snapshot
 	frames  []api.Snapshot
+	events  []api.Event
+	streams chan chan api.Event
 	done    chan struct{}
 }
 
@@ -116,48 +118,92 @@ func (p presetSnapshots) Subscribe() (<-chan api.Snapshot, <-chan api.Event, fun
 	for _, f := range p.frames {
 		snaps <- f
 	}
-	return snaps, make(chan api.Event), func() { p.done <- struct{}{} }
+	events := make(chan api.Event, len(p.events)+1)
+	for _, e := range p.events {
+		events <- e
+	}
+	p.streams <- events
+	return snaps, events, func() { p.done <- struct{}{} }
+}
+
+type presetEngine struct {
+	api.ChaosEngine
+	actions  []string
+	onAction func(string, api.ChaosRequest)
+}
+
+func (p *presetEngine) Do(_ context.Context, action string, req api.ChaosRequest) (api.ChaosResult, error) {
+	p.actions = append(p.actions, action)
+	if p.onAction != nil {
+		p.onAction(action, req)
+	}
+	return api.ChaosResult{Action: action}, nil
 }
 
 // Exercise the HTTP contract: starting a preset records real snapshot data,
 // ignores old violations, preserves new violations and lists the finished run.
 func TestDashboardPresetRecording(t *testing.T) {
-	for _, mode := range []string{"pass", "violation", "reset", "security", "not-ready", "no-generation", "stale", "no-recovery", "slow-recovery", "hostile-empty", "hostile-blocked", "speed-changed", "seed-changed"} {
+	for _, mode := range []string{"pass", "violation", "reset", "security", "not-ready", "regressed", "no-generation", "stale", "missing-observation", "no-recovery", "slow-recovery", "event-gap", "hostile-empty", "hostile-blocked", "hostile-resurrected-event", "speed-changed", "seed-changed"} {
 		t.Run(mode, func(t *testing.T) {
 			action := "split-brain"
 			if strings.HasPrefix(mode, "hostile-") {
 				action = "hostile-tenant"
 			}
-			initial := api.Snapshot{At: 1000, Sim: api.SimStatus{Seed: 42, Speed: 2},
+			initial := api.Snapshot{At: 1000, Scheduler: api.SchedulerUp, Sim: api.SimStatus{Seed: 42, Speed: 2},
 				Recent: []api.Event{{Seq: 6, At: 1000, Kind: api.EventInvariant, Detail: "old violation"}}}
+			for i, id := range []string{"slow", "fast", "third"} {
+				rack := []string{"r2", "r1", "r3"}[i]
+				host := rack + "-h1"
+				initial.VMs = append(initial.VMs, api.VM{ID: id, HostID: host, Rack: rack, State: api.VMReady, Desired: api.DesiredRunning, Generation: 1})
+				initial.Hosts = append(initial.Hosts, api.Host{ID: host, Rack: rack, SlotCount: 2, Lease: api.LeaseHealthy, AdminState: api.AdminActive})
+				initial.Observed = append(initial.Observed, api.HostObservation{HostID: host, Connected: true, Actual: []api.DriverVM{{VMID: id, Generation: 1, Running: true}}})
+			}
 			for _, name := range api.AllInvariants {
 				initial.Invariants = append(initial.Invariants, api.InvariantStatus{Name: name})
 			}
 			initial.Invariants[0].Violations = 3
-			// Default split-brain horizon: 30s heal + 15s boot + 6s lease.
-			final := api.Snapshot{At: 52000, Sim: api.SimStatus{Seed: 99, Speed: 5},
+			// The shared scenario observes its entire 90-second timeline.
+			final := api.Snapshot{At: 91000, Scheduler: api.SchedulerUp, Sim: api.SimStatus{Seed: 99, Speed: 5},
 				Invariants: slices.Clone(initial.Invariants),
-				VMs:        []api.VM{{ID: "slow", State: api.VMReady, Desired: api.DesiredRunning, Generation: 2}},
-				Recent:     append(append([]api.Event{}, initial.Recent...), api.Event{Seq: 7, At: 1100, Kind: api.EventChaos, Detail: "partition-rack"})}
+				VMs:        slices.Clone(initial.VMs), Hosts: initial.Hosts,
+				Recent: append(append([]api.Event{}, initial.Recent...), api.Event{Seq: 7, At: 1100, Kind: api.EventChaos, Detail: "partition-rack"})}
+			final.VMs[0].Generation = 2
+			for _, h := range initial.Observed {
+				h.Actual = slices.Clone(h.Actual)
+				if h.Actual[0].VMID == "slow" {
+					h.Actual[0].Generation = 2
+				}
+				final.Observed = append(final.Observed, h)
+			}
 			final.Recent = append(final.Recent,
-				api.Event{Seq: 20, At: 2000, Kind: api.EventTransition, VMID: "slow", To: api.VMLost},
-				api.Event{Seq: 21, At: 3000, Kind: api.EventTransition, VMID: "slow", To: api.VMUnhealthy},
-				api.Event{Seq: 22, At: 3500, Kind: api.EventTransition, VMID: "fast", To: api.VMUnhealthy},
-				api.Event{Seq: 23, At: 6000, Kind: api.EventTransition, VMID: "fast", To: api.VMReady},
-				api.Event{Seq: 24, At: 9000, Kind: api.EventTransition, VMID: "slow", To: api.VMReady},
-				api.Event{Seq: 25, At: 10000, Kind: api.EventTransition, VMID: "slow", To: api.VMLost},
-				api.Event{Seq: 26, At: 12000, Kind: api.EventTransition, VMID: "slow", To: api.VMReady})
+				api.Event{Seq: 8, At: 2000, Kind: api.EventTransition, VMID: "slow", To: api.VMLost},
+				api.Event{Seq: 9, At: 3000, Kind: api.EventTransition, VMID: "slow", To: api.VMUnhealthy},
+				api.Event{Seq: 10, At: 3500, Kind: api.EventTransition, VMID: "fast", To: api.VMUnhealthy},
+				api.Event{Seq: 11, At: 6000, Kind: api.EventTransition, VMID: "fast", To: api.VMReady},
+				api.Event{Seq: 12, At: 9000, Kind: api.EventTransition, VMID: "slow", To: api.VMReady},
+				api.Event{Seq: 13, At: 10000, Kind: api.EventTransition, VMID: "slow", To: api.VMLost},
+				api.Event{Seq: 14, At: 12000, Kind: api.EventTransition, VMID: "slow", To: api.VMReady})
+			if strings.HasPrefix(mode, "hostile-") {
+				for i := range final.VMs {
+					final.VMs[i].State, final.VMs[i].Generation, final.VMs[i].LastReason = api.VMFailed, 1, api.ReasonQuarantined
+					final.Observed[i].Actual[0].Running = false
+					final.Recent = append(final.Recent, api.Event{Seq: int64(15 + i), At: 15000, Kind: api.EventTransition, VMID: final.VMs[i].ID, To: api.VMUnhealthy, Generation: 1})
+				}
+			}
 			switch mode {
 			case "security":
 				final.Security.Succeeded = 1
-			case "hostile-blocked":
+			case "hostile-blocked", "hostile-resurrected-event":
 				final.Security.Blocked = 5
 			case "not-ready":
 				final.VMs[0].State = api.VMBooting
 			case "no-generation":
 				final.VMs[0].Generation = 1
+				final.Observed[0].Actual[0].Generation = 1
 			case "stale":
-				final.Hosts = []api.Host{{Stale: []api.InventoryItem{{VMID: "slow", Generation: 1}}}}
+				final.Observed[0].Actual[0].Generation = 1
+			case "missing-observation":
+				final.Observed = final.Observed[:2]
 			case "no-recovery":
 				final.Recent = final.Recent[:2]
 			case "slow-recovery":
@@ -167,11 +213,22 @@ func TestDashboardPresetRecording(t *testing.T) {
 			if mode == "violation" {
 				final.Invariants[0].Violations = 4
 				final.Invariants[0].LastDetail = "capacity exceeded"
-				final.Recent = append(final.Recent, api.Event{Seq: 8, At: 1200, Kind: api.EventInvariant, Detail: "capacity exceeded"})
+				final.Recent = append(final.Recent, api.Event{Seq: 15, At: 1200, Kind: api.EventInvariant, Detail: "capacity exceeded"})
 			}
-			src := presetSnapshots{initial: initial, done: make(chan struct{}, 4)}
+			events := slices.Clone(final.Recent[1:])
+			if mode == "event-gap" {
+				events = append(events[:2], events[3:]...)
+			}
+			src := presetSnapshots{initial: initial, events: events, streams: make(chan chan api.Event, 4), done: make(chan struct{}, 4)}
 			if mode != "reset" {
 				src.frames = []api.Snapshot{final}
+			}
+			if mode == "regressed" {
+				mid := final
+				mid.At, mid.Seq = 51000, 10
+				final.VMs = slices.Clone(final.VMs)
+				final.VMs[0].State = api.VMBooting
+				src.frames = []api.Snapshot{mid, final}
 			}
 			if mode == "speed-changed" || mode == "seed-changed" {
 				drift := initial
@@ -185,7 +242,29 @@ func TestDashboardPresetRecording(t *testing.T) {
 				// Returning to the original conditions cannot erase the failure.
 				src.frames = []api.Snapshot{drift, final}
 			}
-			h := newHarness(t, func(o *Options) { o.Snapshots = src; o.Config.ChaosPerIP = 0 })
+			engine := &presetEngine{}
+			if mode == "hostile-resurrected-event" {
+				engine.onAction = func(action string, req api.ChaosRequest) {
+					// After victims are captured by the compromise actions, emit a
+					// transient resurrection absent from every snapshot frame.
+					if action == "packet-loss" && req.Params["percent"] == 0 {
+						for {
+							select {
+							case events := <-src.streams:
+								events <- api.Event{Seq: 18, At: 21000, Kind: api.EventTransition, VMID: "slow", To: api.VMReady, Generation: 2}
+							default:
+								return
+							}
+						}
+					}
+				}
+			}
+			h := newHarness(t, func(o *Options) {
+				engine.ChaosEngine = o.Chaos
+				o.Chaos = engine
+				o.Snapshots = src
+				o.Config.ChaosPerIP = 0
+			})
 			// The engine has changed but the published snapshot is still old.
 			_, err := h.fleet.Sim(context.Background(), "chaos", api.SimRequest{Seed: 99})
 			if err != nil {
@@ -215,8 +294,39 @@ func TestDashboardPresetRecording(t *testing.T) {
 			if r.Scenario != action || r.Seed != 99 || r.Speed != 5 || r.Passed != (mode == "pass" || mode == "hostile-blocked") {
 				t.Fatalf("report: %+v", r)
 			}
-			if mode == "violation" && (r.Violations != 1 || len(r.Markers) != 2) {
+			if mode == "violation" && r.Violations != 1 {
 				t.Fatalf("new violation missing: %+v", r)
+			}
+			if mode != "reset" && slices.Contains(engine.actions, action) {
+				t.Fatal("engine preset must not also run alongside the materialized scenario")
+			}
+			if mode == "regressed" {
+				check := slices.IndexFunc(r.Checks, func(c api.CheckResult) bool { return c.Name == "desired VMs Ready" })
+				if check < 0 || r.Checks[check].Passed || r.Checks[check].Detail != "condition false at end of run" {
+					t.Fatalf("mid-run readiness must not latch: %+v", r)
+				}
+			}
+			if mode == "hostile-resurrected-event" {
+				check := slices.IndexFunc(r.Checks, func(c api.CheckResult) bool {
+					return c.Name == "compromised victims never Ready at a higher generation"
+				})
+				if check < 0 || r.Checks[check].Passed || r.Checks[check].FirstBadSeq != 18 {
+					t.Fatalf("EventTest must reject a resurrection between frames: %+v", r)
+				}
+			}
+			if mode == "event-gap" {
+				check := slices.IndexFunc(r.Checks, func(c api.CheckResult) bool { return c.Name == "recording events contiguous" })
+				if check < 0 || r.Checks[check].Passed {
+					t.Fatalf("missing source event must fail recording integrity: %+v", r)
+				}
+			}
+			if mode == "no-recovery" {
+				if _, sampled := r.Metrics["p99_recover_ms"]; sampled {
+					t.Fatal("unsampled recovery quantile must be absent")
+				}
+			}
+			if n, ok := r.Metrics["recovery_failures"]; !ok || n != 0 {
+				t.Fatalf("completed or intentionally quarantined recoveries: %+v", r.Metrics)
 			}
 			condition := slices.IndexFunc(r.Checks, func(c api.CheckResult) bool { return c.Name == "conditions unchanged" })
 			if condition < 0 {
@@ -235,11 +345,15 @@ func TestDashboardPresetRecording(t *testing.T) {
 					t.Fatalf("conditions failure must be distinct from a safety violation: %+v", r)
 				}
 			}
-			if mode != "reset" && (r.DurationMs != 51000 || r.Checks[0].Passed != true) {
+			if mode != "reset" && (r.DurationMs != 90000 || r.Checks[0].Passed != true) {
 				t.Fatalf("horizon: %+v", r)
 			}
-			if mode != "reset" && mode != "no-recovery" && mode != "slow-recovery" && (r.P99RecoverMs != 7000 || r.Metrics["recovery_samples"] != 3) {
-				t.Fatalf("per-run recovery durations should be 2500, 7000, 2000ms: %+v", r)
+			wantSamples := float64(3)
+			if mode == "hostile-resurrected-event" {
+				wantSamples++ // The forbidden resurrection is also a 6000ms recovery sample.
+			}
+			if mode != "reset" && mode != "no-recovery" && mode != "slow-recovery" && (r.P99RecoverMs != 7000 || r.Metrics["recovery_samples"] != wantSamples) {
+				t.Fatalf("per-run recovery p99 should be 7000ms with %v samples: %+v", wantSamples, r)
 			}
 			frames := h.do("GET", "/v1/runs/"+r.ID+"/snapshots", "")
 			wantStatus(t, frames, 200)

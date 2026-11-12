@@ -40,6 +40,7 @@
 .mark-key.violation { background: var(--bad); }
 
 /* ------------------------------------------------------------------ report */
+.report-panel { flex-shrink: 0; }
 .report-panel .kv { margin: 10px 12px; }
 .checks { display: grid; }
 .check { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 8px; align-items: start; padding: 7px 12px; border-bottom: 1px solid rgba(30, 38, 50, .6); }

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -18,14 +19,23 @@ import (
 
 // Subscribe before applying the preset so its first action is in the recording.
 // Only one dashboard preset runs at a time; reset interrupts it explicitly.
-func (s *Server) startPreset(ctx context.Context, action string, req api.ChaosRequest) (api.ChaosResult, error) {
+func (s *Server) startPreset(ctx context.Context, action string) (api.ChaosResult, error) {
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
 	if s.closing || s.runCancel != nil {
 		return api.ChaosResult{}, &api.Error{Status: 409, Msg: "a preset is already recording or the server is closing"}
 	}
-	if s.o.Snapshots == nil {
-		return api.ChaosResult{}, s.unavailable("snapshot source")
+	if s.o.Snapshots == nil || s.o.ControlPlane == nil {
+		return api.ChaosResult{}, s.unavailable("scenario system")
+	}
+	definitions := scenario.Catalog()
+	i := slices.IndexFunc(definitions, func(d scenario.Scenario) bool { return d.Name == action })
+	if i < 0 {
+		return api.ChaosResult{}, fmt.Errorf("no scenario expectations for %s", action)
+	}
+	definition := definitions[i]
+	if definition.NewRun != nil {
+		definition = definition.NewRun()
 	}
 	initial := s.o.Snapshots.Latest()
 	// Snapshot publication can lag a just-applied seed or speed change.
@@ -40,9 +50,7 @@ func (s *Server) startPreset(ctx context.Context, action string, req api.ChaosRe
 		return api.ChaosResult{}, err
 	}
 	snaps, events, unsubscribe := s.o.Snapshots.Subscribe()
-	if err = w.Snapshot(initial); err == nil {
-		_, err = s.o.Chaos.Do(ctx, action, req)
-	}
+	err = w.Snapshot(initial)
 	if err != nil {
 		unsubscribe()
 		w.Close()
@@ -61,39 +69,21 @@ func (s *Server) startPreset(ctx context.Context, action string, req api.ChaosRe
 			s.runCancel = nil
 			s.runMu.Unlock()
 		}()
-		if err := s.recordPreset(runCtx, w, id, action, initial, snaps, events); err != nil {
+		if err := s.recordPreset(runCtx, w, id, definition, initial, snaps, events); err != nil {
 			s.o.Logf("dashboard recording %s: %v", id, err)
 		}
 	}()
 	return api.ChaosResult{Action: action, Detail: "Recording " + id + "; available in Runs when finished"}, nil
 }
 
-func (s *Server) recordPreset(ctx context.Context, w *recording.Writer, id, action string, initial api.Snapshot, snaps <-chan api.Snapshot, events <-chan api.Event) (err error) {
+func (s *Server) recordPreset(ctx context.Context, w *recording.Writer, id string, definition scenario.Scenario, initial api.Snapshot, snaps <-chan api.Snapshot, events <-chan api.Event) (err error) {
 	defer func() { err = errors.Join(err, w.Close()) }()
-	cfg := s.o.Config
-	// Cover the last scheduled fault/heal or rack drain, then allow recovery.
-	// All durations derive from config, never from wall speed or UI timers.
-	duration := max(cfg.PresetHealAfter, 2*cfg.PresetStepEvery)
-	if action == "rolling-maintenance" {
-		duration = time.Duration(max(0, len(initial.Racks)-1))*cfg.PresetHealAfter + cfg.DrainGrace
-	}
-	duration += cfg.BootDeadline + cfg.HostLeaseTTL
 	report := api.RunReport{RunSummary: api.RunSummary{
-		ID: id, Scenario: action, Seed: initial.Sim.Seed, Speed: initial.Sim.Speed,
+		ID: id, Scenario: definition.Name, Seed: initial.Sim.Seed, Speed: initial.Sim.Speed,
 		StartedAt: s.o.Clock.Now().UTC().Format(time.RFC3339),
 	}, Metrics: map[string]float64{}}
-	definitions := scenario.Catalog()
-	i := slices.IndexFunc(definitions, func(d scenario.Scenario) bool { return d.Name == action })
-	if i < 0 {
-		return fmt.Errorf("no scenario expectations for %s", action)
-	}
-	definition := definitions[i]
 	results := make([]api.CheckResult, len(definition.Expect))
 	tests := make([]scenario.Predicate, len(definition.Expect))
-	var lastAction time.Duration
-	for _, step := range definition.Timeline {
-		lastAction = max(lastAction, step.At)
-	}
 	for i, check := range definition.Expect {
 		results[i] = api.CheckResult{Name: check.Name, Passed: check.Until == 0 && check.Metric == ""}
 		tests[i] = check.Test
@@ -101,9 +91,9 @@ func (s *Server) recordPreset(ctx context.Context, w *recording.Writer, id, acti
 			tests[i] = check.NewTest()
 		}
 	}
-	seen := map[int64]bool{}
+	var initialEventSeq int64
 	for _, e := range initial.Recent {
-		seen[e.Seq] = true
+		initialEventSeq = max(initialEventSeq, e.Seq)
 	}
 	baseline := map[api.InvariantName]int{}
 	counts := map[api.InvariantName]int{}
@@ -145,18 +135,29 @@ func (s *Server) recordPreset(ctx context.Context, w *recording.Writer, id, acti
 				results[i].FirstBadSeq = snap.Seq
 				results[i].Detail = fmt.Sprintf("failed at sim +%s", elapsed)
 			}
-			// The healthy state before a fault cannot satisfy recovery checks.
-			if check.Until > 0 && elapsed > lastAction && elapsed <= check.Until && good {
-				results[i].Passed = true
-			}
 		}
 	}
 	observe(initial)
+	contiguous := api.CheckResult{Name: "recording events contiguous", Passed: true}
+	// The subscription starts after Latest; anchor at its first source event,
+	// not at an older publication's recent-event window.
+	var lastEventSeq int64
 	addEvent := func(e api.Event) error {
-		if e.At < initial.At || seen[e.Seq] {
+		if e.Seq <= initialEventSeq && e.Seq > 0 {
 			return nil
 		}
-		seen[e.Seq] = true
+		if (e.Seq <= 0 || (lastEventSeq != 0 && e.Seq != lastEventSeq+1)) && contiguous.Passed {
+			contiguous.Passed = false
+			contiguous.Detail = fmt.Sprintf("event sequence gap: after %d received %d", lastEventSeq, e.Seq)
+		}
+		lastEventSeq = e.Seq
+		for i, check := range definition.Expect {
+			if check.EventTest != nil && !check.EventTest(e) && results[i].Passed {
+				results[i].Passed = false
+				results[i].FirstBadSeq = e.Seq
+				results[i].Detail = fmt.Sprintf("failed on event %d: %s", e.Seq, e.Detail)
+			}
+		}
 		if e.Kind == api.EventChaos || e.Kind == api.EventInvariant {
 			report.Markers = append(report.Markers, e)
 		}
@@ -164,8 +165,30 @@ func (s *Server) recordPreset(ctx context.Context, w *recording.Writer, id, acti
 	}
 	latest := initial
 	completed := false
+	system := scenario.FromFleet(s.o.ControlPlane, s.o.Chaos, s.o.Snapshots)
+	steps := slices.Clone(definition.Timeline)
+	slices.SortStableFunc(steps, func(a, b scenario.Step) int { return cmp.Compare(a.At, b.At) })
+	next := 0
+	var actionErr error
+	advance := func(elapsed time.Duration) {
+		for next < len(steps) && elapsed >= steps[next].At && actionErr == nil {
+			actionErr = steps[next].Do(ctx, system)
+			if actionErr != nil {
+				actionErr = fmt.Errorf("at %s: %w", steps[next].At, actionErr)
+				return
+			}
+			report.Markers = append(report.Markers, api.Event{At: latest.At, Kind: api.EventChaos, Detail: fmt.Sprintf("scenario %s step %d", definition.Name, next)})
+			next++
+		}
+	}
+	// Materialize once: timeline actions populate the same closure state that
+	// assertions inspect. Time-zero injections precede the initial load.
+	advance(0)
+	for i := 0; i < definition.Load.Count && actionErr == nil; i++ {
+		_, actionErr = system.CreateVM(ctx, fmt.Sprintf("%s-seed-%d-%d", id, report.Seed, i), api.CreateVMRequest{Pool: "ios-xcode16-m", Priority: definition.Load.Priority})
+	}
 loop:
-	for {
+	for actionErr == nil {
 		select {
 		case <-ctx.Done():
 			break loop
@@ -185,26 +208,43 @@ loop:
 				break loop
 			}
 			latest = snap
+			advance(time.Duration(snap.At-initial.At) * time.Millisecond)
 			observe(snap)
-			for _, e := range snap.Recent {
-				if err = addEvent(e); err != nil {
-					return err
-				}
-			}
 			for _, inv := range snap.Invariants {
 				counts[inv.Name] = max(counts[inv.Name], inv.Violations-baseline[inv.Name])
 			}
 			if err = w.Snapshot(snap); err != nil {
 				return err
 			}
-			if snap.At-initial.At >= duration.Milliseconds() {
+			if snap.At-initial.At >= definition.Duration.Milliseconds() && actionErr == nil {
 				completed = true
 				break loop
 			}
 		}
 	}
+	// A final frame can race with its source events. Evaluate every buffered
+	// event before final-frame and metric checks, as the CLI runner does.
+drain:
+	for {
+		select {
+		case e, ok := <-events:
+			if !ok {
+				break drain
+			}
+			if err = addEvent(e); err != nil {
+				return err
+			}
+		default:
+			break drain
+		}
+	}
 	report.DurationMs = max(0, latest.At-initial.At)
 	report.Checks = append(report.Checks, api.CheckResult{Name: "recording completed", Passed: completed, Detail: "Reset or server shutdown interrupts the observation window"})
+	actions := api.CheckResult{Name: "scenario actions completed", Passed: actionErr == nil && next == len(steps)}
+	if actionErr != nil {
+		actions.Detail = actionErr.Error()
+	}
+	report.Checks = append(report.Checks, actions, contiguous)
 	for _, name := range api.AllInvariants {
 		n := counts[name]
 		report.Violations += n
@@ -233,6 +273,13 @@ loop:
 		return err
 	}
 	for i, check := range definition.Expect {
+		if check.Until > 0 {
+			results[i].Passed = tests[i](latest)
+			if !results[i].Passed {
+				results[i].FirstBadSeq = latest.Seq
+				results[i].Detail = "condition false at end of run"
+			}
+		}
 		if check.Metric != "" {
 			value, ok := report.Metrics[check.Metric]
 			if check.Metric == "p99_recover_ms" {

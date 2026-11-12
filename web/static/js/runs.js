@@ -1,7 +1,7 @@
 // The Runs page. The list comes from GET /v1/runs; opening a run plays its
 // recorded snapshots through the same panels as the live fleet (see view() in
 // store.js). This module adds the scrubber bar and the report.
-import { $, esc, mount, clock, dur, secs, badge, EVENT_KINDS, shorten, title } from './util.js';
+import { $, esc, mount, clock, dur, secs, badge, EVENT_KINDS, INVARIANTS, INVARIANT_HINTS, shorten, title } from './util.js';
 import { state, update } from './store.js';
 import { api } from './api.js';
 
@@ -200,9 +200,9 @@ function report(st) {
   const checks = (r.checks || [])
     .map((c) => {
       const bad = c.first_bad_seq ? (r.markers || []).find((m) => m.seq === c.first_bad_seq) : null;
-      return `<div class="check ${c.passed ? 'pass' : 'fail'}">
+      return `<div class="check ${c.passed ? 'pass' : 'fail'}" ${INVARIANT_HINTS[c.name] ? `title="${esc(INVARIANTS[c.name])} — ${esc(INVARIANT_HINTS[c.name])}"` : ''}>
         <i>${c.passed ? '✓' : '✕'}</i>
-        <div><b>${esc(title(c.name))}</b>${c.detail ? `<span>${esc(shorten(c.detail))}</span>` : ''}</div>
+        <div><b>${esc(INVARIANTS[c.name] || title(c.name))}</b>${c.detail ? `<span>${esc(shorten(c.detail))}</span>` : ''}</div>
         ${bad ? `<button class="btn sm danger" data-act="seek" data-at="${bad.at}" title="Jump to the first recorded violation of this check">Go to ${clock(bad.at)}</button>` : ''}
       </div>`;
     })
@@ -230,7 +230,7 @@ function report(st) {
        <div><span class="k">p99 recovery</span><span class="v">${r.p99_recover_ms ? secs(r.p99_recover_ms) : '–'}</span></div>
        <div><span class="k">Violations</span><span class="v${r.violations ? ' bad' : ''}">${r.violations}</span></div>
        <div><span class="k">Sim time</span><span class="v">${dur(r.duration_ms)}</span></div>
-       <div><span class="k">Started</span><span class="v">${esc(started(r.started_at))}</span></div>
+       <div class="wide"><span class="k">Started</span><span class="v">${esc(started(r.started_at))}</span></div>
      </div>
      <div class="sub-head">Checks</div><div class="checks">${checks || '<div class="empty">No checks recorded.</div>'}</div>
      ${metrics ? `<div class="sub-head">Metrics</div><div class="kv">${metrics}</div>` : ''}
