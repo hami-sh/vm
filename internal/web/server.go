@@ -6,8 +6,6 @@
 package web
 
 import (
-	"bufio"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -27,7 +25,6 @@ import (
 	"github.com/hami-sh/vm/internal/api"
 	"github.com/hami-sh/vm/internal/clock"
 	"github.com/hami-sh/vm/internal/config"
-	"github.com/hami-sh/vm/internal/web/recording"
 	"github.com/hami-sh/vm/web/static"
 )
 
@@ -37,8 +34,8 @@ type Options struct {
 	Chaos        api.ChaosEngine
 	Snapshots    api.SnapshotSource
 	Config       config.Config
-	// Clock is wall time for SSE pacing, the per-IP chaos limit and idle
-	// reset. Default clock.Real{}. (Sim time comes from snapshots.)
+	// Clock is wall time for SSE pacing and the per-IP chaos limit. Default
+	// clock.Real{}. (Sim time comes from snapshots.)
 	Clock clock.Clock
 	// RunsDir holds runs/<id>/ recordings. Default "runs".
 	RunsDir string
@@ -48,23 +45,22 @@ type Options struct {
 	// Static overrides the embedded dashboard, e.g. os.DirFS("web/static")
 	// for live editing.
 	Static fs.FS
-	// IdleReset calls the "reset" chaos action after Config.IdleResetAfter of
-	// wall time with no chaos request, if any chaos happened since the last
-	// reset. For the public demo; off in tests and scenario runs.
-	IdleReset bool
 	// Logf logs handler failures. Default log.Printf.
 	Logf func(format string, args ...any)
 }
 
 // Server is the HTTP front of the control plane.
+//
+// The idle auto-reset from the plan's public-URL hardening is not here: the
+// chaos engine already resets itself after config.IdleResetAfter of wall time
+// without chaos, and a second timer in this package would reset twice.
 type Server struct {
 	o       Options
 	mux     *http.ServeMux
 	hub     *hub
 	limiter *ipLimiter
-	idle    idleTracker
 	cancel  context.CancelFunc
-	done    chan struct{}
+	done    chan struct{} // closed when the hub has stopped
 }
 
 // New builds a Server and starts its SSE hub. Call Close to stop the hub.
@@ -90,13 +86,7 @@ func New(o Options) *Server {
 	s.hub = newHub(o.Snapshots, o.Clock, o.Config.SSEEvery)
 	go func() {
 		defer close(s.done)
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() { defer wg.Done(); s.hub.run(ctx) }()
-		if o.IdleReset && o.Chaos != nil {
-			s.idleResetLoop(ctx)
-		}
-		wg.Wait()
+		s.hub.run(ctx)
 	}()
 	s.routes()
 	return s
@@ -125,7 +115,7 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /v1/chaos/actions", s.chaosActions)
 	m.HandleFunc("POST /v1/chaos/{action}", s.limited(s.chaosDo))
 	m.HandleFunc("POST /v1/sim/{action}", s.sim)
-	m.HandleFunc("POST /v1/topology/{action}", s.limited(s.topology))
+	m.HandleFunc("POST /v1/topology/{action}", s.topology)
 	m.HandleFunc("GET /v1/runs", s.listRuns)
 	m.HandleFunc("GET /v1/runs/{id}", s.getRun)
 	m.HandleFunc("GET /v1/runs/{id}/snapshots", s.runSnapshots)
@@ -138,7 +128,14 @@ func (s *Server) routes() {
 		writeError(w, &api.Error{Status: http.StatusNotFound, Msg: "no route " + r.Method + " " + r.URL.Path})
 	})
 	files := http.FileServerFS(s.o.Static)
-	m.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+	// "GET /" would conflict with the method-less "/v1/" catch-all above
+	// (fewer methods, more general path), so the method is checked here.
+	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			writeError(w, &api.Error{Status: http.StatusMethodNotAllowed, Msg: "method not allowed"})
+			return
+		}
 		// The dashboard is tiny and changes with each deploy: always revalidate.
 		w.Header().Set("Cache-Control", "no-cache")
 		files.ServeHTTP(w, r)
@@ -332,7 +329,6 @@ func (s *Server) chaosDo(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	s.idle.seen(s.o.Clock.Now(), r.PathValue("action") == "reset")
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -382,11 +378,12 @@ func (s *Server) topology(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	s.idle.seen(s.o.Clock.Now(), false)
 	writeJSON(w, http.StatusOK, res)
 }
 
-// limited applies the per-IP chaos rate limit (config.ChaosPerIP).
+// limited applies the per-IP chaos rate limit (config.ChaosPerIP, on wall
+// time) to POST /v1/chaos/{action} only. Sim controls, topology changes and
+// the VM API are not chaos and are not limited.
 func (s *Server) limited(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if wait := s.limiter.allow(clientIP(r), s.o.Clock.Now()); wait > 0 {
@@ -443,43 +440,6 @@ func (l *ipLimiter) allow(ip string, now time.Time) time.Duration {
 	return 0
 }
 
-// idleTracker remembers the last chaos request, for the idle auto-reset.
-type idleTracker struct {
-	mu    sync.Mutex
-	last  time.Time
-	dirty bool // chaos happened since the last reset
-}
-
-func (t *idleTracker) seen(now time.Time, reset bool) {
-	t.mu.Lock()
-	t.last, t.dirty = now, !reset
-	t.mu.Unlock()
-}
-
-func (t *idleTracker) due(now time.Time, after time.Duration) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.dirty && after > 0 && now.Sub(t.last) >= after
-}
-
-func (s *Server) idleResetLoop(ctx context.Context) {
-	t := s.o.Clock.NewTicker(time.Second)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case now := <-t.C():
-			if s.idle.due(now, s.o.Config.IdleResetAfter) {
-				if _, err := s.o.Chaos.Do(ctx, "reset", api.ChaosRequest{}); err != nil {
-					s.o.Logf("web: idle reset: %v", err)
-				}
-				s.idle.seen(now, true)
-			}
-		}
-	}
-}
-
 // ------------------------------------------------------------- snapshots
 
 func (s *Server) snapshot(w http.ResponseWriter, _ *http.Request) {
@@ -488,82 +448,6 @@ func (s *Server) snapshot(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.o.Snapshots.Latest())
-}
-
-// ------------------------------------------------------------------ runs
-
-func (s *Server) listRuns(w http.ResponseWriter, _ *http.Request) {
-	runs, err := recording.List(s.o.RunsDir)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, runs)
-}
-
-func runErr(err error) error {
-	if errors.Is(err, recording.ErrNotFound) {
-		return &api.Error{Status: http.StatusNotFound, Msg: err.Error()}
-	}
-	return err
-}
-
-func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
-	rep, err := recording.Report(s.o.RunsDir, r.PathValue("id"))
-	if err != nil {
-		writeError(w, runErr(err))
-		return
-	}
-	writeJSON(w, http.StatusOK, rep)
-}
-
-// runSnapshots streams snapshots.jsonl as NDJSON. ?every=N keeps one line in
-// N (playback of long runs); gzip is used when the client accepts it.
-func (s *Server) runSnapshots(w http.ResponseWriter, r *http.Request) {
-	f, err := recording.OpenSnapshots(s.o.RunsDir, r.PathValue("id"))
-	if err != nil {
-		writeError(w, runErr(err))
-		return
-	}
-	defer f.Close()
-	every := 1
-	if v := r.URL.Query().Get("every"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 {
-			writeError(w, badRequest("every must be a positive integer"))
-			return
-		}
-		every = n
-	}
-	w.Header().Set("Content-Type", "application/x-ndjson")
-	w.Header().Set("Vary", "Accept-Encoding")
-	var out io.Writer = w
-	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-		w.Header().Set("Content-Encoding", "gzip")
-		gz := gzip.NewWriter(w)
-		defer gz.Close()
-		out = gz
-	}
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64<<10), 16<<20)
-	var last []byte
-	for i := 0; sc.Scan(); i++ {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		if i%every != 0 {
-			last = append(last[:0], line...)
-			continue
-		}
-		last = last[:0]
-		out.Write(line)
-		out.Write([]byte{'\n'})
-	}
-	if len(last) > 0 { // always include the final state
-		out.Write(last)
-		out.Write([]byte{'\n'})
-	}
 }
 
 // --------------------------------------------------------------- metrics

@@ -14,10 +14,10 @@ import (
 )
 
 // hub fans one SnapshotSource subscription out to every SSE client. Each
-// client gets the latest snapshot on connect, then one "snapshot" message
-// every SSEEvery of wall time (when it changed) and every "event" as it is
-// published. A slow client misses messages rather than slowing the others:
-// the next snapshot supersedes whatever it missed.
+// client gets the latest snapshot and the recent event backlog on connect,
+// then one "snapshot" message every SSEEvery of wall time (when it changed)
+// and every "event" as it is published. A slow client misses messages rather
+// than slowing the others: the next snapshot supersedes whatever it missed.
 type hub struct {
 	src   api.SnapshotSource
 	clk   clock.Clock
@@ -25,17 +25,33 @@ type hub struct {
 
 	mu      sync.Mutex
 	clients map[chan []byte]struct{}
+	// backlog holds the last backlogEvents events, oldest first, so a page
+	// opened mid-run has history for its event log and detail panel.
+	backlog []api.Event
+	seen    map[int64]struct{} // Seq of every event in backlog
 }
 
-// clientBuffer is how many messages a client may fall behind before drops.
-const clientBuffer = 256
+const (
+	// clientBuffer is how many messages a client may fall behind before drops.
+	clientBuffer = 256
+	// backlogEvents is how many events a new client is sent on connect.
+	backlogEvents = 500
+	// keepAlive is the wall time between SSE comments on an idle stream, so
+	// proxies don't close it.
+	keepAlive = 15 * time.Second
+	// resubscribeAfter is the wall-time pause before subscribing again when
+	// the source closes its channels.
+	resubscribeAfter = 250 * time.Millisecond
+)
 
 func newHub(src api.SnapshotSource, clk clock.Clock, every time.Duration) *hub {
-	return &hub{src: src, clk: clk, every: every, clients: map[chan []byte]struct{}{}}
+	return &hub{src: src, clk: clk, every: every,
+		clients: map[chan []byte]struct{}{}, seen: map[int64]struct{}{}}
 }
 
-// sseFrame formats one SSE message. JSON never contains a raw newline, so
-// data fits on one line.
+// sseFrame formats one SSE message: "event: <name>", an optional "id: <id>"
+// and one "data: <json>" line, ended by a blank line. encoding/json never
+// emits a raw newline, so the payload always fits on one data line.
 func sseFrame(event string, id int64, v any) []byte {
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -55,12 +71,20 @@ func sseFrame(event string, id int64, v any) []byte {
 	return buf.Bytes()
 }
 
-func (h *hub) add() chan []byte {
+// add registers a client and returns the backlog events after afterSeq, in
+// one step, so the client sees every event exactly once.
+func (h *hub) add(afterSeq int64) (chan []byte, []api.Event) {
 	ch := make(chan []byte, clientBuffer)
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.clients[ch] = struct{}{}
-	h.mu.Unlock()
-	return ch
+	var missed []api.Event
+	for _, e := range h.backlog {
+		if e.Seq > afterSeq {
+			missed = append(missed, e)
+		}
+	}
+	return ch, missed
 }
 
 func (h *hub) remove(ch chan []byte) {
@@ -69,12 +93,10 @@ func (h *hub) remove(ch chan []byte) {
 	h.mu.Unlock()
 }
 
-func (h *hub) broadcast(frame []byte) {
+func (h *hub) broadcastLocked(frame []byte) {
 	if frame == nil {
 		return
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	for ch := range h.clients {
 		select {
 		case ch <- frame:
@@ -83,8 +105,38 @@ func (h *hub) broadcast(frame []byte) {
 	}
 }
 
+func (h *hub) snapshot(s api.Snapshot) {
+	frame := sseFrame("snapshot", 0, s)
+	h.mu.Lock()
+	h.broadcastLocked(frame)
+	h.mu.Unlock()
+}
+
+// event broadcasts e unless it was already sent. The source's event channel
+// drops events when it is full, so the hub also feeds every snapshot's
+// Recent list through here; Seq makes the second copy a no-op.
+func (h *hub) event(e api.Event) {
+	frame := sseFrame("event", e.Seq, e)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if e.Seq != 0 {
+		if _, dup := h.seen[e.Seq]; dup {
+			return
+		}
+		h.seen[e.Seq] = struct{}{}
+	}
+	h.backlog = append(h.backlog, e)
+	if over := len(h.backlog) - backlogEvents; over > 0 {
+		for _, old := range h.backlog[:over] {
+			delete(h.seen, old.Seq)
+		}
+		h.backlog = append(h.backlog[:0], h.backlog[over:]...)
+	}
+	h.broadcastLocked(frame)
+}
+
 // run owns the subscription until ctx ends, resubscribing if the source
-// closes its channels (e.g. the fleet was rebuilt by a reset).
+// closes its channels (e.g. the fleet was rebuilt).
 func (h *hub) run(ctx context.Context) {
 	if h.src == nil {
 		return
@@ -93,7 +145,7 @@ func (h *hub) run(ctx context.Context) {
 		h.follow(ctx)
 		select {
 		case <-ctx.Done():
-		case <-h.clk.After(250 * time.Millisecond):
+		case <-h.clk.After(resubscribeAfter):
 		}
 	}
 }
@@ -113,26 +165,27 @@ func (h *hub) follow(ctx context.Context) {
 			if !ok {
 				return
 			}
+			for _, e := range s.Recent {
+				h.event(e)
+			}
 			latest, have = s, true
 		case e, ok := <-events:
 			if !ok {
 				return
 			}
-			h.broadcast(sseFrame("event", e.Seq, e))
+			h.event(e)
 		case <-tick.C():
 			if have && latest.Seq != sentSeq {
 				sentSeq = latest.Seq
-				h.broadcast(sseFrame("snapshot", 0, latest))
+				h.snapshot(latest)
 			}
 		}
 	}
 }
 
-// keepAlive is the wall time between SSE comments on an idle stream, so
-// proxies don't close it.
-const keepAlive = 15 * time.Second
-
-// events serves GET /v1/events.
+// events serves GET /v1/events: the latest snapshot, the event backlog (only
+// events after Last-Event-ID when the browser is reconnecting), then live
+// messages.
 func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	if s.o.Snapshots == nil {
 		writeError(w, s.unavailable("snapshot source"))
@@ -140,17 +193,21 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	}
 	rc := http.NewResponseController(w)
 	rc.SetWriteDeadline(time.Time{}) // a stream outlives any server write timeout
-	h := w.Header()
-	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
-	h.Set("Connection", "keep-alive")
-	h.Set("X-Accel-Buffering", "no")
+	hd := w.Header()
+	hd.Set("Content-Type", "text/event-stream")
+	hd.Set("Cache-Control", "no-cache")
+	hd.Set("Connection", "keep-alive")
+	hd.Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
-	ch := s.hub.add()
+	after, _ := strconv.ParseInt(r.Header.Get("Last-Event-ID"), 10, 64)
+	ch, missed := s.hub.add(after)
 	defer s.hub.remove(ch)
 	w.Write([]byte("retry: 2000\n\n"))
 	w.Write(sseFrame("snapshot", 0, s.o.Snapshots.Latest()))
+	for _, e := range missed {
+		w.Write(sseFrame("event", e.Seq, e))
+	}
 	if rc.Flush() != nil {
 		return
 	}

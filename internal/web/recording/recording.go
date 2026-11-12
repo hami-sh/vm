@@ -263,7 +263,7 @@ func List(root string) ([]api.RunSummary, error) {
 }
 
 // OpenSnapshots opens root/<id>/snapshots.jsonl.
-func OpenSnapshots(root, id string) (io.ReadCloser, error) {
+func OpenSnapshots(root, id string) (io.ReadSeekCloser, error) {
 	dir, err := runDir(root, id)
 	if err != nil {
 		return nil, err
