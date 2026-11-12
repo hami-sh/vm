@@ -78,3 +78,52 @@ func TestCrossComponentSlackAndEventDeduplication(t *testing.T) {
 		t.Fatal("duplicate event checked twice", e)
 	}
 }
+
+func TestPendingPlacementRequiresJointlyAvailableCapacity(t *testing.T) {
+	for _, mode := range []string{"killed host before lease expiry", "scheduler occupied", "agent occupied", "different free slots", "disconnected", "disk full", "scheduler suspect", "scheduler cordoned", "available"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := config.Default()
+			c := New(cfg)
+			s := api.Snapshot{At: 1000, Scheduler: api.SchedulerUp,
+				VMs: []api.VM{{ID: "pending", State: api.VMPending}},
+				Hosts: []api.Host{{ID: "h", SlotCount: 2, Lease: api.LeaseHealthy, AdminState: api.AdminActive,
+					Slots: []api.Slot{{Index: 0, State: api.SlotFree}, {Index: 1, State: api.SlotOccupied}}}},
+			}
+			raw := Observation{Host: s.Hosts[0], Connected: true}
+			raw.Host.Slots = []api.Slot{{Index: 0, State: api.SlotFree}, {Index: 1, State: api.SlotOccupied}}
+			switch mode {
+			case "killed host before lease expiry":
+				s.Hosts[0].Slots[0].State = api.SlotOccupied
+				raw.Host.Slots[1].State = api.SlotFree
+				raw.Host.Faults = []string{"kill-host"}
+			case "scheduler occupied":
+				s.Hosts[0].Slots[0].State = api.SlotOccupied
+			case "agent occupied":
+				raw.Host.Slots[0].State = api.SlotOccupied
+			case "different free slots":
+				raw.Host.Slots[0].State = api.SlotOccupied
+				raw.Host.Slots[1].State = api.SlotFree
+			case "disconnected":
+				raw.Connected = false
+			case "disk full":
+				raw.Host.Faults = []string{"fill-disk"}
+			case "scheduler suspect":
+				s.Hosts[0].Lease = api.LeaseSuspect
+			case "scheduler cordoned":
+				s.Hosts[0].AdminState = api.AdminCordoned
+			}
+			c.Check(s, raw)
+			// Still inside the healthy host lease, but beyond the unchanged
+			// placement deadline and one heartbeat of cross-component slack.
+			s.At += cfg.HostLeaseTTL.Milliseconds() - 1
+			out := c.Check(s, raw)
+			want := 0
+			if mode == "available" {
+				want = 1
+			}
+			if len(out) != want || (want == 1 && out[0].Detail != string(api.InvPendingPlaced)+": pending") {
+				t.Fatalf("violations=%+v, want %d placement violations", out, want)
+			}
+		})
+	}
+}
