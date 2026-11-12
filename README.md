@@ -1,10 +1,10 @@
 # macOS VM control plane
 
-A Go control plane for macOS VMs across three racks, four hosts per rack and two VM slots per host. It demonstrates lifecycle correctness under guest, host, rack and scheduler failures: readiness comes from a checked guest registration, placement is persisted before commands are sent, and generations fence stale copies. Live deployment: **https://controlplane-production-0652d599.up.railway.app** (`/healthz`). The initial deployment is the Phase 0 health stub; the dashboard and assembled fleet are being integrated. Built as five parallel workstreams; see [COORDINATION.md](COORDINATION.md).
+A Go control plane for macOS VMs across three racks, four hosts per rack and two VM slots per host. It demonstrates lifecycle correctness under guest, host, rack and scheduler failures: readiness comes from a checked guest registration, placement is persisted before commands are sent, and generations fence stale copies. Live deployment: **https://controlplane-production-0652d599.up.railway.app** (`/healthz`). The initial deployment is the Phase 0 health stub; the source now serves the dashboard and assembled fleet, pending release. Built as five parallel workstreams; see [COORDINATION.md](COORDINATION.md).
 
 ## Try this: a 60-second tour
 
-Once the dashboard is integrated:
+In the local dashboard (or the live deployment after release):
 
 1. Flood the 24 slots. Watch admission queue by priority, then 429s or shedding at the 32-entry cap.
 2. Kill a host. Its lease becomes Suspect, then Lost; replacement VMs receive a new generation.
@@ -16,7 +16,7 @@ For local development, install Go 1.27.4 and run `make run`. The binary listens 
 
 ## Verify and record
 
-`make verify` runs vet, race tests and every scenario 20 times against isolated real fleets (scheduler, SQLite, agents, drivers, simnet and checker) in-process under the race detector. Fakes test harness semantics, never substitute for the real fleet at this gate. `make e2e` is the separate real-server SSE/HTTP gate; it remains required and is expected to fail until the HTTP server is wired to the fleet and web handler.
+`make verify` runs vet, race tests, the real-server SSE/HTTP end-to-end check and every scenario 20 times against isolated real fleets (scheduler, SQLite, agents, drivers, simnet and checker) in-process under the race detector. Fakes test harness semantics, never substitute for the real fleet at this gate. `make e2e` also runs the HTTP/SSE check independently.
 
 ```sh
 make verify
@@ -29,7 +29,7 @@ The default is four concurrent isolated fleets. On the 16-vCPU / 31-GiB verifica
 
 The runner defaults to **5×**, including under `-race`. Explicit `--speed 0` calibrates the complete suite at 5× and 50× with the same seeds. Different liveness pass rates select 5×; this includes time-bounded invariants 2 (stale-copy stop deadline) and 8 (prompt placement). Any violation of invariant 1 or 3–7 at either speed fails calibration: reducing speed must never conceal those safety bugs. Failures at both speeds also stop calibration. Use `--speed` for an explicit diagnostic override, `--seed` to choose the seed range, `--parallel` to cap isolated systems and `--output` to choose the recording directory. Seeds reproduce fault choices, not goroutine scheduling. Recovery latency is measured from Lost/Unhealthy to Ready transition events, not snapshots, which can miss transient lifecycle states.
 
-Each recorded run contains the following files. `vmctl verify` writes `runs/<id>/` by default; `make verify` keeps each batch under `runs/verify-*/` and copies the latest successful batch to `runs/latest/` for the release image. Failed batches remain available and never replace that image evidence.
+Each recorded run contains the following files. `vmctl verify` writes `runs/<id>/` by default; `make verify` keeps each full batch under `runs/verify-*/` and bundles one passing run per scenario from the latest successful batch into `runs/latest/`. The bundle keeps every twentieth frame, both endpoints, and every frame within ±2 simulated seconds of a chaos/violation marker. Reports, metrics and event logs are unchanged. Bundling fails above 100 MB; failed batches never replace the last green image evidence. `vmctl bundle --input runs/verify-...` can regenerate the bundle without rerunning the suite.
 
 | File | Contents |
 | --- | --- |
@@ -114,7 +114,29 @@ The multi-stage Dockerfile builds a static `CGO_ENABLED=0` binary with `golang:1
 
 Run `make verify` in the deployment build context before building or uploading the image. The Dockerfile embeds `runs/latest/` at `/runs` and sets `RUNS_DIR=/runs`; `.dockerignore` excludes earlier/failed batches and Git metadata. The files are owned by the non-root runtime user so dashboard-started recordings can share that directory. A source-only build still works but has no bundled evidence; a Git-only deploy cannot include ignored local recordings. For an approved release, upload the verified workspace with `railway up --no-gitignore --service controlplane`; `.railwayignore` includes only the latest batch while excluding historical runs, databases and local scratch files. Without `--no-gitignore`, the CLI's normal Git-ignore handling excludes the recordings.
 
-The 0%-chaos interactive baseline at 5× under `-race` is p99 **6017 ms** (340 boots, 20 seeds, 17/24 slots per seed). The configured chart target is twice that, **12034 ms** of simulation time. This is a measured baseline and target, not a claim that the 50%-chaos readiness SLA has already been verified.
+The 0%-chaos interactive baseline at 5× under `-race` is p99 **6017 ms** (340 boots, 20 seeds, 17/24 slots per seed). The configured chart target is twice that, **12034 ms** of simulation time. The separate, opt-in `target-50pct-chaos` profile offers 17 interactive VMs on 24 slots (70.8%), with 50% ambient guest/host/network/control faults enabled before boot. Only this measurement filters load/topology injections, so its offered load and capacity stay fixed. The default `bad-day` preset keeps unfiltered 50% ambient chaos, the flood, latency spike and scheduler restart mid-flood. The measurement reports first-Ready p99, sample/request counts and target attainment in `report.json`; missing/unready requests prevent a target-met result. The target is reported, never used to waive or add an invariant gate. Run it separately with `go run -race ./cmd/vmctl verify --scenario target-50pct-chaos --repeat 20 --parallel 8 --speed 5 --output runs/target-50pct-chaos`.
+
+Measured across seeds 1–20 at 5× under `-race` (parallel2): **17925 ms pooled p99**, above the **12034 ms** target, with **339/340** initial requests observed Ready; the missing request is not counted as a zero-latency success. Four of 20 runs missed the target (worst per-run p99 **32209 ms**). The scenario safety verdict was **19/20**, with one invariant-2 stale-copy stop deadline violation; this measurement is not a green correctness gate. Reports and full event/snapshot evidence remain under `runs/target-50pct-chaos/` on the verification orb.
+
+Known limitation: the 5× repeat50 diagnostic (seeds 20–69) passed **49/50**, with all **12 invariant-2 events from seed 21**. The last event was **3994 ms after gen2 placement**, or **1994 ms past the 2 s bound**; this is the last observed violation, not the driver's stop time. At 2× the same seed range passed **49/50**, with 16 invariant-2 events from seed 21 (last violation 4314 ms after placement, 2314 ms past the bound). At 1× it passed **50/50**, with zero violations. The exact seed-20 reruns also pass at 2× and 1×. These are diagnostics at the stated speeds, not a relaxed bound or proof of a bounded driver stop. The measurement stays outside the default gate and release image.
+
+The stale-copy bound (one heartbeat) is checked only while the host's heartbeat lease is healthy. With paused heartbeats or ack loss, an old copy is stopped by the next delivered StartVM or heartbeat ack; the agent does not self-fence on missed acks, so stop time on a heartbeat-silent host is not bounded or observed by these recordings. One authoritative copy held in every run.
+
+### Release sequence (approval required)
+
+Upload only after release approval and a passing `make verify` (including e2e). Use a production-scoped project token in `RAILWAY_TOKEN`, not the workspace `RAILWAY_API_TOKEN`; do not paste either into the repository or a thread. Run this sequence in the verified workspace containing the ignored recordings, not a fresh Git-only checkout.
+
+```sh
+make verify VERIFY_PARALLEL=8
+docker build -t vm-controlplane:verified .
+test "$(find runs/latest -mindepth 2 -maxdepth 2 -name report.json | wc -l)" -eq 14
+: "${RAILWAY_TOKEN:?Set the production project token securely before uploading}"
+env -u RAILWAY_API_TOKEN npm exec --yes --package @railway/cli -- railway up \
+  --project bdb8a2f4-7793-4941-a9c6-8caf5ed9f35b \
+  --environment production --service controlplane --no-gitignore --detach
+```
+
+The upload command starts a deployment; it is not a health verdict. After the deployment reports success, check `/healthz`, the dashboard, `/v1/events` and `/v1/runs` at the live URL and open a bundled recording. Local playback should set `RUNS_DIR=runs/latest`; the image sets it to `/runs` automatically.
 
 ## What's next
 

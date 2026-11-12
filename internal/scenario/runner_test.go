@@ -1,6 +1,7 @@
 package scenario
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -12,7 +13,123 @@ import (
 	"time"
 
 	"github.com/hami-sh/vm/internal/api"
+	"github.com/hami-sh/vm/internal/config"
 )
+
+func TestReadinessTargetIsReportedNotGated(t *testing.T) {
+	target := config.Default().TimeToReadyTarget.Milliseconds()
+	for _, test := range []struct {
+		latency int64
+		met     float64
+	}{{target, 1}, {target + 1, 0}, {0, 0}} {
+		frame := snapshot(target+10000, api.VMReady)
+		frame.VMs[0].CreatedAt = 1000
+		frame.Sim.Intensity = .5
+		f := &fakeFleet{initial: snapshot(0, api.VMReady), frames: []api.Snapshot{frame}}
+		if test.latency > 0 {
+			f.events = []api.Event{
+				{Kind: api.EventTransition, VMID: "unrelated", At: 1001, To: api.VMReady},
+				{Kind: api.EventTransition, VMID: "vm-1", At: 1000 + test.latency, To: api.VMReady},
+				{Kind: api.EventTransition, VMID: "vm-1", At: frame.At - 1, To: api.VMReady},
+			}
+		}
+		s := Scenario{Name: "target", Topology: Topology{1, 1, 2}, Load: Load{1, "interactive"}, Duration: time.Duration(frame.At) * time.Millisecond, Expect: []Check{Always("invariants", NoInvariantViolations)}}
+		r, err := Run(context.Background(), s, func(context.Context, Scenario, int64, float64) (System, func(), error) { return f, func() {}, nil }, 1, 5, t.TempDir())
+		if err != nil || !r.Passed || r.Metrics["time_to_ready_target_met"] != test.met || r.Metrics["time_to_ready_requested"] != 1 || r.Metrics["offered_load_fraction"] != .5 {
+			t.Fatalf("readiness target became a gate or lost load context: %+v %v", r, err)
+		}
+		if test.latency > 0 && (r.Metrics["p99_time_to_ready_ms"] != float64(test.latency) || r.Metrics["time_to_ready_samples"] != 1) {
+			t.Fatalf("must measure first Ready for the requested cohort only: %+v", r.Metrics)
+		}
+		if test.latency == 0 {
+			if _, ok := r.Metrics["p99_time_to_ready_ms"]; ok || r.Metrics["time_to_ready_samples"] != 0 {
+				t.Fatalf("missing Ready event became a zero-latency success: %+v", r.Metrics)
+			}
+		}
+	}
+}
+
+func TestBundleSelectsAndThinsWithoutLosingMarkers(t *testing.T) {
+	input, output := filepath.Join(t.TempDir(), "batch"), filepath.Join(t.TempDir(), "latest")
+	write := func(name, scenario string, seed int64) {
+		dir := filepath.Join(input, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		r := api.RunReport{RunSummary: api.RunSummary{ID: name, Scenario: scenario, Seed: seed, Passed: true}, Markers: []api.Event{{Kind: api.EventChaos, At: 3500}, {Kind: api.EventInvariant, At: 8100}}}
+		b, _ := json.Marshal(r)
+		for file, data := range map[string][]byte{"report.json": b, "metrics.json": []byte(`{}`), "events.jsonl": []byte("{}\n")} {
+			if err := os.WriteFile(filepath.Join(dir, file), data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var frames bytes.Buffer
+		for at := int64(0); at <= 10300; at += 100 {
+			if err := json.NewEncoder(&frames).Encode(snapshot(at, api.VMReady)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := json.NewEncoder(&frames).Encode(snapshot(10345, api.VMReady)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "snapshots.jsonl"), frames.Bytes(), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("a-seed2", "alpha", 2)
+	write("z-seed1", "alpha", 1)
+	write("beta-seed4", "beta", 4)
+	original, _ := os.ReadFile(filepath.Join(input, "z-seed1", "snapshots.jsonl"))
+	count, size, err := Bundle(input, output)
+	if err != nil || count != 2 || size <= 0 || size >= 100_000_000 {
+		t.Fatalf("bundle: count=%d bytes=%d err=%v", count, size, err)
+	}
+	if _, err := os.Stat(filepath.Join(output, "a-seed2")); !os.IsNotExist(err) {
+		t.Fatal("bundled more than one run per scenario")
+	}
+	b, err := os.ReadFile(filepath.Join(output, "z-seed1", "snapshots.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept := map[int64]bool{}
+	d := json.NewDecoder(bytes.NewReader(b))
+	for {
+		var frame api.Snapshot
+		if err := d.Decode(&frame); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		kept[frame.At] = true
+	}
+	for _, at := range []int64{0, 1500, 3500, 5500, 6100, 8100, 10100, 10345} {
+		if !kept[at] {
+			t.Fatalf("lost endpoint/marker-window frame at %d", at)
+		}
+	}
+	for _, at := range []int64{1000, 1400, 5600, 5900, 10300} {
+		if kept[at] {
+			t.Fatalf("did not thin quiet frame at %d", at)
+		}
+	}
+	after, _ := os.ReadFile(filepath.Join(input, "z-seed1", "snapshots.jsonl"))
+	if !bytes.Equal(original, after) {
+		t.Fatal("modified full evidence batch")
+	}
+	if _, _, err := Bundle(input, input); err == nil {
+		t.Fatal("allowed replacing the full batch")
+	}
+	if err := os.WriteFile(filepath.Join(input, "a-seed2", "report.json"), []byte(`{"passed":false}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Bundle(input, output); err == nil {
+		t.Fatal("published a failed batch")
+	}
+	after, _ = os.ReadFile(filepath.Join(output, "z-seed1", "snapshots.jsonl"))
+	if !bytes.Equal(b, after) {
+		t.Fatal("failed bundle replaced last green evidence")
+	}
+}
 
 // Embedding the contracts makes accidental use of an unimplemented endpoint
 // fail immediately; the runner only needs create and the snapshot stream here.

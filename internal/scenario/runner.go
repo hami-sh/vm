@@ -212,10 +212,13 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 		}
 		next++
 	}
+	cohort := map[string]bool{}
 	for i := 0; i < s.Load.Count; i++ {
-		if _, e := f.CreateVM(ctx, fmt.Sprintf("seed-%d-%d", seed, i), api.CreateVMRequest{Pool: "ios-xcode16-m", Priority: s.Load.Priority}); e != nil {
+		created, e := f.CreateVM(ctx, fmt.Sprintf("seed-%d-%d", seed, i), api.CreateVMRequest{Pool: "ios-xcode16-m", Priority: s.Load.Priority})
+		if e != nil {
 			return report, e
 		}
+		cohort[created.ID] = true
 	}
 	results := make([]api.CheckResult, len(s.Expect))
 	tests := make([]Predicate, len(s.Expect))
@@ -232,6 +235,8 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 		lastAction = steps[len(steps)-1].At
 	}
 	lost := map[string]int64{}
+	createdAt := map[string]int64{}
+	firstReady := map[string]int64{}
 	var recoveries []int64
 	recordEvent := func(ev api.Event) error {
 		if e := json.NewEncoder(events).Encode(ev); e != nil {
@@ -241,6 +246,11 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 			report.Markers = append(report.Markers, ev)
 		}
 		if ev.Kind == api.EventTransition {
+			if ev.To == api.VMReady && cohort[ev.VMID] {
+				if _, ok := firstReady[ev.VMID]; !ok {
+					firstReady[ev.VMID] = ev.At
+				}
+			}
 			if ev.To == api.VMLost || ev.To == api.VMUnhealthy {
 				if _, ok := lost[ev.VMID]; !ok {
 					lost[ev.VMID] = ev.At
@@ -279,6 +289,16 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 			seen = true
 			if e := json.NewEncoder(snaps).Encode(snap); e != nil {
 				return report, e
+			}
+			for _, v := range snap.VMs {
+				if cohort[v.ID] {
+					if _, ok := createdAt[v.ID]; !ok {
+						createdAt[v.ID] = v.CreatedAt
+					}
+				}
+			}
+			if snap.Sim.Intensity > report.Metrics["chaos_intensity"] {
+				report.Metrics["chaos_intensity"] = snap.Sim.Intensity
 			}
 			elapsed := time.Duration(snap.At-origin) * time.Millisecond
 			for next < len(steps) && elapsed >= steps[next].At {
@@ -345,6 +365,29 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 				if len(recoveries) > 0 {
 					report.P99RecoverMs = percentile(recoveries)
 					report.Metrics["p99_recover_ms"] = float64(report.P99RecoverMs)
+				}
+				// Target attainment is evidence, never a pass/fail check. Count
+				// only first Ready for the initial interactive cohort; lost or
+				// failed boots remain visible as missing samples, not successes.
+				if s.Load.Priority == "interactive" && len(cohort) > 0 {
+					var ready []int64
+					for id, at := range firstReady {
+						if created, ok := createdAt[id]; ok && at >= created {
+							ready = append(ready, at-created)
+						}
+					}
+					report.Metrics["time_to_ready_requested"] = float64(len(cohort))
+					report.Metrics["time_to_ready_samples"] = float64(len(ready))
+					report.Metrics["time_to_ready_target_ms"] = float64(cfg.TimeToReadyTarget.Milliseconds())
+					report.Metrics["time_to_ready_target_met"] = 0
+					report.Metrics["offered_load_fraction"] = float64(s.Load.Count) / float64(s.Topology.Racks*s.Topology.Hosts*s.Topology.Slots)
+					if len(ready) > 0 {
+						p99 := percentile(ready)
+						report.Metrics["p99_time_to_ready_ms"] = float64(p99)
+						if len(ready) == len(cohort) && p99 <= cfg.TimeToReadyTarget.Milliseconds() {
+							report.Metrics["time_to_ready_target_met"] = 1
+						}
+					}
 				}
 				for i, c := range s.Expect {
 					if c.Metric != "" {

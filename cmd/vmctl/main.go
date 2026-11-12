@@ -24,8 +24,24 @@ func main() {
 	}
 }
 func run() error {
+	if len(os.Args) > 1 && os.Args[1] == "bundle" {
+		fs := flag.NewFlagSet("bundle", flag.ContinueOnError)
+		input := fs.String("input", "", "completed green verification batch")
+		output := fs.String("output", "runs/latest", "release recording directory")
+		if err := fs.Parse(os.Args[2:]); err != nil {
+			return err
+		}
+		if *input == "" {
+			return fmt.Errorf("bundle requires --input")
+		}
+		count, size, err := scenario.Bundle(*input, *output)
+		if err == nil {
+			fmt.Printf("bundle: %d recordings, %d bytes\n", count, size)
+		}
+		return err
+	}
 	if len(os.Args) < 2 || (os.Args[1] != "verify" && os.Args[1] != "e2e") {
-		return fmt.Errorf("usage: vmctl {verify|e2e} [flags]")
+		return fmt.Errorf("usage: vmctl {verify|e2e|bundle} [flags]")
 	}
 	fs := flag.NewFlagSet(os.Args[1], flag.ContinueOnError)
 	repeat := fs.Int("repeat", 20, "runs per scenario")
@@ -80,6 +96,7 @@ func run() error {
 	}
 	scenarios := scenario.Catalog()
 	if *filter != "" {
+		scenarios = append(scenarios, scenario.TargetScenario())
 		var selected []scenario.Scenario
 		for _, s := range scenarios {
 			if s.Name == *filter {
