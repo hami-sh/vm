@@ -128,3 +128,37 @@ func TestFaultsAndPayloadIsolation(t *testing.T) {
 		}
 	}
 }
+
+func TestReorderWithoutLatency(t *testing.T) {
+	c := clock.NewFake(time.Unix(100, 0))
+	cfg := config.Default()
+	n := simnet.New(c, cfg, 22)
+	defer n.Close()
+	s := attach(t, n, api.Addr{Kind: api.KindScheduler, ID: "scheduler"})
+	h := attach(t, n, api.Addr{Kind: api.KindAgent, ID: "h1", Host: "h1", Rack: "r1"})
+	n.SetReorder(true)
+	for i := range 20 {
+		if err := s.Send(h.Addr(), api.PortControl, i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Advance(cfg.InvariantEvery)
+	for range 10000 {
+		runtime.Gosched()
+		if len(h.Inbox()) == 20 {
+			break
+		}
+	}
+	if len(h.Inbox()) != 20 {
+		t.Fatal("reordered traffic not delivered")
+	}
+	ordered := true
+	for i := range 20 {
+		if (<-h.Inbox()).Msg.(int) != i {
+			ordered = false
+		}
+	}
+	if ordered {
+		t.Fatal("reorder fault preserved the original order")
+	}
+}

@@ -17,7 +17,7 @@ import (
 
 type tartVM struct {
 	p        api.BootParams
-	spec     api.VMSpec
+	launch   api.StartVM
 	dir      string
 	done     chan struct{}
 	running  bool
@@ -49,6 +49,10 @@ func tartCommand(ctx context.Context, args ...string) error {
 	return nil
 }
 func (t *Tart) Start(ctx context.Context, s api.VMSpec, p api.BootParams) (err error) {
+	return t.StartCommand(ctx, api.StartVM{VMID: p.VMID, Generation: p.Generation, Token: p.Token, Spec: s}, p)
+}
+func (t *Tart) StartCommand(ctx context.Context, cmd api.StartVM, p api.BootParams) (err error) {
+	s := cmd.Spec
 	t.mu.Lock()
 	if old := t.vms[p.VMID]; old != nil {
 		t.mu.Unlock()
@@ -61,7 +65,7 @@ func (t *Tart) Start(ctx context.Context, s api.VMSpec, p api.BootParams) (err e
 		t.mu.Unlock()
 		return fmt.Errorf("full")
 	}
-	v := &tartVM{p: p, spec: s, done: make(chan struct{})}
+	v := &tartVM{p: p, launch: cmd, done: make(chan struct{})}
 	t.vms[p.VMID] = v
 	t.mu.Unlock()
 	name := tartName(p.VMID, p.Generation)
@@ -94,15 +98,15 @@ func (t *Tart) Start(ctx context.Context, s api.VMSpec, p api.BootParams) (err e
 	if err = os.WriteFile(filepath.Join(dir, "boot.json"), b, 0600); err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, "tart", "run", "--no-graphics", "--dir=boot:"+dir+":ro", name)
-	if err = cmd.Start(); err != nil {
+	process := exec.CommandContext(ctx, "tart", "run", "--no-graphics", "--dir=boot:"+dir+":ro", name)
+	if err = process.Start(); err != nil {
 		return err
 	}
 	t.mu.Lock()
 	v.running = true
 	t.mu.Unlock()
 	go func() {
-		err := cmd.Wait()
+		err := process.Wait()
 		t.mu.Lock()
 		v.running = false
 		stopping := v.stopping
@@ -165,14 +169,14 @@ func (t *Tart) List(ctx context.Context) ([]api.DriverVM, error) {
 	return out, ctx.Err()
 }
 func (t *Tart) Exits() <-chan api.DriverExit { return t.exits }
-func (t *Tart) BootInfo(id string, gen int64) (api.BootParams, api.VMSpec, bool) {
+func (t *Tart) LaunchInfo(id string, gen int64) (api.StartVM, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	v := t.vms[id]
 	if v == nil || v.p.Generation != gen {
-		return api.BootParams{}, api.VMSpec{}, false
+		return api.StartVM{}, false
 	}
-	return v.p, v.spec, true
+	return v.launch, true
 }
 
 var _ api.Driver = (*Tart)(nil)

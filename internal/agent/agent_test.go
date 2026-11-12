@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +19,7 @@ import (
 
 type harness struct {
 	t         *testing.T
-	c         *clock.Fake
+	c         clock.Clock
 	cfg       config.Config
 	n         *simnet.Network
 	d         *driver.Fake
@@ -29,11 +30,19 @@ type harness struct {
 	messages  []any
 }
 
-func newHarness(t *testing.T) *harness {
+type observedEndpoint struct {
+	api.Endpoint
+	inbox chan api.Envelope
+}
+
+func (e observedEndpoint) Inbox() <-chan api.Envelope { return e.inbox }
+
+func newHarness(t *testing.T, observe ...func(api.Envelope)) *harness {
+	return newHarnessClock(t, clock.NewFake(time.Unix(1000, 0)), config.Default(), observe...)
+}
+func newHarnessClock(t *testing.T, c clock.Clock, cfg config.Config, observe ...func(api.Envelope)) *harness {
 	t.Helper()
 	baseline := runtime.NumGoroutine()
-	cfg := config.Default()
-	c := clock.NewFake(time.Unix(1000, 0))
 	n := simnet.New(c, cfg, 37)
 	s, err := n.Attach(api.Addr{Kind: api.KindScheduler, ID: "scheduler"})
 	if err != nil {
@@ -45,8 +54,36 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	d := driver.NewFake(c, cfg, n, 42)
-	a := agent.New(cfg, c, ep, s.Addr(), d)
 	ctx, cancel := context.WithCancel(context.Background())
+	observedDone := make(chan struct{})
+	if len(observe) > 0 {
+		source := ep
+		tapped := observedEndpoint{Endpoint: ep, inbox: make(chan api.Envelope)}
+		ep = tapped
+		go func() {
+			defer close(observedDone)
+			defer close(tapped.inbox)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case e, ok := <-source.Inbox():
+					if !ok {
+						return
+					}
+					select {
+					case tapped.inbox <- e:
+						observe[0](e)
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}()
+	} else {
+		close(observedDone)
+	}
+	a := agent.New(cfg, c, ep, s.Addr(), d)
 	go a.Run(ctx)
 	h := &harness{t: t, c: c, cfg: cfg, n: n, d: d, a: a, scheduler: s, host: host, ctx: ctx}
 	t.Cleanup(func() {
@@ -60,6 +97,7 @@ func newHarness(t *testing.T) *harness {
 		}
 		d.Close()
 		n.Close()
+		<-observedDone
 		for range 100 {
 			if runtime.NumGoroutine() <= baseline {
 				return
@@ -103,10 +141,13 @@ func (h *harness) snapshot() agent.Snapshot {
 	return s
 }
 func (h *harness) step(d time.Duration) {
-	h.c.Advance(d)
+	if fake, ok := h.c.(*clock.Fake); ok {
+		fake.Advance(d)
+		d = 100 * time.Microsecond
+	}
 	// A fake clock does not schedule goroutines. Give every actor wall time
 	// before moving the next simulated deadline; don't race through TTLs.
-	timer := clock.Real{}.NewTimer(100 * time.Microsecond)
+	timer := clock.Real{}.NewTimer(d)
 	<-timer.C()
 	timer.Stop()
 	h.drain()
@@ -118,7 +159,7 @@ func (h *harness) until(check func(agent.Snapshot) bool) agent.Snapshot {
 		if check(s) {
 			return s
 		}
-		h.step(100 * time.Millisecond)
+		h.step(min(100*time.Millisecond, h.cfg.GuestHeartbeat/2))
 	}
 	h.t.Fatalf("condition not reached: %+v; messages=%+v", h.snapshot(), h.messages)
 	return agent.Snapshot{}
@@ -307,6 +348,64 @@ func TestAgentRestartPreservesDriverVMs(t *testing.T) {
 	}
 }
 
+func TestInventoryRoundTripsSchedulerIdentity(t *testing.T) {
+	h := newHarness(t)
+	cmd := start("a", 1)
+	cmd.Epoch = 17
+	cmd.IdempotencyKey = "opaque/key:α"
+	cmd.RequestHash = "opaque-hash-not-interpreted"
+	h.send(cmd)
+	h.until(func(s agent.Snapshot) bool { return ready(s, "a", 1) })
+	check := func(items []api.InventoryItem) bool {
+		if len(items) != 1 {
+			return false
+		}
+		got := items[0]
+		if got.Pool != cmd.Spec.Pool || got.IdempotencyKey != cmd.IdempotencyKey || got.RequestHash != cmd.RequestHash {
+			t.Fatalf("identity changed: %+v", got)
+		}
+		return true
+	}
+	h.until(func(s agent.Snapshot) bool {
+		for _, m := range h.messages {
+			if hb, ok := m.(api.HostHeartbeat); ok && hb.Epoch == 17 && check(hb.Inventory) {
+				return true
+			}
+		}
+		return false
+	})
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 23})
+	h.until(func(s agent.Snapshot) bool { return s.Epoch == 23 })
+	stale := start("stale", 1)
+	stale.Epoch = 22
+	h.send(stale)
+	h.send(api.StopVM{VMID: "a", Generation: 1, Epoch: 22})
+	h.until(func(s agent.Snapshot) bool {
+		for _, m := range h.messages {
+			if hb, ok := m.(api.HostHeartbeat); ok && hb.Epoch == 23 && check(hb.Inventory) {
+				return true
+			}
+		}
+		return false
+	})
+	if !ready(h.snapshot(), "a", 1) || len(h.snapshot().Actual) != 1 {
+		t.Fatal("old scheduler epoch changed actual VMs")
+	}
+	before := len(h.messages)
+	if err := h.a.Restart(h.ctx); err != nil {
+		t.Fatal(err)
+	}
+	h.until(func(s agent.Snapshot) bool {
+		for _, m := range h.messages[before:] {
+			if r, ok := m.(api.RegisterHost); ok && check(r.Inventory) {
+				return true
+			}
+		}
+		return false
+	})
+	h.until(func(s agent.Snapshot) bool { return ready(s, "a", 1) })
+}
+
 func TestCompromiseUsesRealEndpointAndStops(t *testing.T) {
 	for _, cause := range []string{"stop", "crash", "quarantine"} {
 		t.Run(cause, func(t *testing.T) {
@@ -369,9 +468,47 @@ func TestCompromiseUsesRealEndpointAndStops(t *testing.T) {
 }
 
 func TestFloodDoesNotStarveNeighbours(t *testing.T) {
-	h := newHarness(t)
+	arrivals := make(chan time.Time, config.Default().EventRetention)
+	cfg := config.Default()
+	// Wall-clock observation avoids fake-clock stepping quantization. Scale
+	// the test fixture consistently to the configured maximum demo speed.
+	factor := time.Duration(cfg.MaxSpeed)
+	cfg.BootMin /= factor
+	cfg.BootMax /= factor
+	cfg.GuestHeartbeat /= factor
+	cfg.GuestLeaseTTL /= factor
+	cfg.HostHeartbeat /= factor
+	cfg.InvariantEvery /= factor
+	cfg.GuestMsgPerSec *= int(factor)
+	cfg.QuarantineWindow /= factor
+	var h *harness
+	h = newHarnessClock(t, clock.Real{}, cfg, func(e api.Envelope) {
+		if _, ok := e.Msg.(api.GuestHeartbeat); ok && e.From.ID == "neighbour" {
+			arrivals <- h.c.Now()
+		}
+	})
 	h.boot("attacker", 1)
 	h.boot("neighbour", 1)
+	p99 := func() time.Duration {
+		var samples []time.Time
+		for len(arrivals) > 0 {
+			samples = append(samples, <-arrivals)
+		}
+		if len(samples) < 10 {
+			t.Fatalf("too few heartbeat observations: %d", len(samples))
+		}
+		var gaps []time.Duration
+		for i := 1; i < len(samples); i++ {
+			gaps = append(gaps, samples[i].Sub(samples[i-1]))
+		}
+		sort.Slice(gaps, func(i, j int) bool { return gaps[i] < gaps[j] })
+		return gaps[(len(gaps)*99-1)/100]
+	}
+	for range 40 {
+		h.step(h.cfg.GuestHeartbeat / 2)
+		h.snapshot()
+	}
+	baseline := p99()
 	// Both oversized traffic and rate-limit violations must be blocked through
 	// the real VM endpoint, while the neighbour keeps renewing its lease.
 	h.guest("attacker", strings.Repeat("x", h.cfg.GuestMsgMaxBytes+1))
@@ -387,6 +524,11 @@ func TestFloodDoesNotStarveNeighbours(t *testing.T) {
 			t.Fatal("neighbour lease starved")
 		}
 	}
+	flood := p99()
+	if flood > baseline+50*time.Millisecond {
+		t.Fatalf("neighbour heartbeat p99 changed: baseline=%v flood=%v", baseline, flood)
+	}
+	t.Logf("neighbour heartbeat p99: baseline=%v flood=%v", baseline, flood)
 	for _, m := range h.messages {
 		if r, ok := m.(api.UnhealthyReport); ok && r.VMID == "neighbour" {
 			t.Fatalf("neighbour affected: %+v", r)
@@ -484,4 +626,59 @@ func TestAdmissionCapAndHostFaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.boot("a", 2)
+}
+
+type listGate struct {
+	api.Driver
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (d listGate) List(ctx context.Context) ([]api.DriverVM, error) {
+	select {
+	case d.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-d.release:
+		return d.Driver.List(ctx)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+func TestRestartReturnsAfterInventoryRecovery(t *testing.T) {
+	cfg := config.Default()
+	c := clock.NewFake(time.Unix(100, 0))
+	n := simnet.New(c, cfg, 1)
+	s, err := n.Attach(api.Addr{Kind: api.KindScheduler, ID: "scheduler"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ep, err := n.Attach(api.Addr{Kind: api.KindAgent, ID: "h1", Host: "h1", Rack: "r1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := driver.NewFake(c, cfg, n, 2)
+	gate := listGate{Driver: f, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	a := agent.New(cfg, c, ep, s.Addr(), gate)
+	ctx, cancel := context.WithCancel(context.Background())
+	go a.Run(ctx)
+	t.Cleanup(func() { cancel(); <-a.Done(); f.Close(); n.Close() })
+	returned := make(chan error, 1)
+	go func() { returned <- a.Restart(ctx) }()
+	<-gate.entered
+	timer := clock.Real{}.NewTimer(10 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case err := <-returned:
+		t.Fatalf("restart returned before driver inventory was read: %v", err)
+	case <-timer.C():
+	}
+	close(gate.release)
+	if err := <-returned; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Snapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
 }

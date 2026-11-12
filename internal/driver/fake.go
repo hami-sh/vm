@@ -15,7 +15,7 @@ import (
 
 type machine struct {
 	p           api.BootParams
-	spec        api.VMSpec
+	launch      api.StartVM
 	cancel      context.CancelFunc
 	done        chan struct{}
 	guestCancel context.CancelFunc
@@ -52,6 +52,13 @@ func (f *Fake) SlowBoot(factor float64) { f.mu.Lock(); defer f.mu.Unlock(); f.sl
 func (f *Fake) FillDisk(full bool)      { f.mu.Lock(); defer f.mu.Unlock(); f.diskFull = full }
 func (f *Fake) DiskFull() bool          { f.mu.Lock(); defer f.mu.Unlock(); return f.diskFull }
 func (f *Fake) Start(ctx context.Context, s api.VMSpec, p api.BootParams) error {
+	return f.StartCommand(ctx, api.StartVM{VMID: p.VMID, Generation: p.Generation, Token: p.Token, Spec: s}, p)
+}
+
+// StartCommand retains opaque scheduler identity for process-restart recovery;
+// the shared api.Driver.Start remains supported for standalone callers.
+func (f *Fake) StartCommand(ctx context.Context, cmd api.StartVM, p api.BootParams) error {
+	s := cmd.Spec
 	f.mu.Lock()
 	if f.closed || f.diskFull {
 		f.mu.Unlock()
@@ -65,7 +72,7 @@ func (f *Fake) Start(ctx context.Context, s api.VMSpec, p api.BootParams) error 
 		return fmt.Errorf("VM already exists")
 	}
 	bootCtx, cancel := context.WithCancel(ctx)
-	m := &machine{p: p, spec: s, ctx: bootCtx, cancel: cancel, done: make(chan struct{}), quota: s.DiskMB, swap: make(chan replacement)}
+	m := &machine{p: p, launch: cmd, ctx: bootCtx, cancel: cancel, done: make(chan struct{}), quota: s.DiskMB, swap: make(chan replacement)}
 	f.vms[p.VMID] = m
 	delay := f.cfg.BootMin
 	if f.cfg.BootMax > delay {
@@ -198,16 +205,16 @@ func (f *Fake) List(ctx context.Context) ([]api.DriverVM, error) {
 }
 func (f *Fake) Exits() <-chan api.DriverExit { return f.exits }
 
-// BootInfo is host-owned launch metadata, not a guest claim. It is the local
+// LaunchInfo is host-owned launch metadata, not a guest claim. It is the local
 // recovery adapter because api.Driver.List intentionally carries no secrets.
-func (f *Fake) BootInfo(id string, gen int64) (api.BootParams, api.VMSpec, bool) {
+func (f *Fake) LaunchInfo(id string, gen int64) (api.StartVM, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	m := f.vms[id]
 	if m == nil || m.p.Generation != gen {
-		return api.BootParams{}, api.VMSpec{}, false
+		return api.StartVM{}, false
 	}
-	return m.p, m.spec, true
+	return m.launch, true
 }
 
 // GuestResults drains independent verdicts received by the real guest loop.

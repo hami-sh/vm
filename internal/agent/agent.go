@@ -44,6 +44,8 @@ type completion struct {
 type tick struct{}
 type recovered struct {
 	revision uint64
+	powerOff bool
+	reply    chan<- error
 	vms      []api.DriverVM
 	params   map[string]api.StartVM
 	err      error
@@ -54,6 +56,7 @@ type control struct {
 	down             *bool
 	skew             *time.Duration
 	attack, vm       string
+	reply            chan<- error
 }
 type Snapshot struct {
 	Host      api.Host
@@ -97,7 +100,7 @@ func (a *Agent) Run(ctx context.Context) {
 	defer ticker.Stop()
 	leases := a.clock.NewTicker(a.cfg.InvariantEvery)
 	defer leases.Stop()
-	a.execute([]Effect{a.report(api.RegisterHost{HostID: a.ep.Addr().ID, Rack: a.ep.Addr().Rack, Slots: min(2, a.cfg.SlotsPerHost), DiskFull: a.diskFull(), Inventory: a.inventory()})})
+	a.execute([]Effect{a.report(api.RegisterHost{HostID: a.ep.Addr().ID, Rack: a.ep.Addr().Rack, Slots: min(2, a.cfg.SlotsPerHost), DiskFull: a.diskFull(), Inventory: a.inventory(), Epoch: a.epoch})})
 	for {
 		// Give deadlines priority even with a permanently readable guest inbox.
 		select {
@@ -143,11 +146,19 @@ func (a *Agent) Snapshot(ctx context.Context) (Snapshot, error) {
 }
 func (a *Agent) Kill(ctx context.Context) error {
 	on := true
-	return a.command(ctx, control{down: &on})
+	result, err := actor.Ask(ctx, a.inbox, func(reply chan<- error) any { return control{down: &on, reply: reply} })
+	if err != nil {
+		return err
+	}
+	return result
 }
 func (a *Agent) Restart(ctx context.Context) error {
 	on := false
-	return a.command(ctx, control{down: &on})
+	result, err := actor.Ask(ctx, a.inbox, func(reply chan<- error) any { return control{down: &on, reply: reply} })
+	if err != nil {
+		return err
+	}
+	return result
 }
 func (a *Agent) SetClockSkew(ctx context.Context, skew time.Duration) error {
 	return a.command(ctx, control{skew: &skew})
@@ -186,7 +197,7 @@ func (a *Agent) diskFull() bool {
 func (a *Agent) inventory() []api.InventoryItem {
 	out := make([]api.InventoryItem, 0, len(a.vms))
 	for id, v := range a.vms {
-		out = append(out, api.InventoryItem{VMID: id, Generation: v.start.Generation, State: v.state, Pool: v.start.Spec.Pool})
+		out = append(out, api.InventoryItem{VMID: id, Generation: v.start.Generation, State: v.state, Pool: v.start.Spec.Pool, IdempotencyKey: v.start.IdempotencyKey, RequestHash: v.start.RequestHash})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].VMID < out[j].VMID })
 	return out
@@ -196,7 +207,7 @@ func (a *Agent) heartbeat() []Effect {
 		return nil
 	}
 	a.seq++
-	return []Effect{a.report(api.HostHeartbeat{HostID: a.ep.Addr().ID, Seq: a.seq, DiskFull: a.diskFull(), Inventory: a.inventory()})}
+	return []Effect{a.report(api.HostHeartbeat{HostID: a.ep.Addr().ID, Seq: a.seq, DiskFull: a.diskFull(), Inventory: a.inventory(), Epoch: a.epoch})}
 }
 func (a *Agent) execute(effects []Effect) {
 	for _, e := range effects {
@@ -245,7 +256,14 @@ func (a *Agent) start(now time.Time, m api.StartVM) []Effect {
 	revision := a.revision
 	return []Effect{a.result(m, true, ""), {Work: func(context.Context) any {
 		defer close(v.bootDone)
-		err := a.driver.Start(bootCtx, m.Spec, p)
+		var err error
+		if d, ok := a.driver.(interface {
+			StartCommand(context.Context, api.StartVM, api.BootParams) error
+		}); ok {
+			err = d.StartCommand(bootCtx, m, p)
+		} else {
+			err = a.driver.Start(bootCtx, m.Spec, p)
+		}
 		return completion{revision: revision, id: m.VMID, gen: m.Generation, err: err}
 	}}}
 }
@@ -442,14 +460,13 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 			a.skew = *m.skew
 		}
 		if m.down != nil {
-			if *m.down {
-				a.down = true
-				var out []Effect
+			powerOff, reply := *m.down, m.reply
+			var boots []<-chan struct{}
+			if powerOff {
 				for _, v := range a.vms {
-					v.pending = nil
-					out = append(out, a.release(v, api.ReasonHostLost)...)
+					v.cancel()
+					boots = append(boots, v.bootDone)
 				}
-				return out
 			}
 			// Lose actor memory, but never cancel an incarnation on process
 			// restart. The driver, not scheduler memory, supplies recovery data.
@@ -463,18 +480,30 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 			a.paused = false
 			a.cordoned = false
 			return []Effect{{Work: func(ctx context.Context) any {
+				for _, done := range boots {
+					<-done
+				}
 				vms, err := a.driver.List(ctx)
+				if powerOff && err == nil {
+					for _, v := range vms {
+						if stopErr := a.driver.Stop(ctx, v.VMID, v.Generation); stopErr != nil {
+							err = stopErr
+							break
+						}
+					}
+					vms = nil
+				}
 				params := make(map[string]api.StartVM)
 				if source, ok := a.driver.(interface {
-					BootInfo(string, int64) (api.BootParams, api.VMSpec, bool)
+					LaunchInfo(string, int64) (api.StartVM, bool)
 				}); ok {
 					for _, v := range vms {
-						if p, s, ok := source.BootInfo(v.VMID, v.Generation); ok {
-							params[v.VMID] = api.StartVM{VMID: p.VMID, Generation: p.Generation, Token: p.Token, Spec: s}
+						if cmd, ok := source.LaunchInfo(v.VMID, v.Generation); ok {
+							params[v.VMID] = cmd
 						}
 					}
 				}
-				return recovered{revision: revision, vms: vms, params: params, err: err}
+				return recovered{revision: revision, powerOff: powerOff, reply: reply, vms: vms, params: params, err: err}
 			}}}
 		}
 		if m.paused != nil {
@@ -487,7 +516,16 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 			return a.blocked(now, v, m.attack)
 		}
 	case recovered:
-		if m.revision != a.revision || m.err != nil {
+		if m.revision != a.revision {
+			m.reply <- context.Canceled
+			return nil
+		}
+		if m.err != nil {
+			m.reply <- m.err
+			return nil
+		}
+		if m.powerOff {
+			m.reply <- nil
 			return nil
 		}
 		for _, actual := range m.vms {
@@ -501,7 +539,8 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 			a.highest[actual.VMID] = actual.Generation
 		}
 		a.down = false
-		return []Effect{a.report(api.RegisterHost{HostID: a.ep.Addr().ID, Rack: a.ep.Addr().Rack, Slots: min(2, a.cfg.SlotsPerHost), DiskFull: a.diskFull(), Inventory: a.inventory()})}
+		m.reply <- nil
+		return []Effect{a.report(api.RegisterHost{HostID: a.ep.Addr().ID, Rack: a.ep.Addr().Rack, Slots: min(2, a.cfg.SlotsPerHost), DiskFull: a.diskFull(), Inventory: a.inventory(), Epoch: a.epoch})}
 	case query:
 		h := api.Host{ID: a.ep.Addr().ID, Rack: a.ep.Addr().Rack, SlotCount: min(2, a.cfg.SlotsPerHost), AdminState: api.AdminActive, Lease: api.LeaseHealthy}
 		if a.cordoned {
