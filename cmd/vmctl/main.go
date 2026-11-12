@@ -80,19 +80,47 @@ func run() error {
 		factory = serverFactory(abs)
 	}
 	if os.Args[1] == "e2e" {
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
 		f, stop, err := factory(ctx, scenario.Catalog()[0], 1, 5)
 		if err != nil {
 			return err
 		}
 		defer stop()
-		if _, err = f.Do(ctx, "flood", api.ChaosRequest{Params: map[string]float64{"count": 1}}); err != nil {
-			return fmt.Errorf("HTTP chaos: %w", err)
+		snapshots, _, cancelStream := f.Subscribe()
+		defer cancelStream()
+		created := ""
+		for {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("e2e create never reached Ready over SSE: %w", ctx.Err())
+			case s, ok := <-snapshots:
+				if !ok {
+					return fmt.Errorf("SSE closed before create reached Ready")
+				}
+				if created == "" {
+					v, err := f.CreateVM(ctx, "e2e-create", api.CreateVMRequest{Pool: "ios-xcode16-m", Priority: "interactive"})
+					if e, ok := err.(*api.Error); ok && e.Status == 503 {
+						continue // Fresh-store inventory recovery rejects admission.
+					}
+					if err != nil {
+						return fmt.Errorf("HTTP create: %w", err)
+					}
+					created = v.ID
+					if _, err := f.Do(ctx, "flood", api.ChaosRequest{Params: map[string]float64{"count": 1}}); err != nil {
+						return fmt.Errorf("HTTP chaos: %w", err)
+					}
+				}
+				if s.Scheduler == api.SchedulerUp {
+					for _, v := range s.VMs {
+						if v.ID == created && v.State == api.VMReady {
+							fmt.Println("e2e: HTTP create and chaos accepted, SSE observed the created VM Ready with scheduler Up")
+							return nil
+						}
+					}
+				}
+			}
 		}
-		if f.Latest().Scheduler == "" {
-			return fmt.Errorf("SSE snapshot has no scheduler status")
-		}
-		fmt.Println("e2e: server booted, HTTP chaos accepted, SSE snapshot matches api.Snapshot")
-		return nil
 	}
 	scenarios := scenario.Catalog()
 	if *filter != "" {

@@ -3,6 +3,7 @@ package scenario
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -10,7 +11,7 @@ import (
 	"github.com/hami-sh/vm/internal/config"
 )
 
-// Catalog includes all eight failure scenarios and the six dashboard presets.
+// Catalog includes the failure scenarios, six dashboard presets and review regressions.
 func Catalog() []Scenario {
 	sec := time.Second
 	cfg := config.Default()
@@ -28,11 +29,11 @@ func Catalog() []Scenario {
 		base("duplicate-create", Step{5 * sec, duplicateCreate}),
 		base("impostor-guest", Step{10 * sec, Chaos("compromise", "@ready", nil)}),
 		base("split-brain", Step{10 * sec, Chaos("partition-rack", "r2", nil)}, Step{40 * sec, Chaos("heal-rack", "r2", nil)}),
-		base("gray-failure", Step{10 * sec, Chaos("pause-heartbeats", "r1-h1", nil)}, Step{10 * sec, Chaos("pause-heartbeats", "r2-h1", nil)}, Step{10 * sec, Chaos("pause-heartbeats", "r3-h1", nil)}, Step{40 * sec, Chaos("restart-host", "r1-h1", nil)}, Step{40 * sec, Chaos("restart-host", "r2-h1", nil)}, Step{40 * sec, Chaos("restart-host", "r3-h1", nil)}),
-		base("thundering-herd", Step{10 * sec, Chaos("partition-rack", "r2", nil)}, Step{11 * sec, Chaos("flood", "", map[string]float64{"count": 60})}),
+		base("gray-failure", Step{10 * sec, Chaos("pause-heartbeats", "r1-h1", nil)}, Step{10 * sec, Chaos("pause-heartbeats", "r2-h1", nil)}, Step{10 * sec, Chaos("pause-heartbeats", "r3-h1", nil)}, Step{40 * sec, Chaos("resume-heartbeats", "r1-h1", nil)}, Step{40 * sec, Chaos("resume-heartbeats", "r2-h1", nil)}, Step{40 * sec, Chaos("resume-heartbeats", "r3-h1", nil)}),
+		base("thundering-herd", Step{10 * sec, Chaos("power-off-rack", "r2", nil)}, Step{11 * sec, Chaos("flood", "", map[string]float64{"count": 60, "interactive": 1})}),
 		base("rolling-maintenance", Step{10 * sec, drain("r1")}, Step{20 * sec, addRack("r4")}, Step{30 * sec, drain("r2")}, Step{40 * sec, addRack("r5")}, Step{50 * sec, drain("r3")}, Step{60 * sec, addRack("r6")}),
-		base("hostile-tenant", Step{10 * sec, Chaos("flood", "", map[string]float64{"count": 60})}, Step{11 * sec, compromiseThree}),
-		base("bad-day", Step{10 * sec, ambient}, Step{11 * sec, Chaos("flood", "", map[string]float64{"count": 60})}, Step{12 * sec, Chaos("latency-spike", "", map[string]float64{"ms": 200})}, Step{30 * sec, Chaos("kill-scheduler", "", nil)}, Step{40 * sec, Chaos("restart-scheduler", "", nil)}),
+		base("hostile-tenant"),
+		base("bad-day", Step{10 * sec, ambient}, Step{11 * sec, Chaos("sustained-load", "", map[string]float64{"rate": 6})}, Step{11 * sec, Chaos("flood", "", map[string]float64{"count": 60})}, Step{12 * sec, Chaos("latency-spike", "", map[string]float64{"ms": 1000})}, Step{30 * sec, Chaos("kill-scheduler", "", nil)}, Step{40 * sec, Chaos("restart-scheduler", "", nil)}, Step{45 * sec, Chaos("sustained-load", "", map[string]float64{"rate": 0})}),
 	}
 	// Overload is intentionally not an all-ready assertion: excess demand must
 	// queue or be rejected; it cannot all fit on 24 slots.
@@ -55,16 +56,6 @@ func Catalog() []Scenario {
 		Name: "powered-off VMs replaced at gen+1 ahead of batch", Until: 90 * sec,
 		NewTest: func() Predicate { return hostReplacement("r1-h1") },
 	}}
-	for _, i := range []int{0, 4, 8, 9} {
-		s[i].Expect = append(s[i].Expect, Eventually(90*sec, "new generation Ready", func(s api.Snapshot) bool {
-			for _, v := range s.VMs {
-				if v.Generation > 1 && v.State == api.VMReady {
-					return true
-				}
-			}
-			return false
-		}))
-	}
 	s[1].Expect = []Check{Always("invariants", NoInvariantViolations), Always("bounded attempts", func(s api.Snapshot) bool {
 		for _, v := range s.VMs {
 			if v.Attempts > cfg.MaxAttempts {
@@ -81,8 +72,263 @@ func Catalog() []Scenario {
 		return len(s.VMs) > 0
 	})}
 	s[11].Expect = append(s[11].Expect, Eventually(90*sec, "maintenance recovered", AllDesiredVMsReady))
+	s[11].Duration = max(s[11].Duration, 50*sec+cfg.DrainGrace+cfg.BootDeadline+cfg.HostLeaseTTL)
 	s[8].Expect = append(s[8].Expect, Metric("p99_recover_ms", 20000))
+	for _, i := range []int{3, 10, 11, 12, 13} {
+		s[i].Expect = append(s[i].Expect,
+			Always("replacement queue precedes new requests", ReplacementQueueOrdered),
+			Eventually(s[i].Duration, "scheduler Up", func(s api.Snapshot) bool { return s.Scheduler == api.SchedulerUp }))
+		if i != 10 { // Herd checks each victim and placement order separately.
+			s[i].Expect = append(s[i].Expect, Check{Name: "previously Ready VMs recovered", Until: s[i].Duration, NewTest: readyCohort}, Metric("recovery_failures", 1))
+		}
+	}
+	s[10].Expect = append(s[10].Expect, Eventually(s[10].Duration, "rack loss exposes negative headroom and backpressure", func(s api.Snapshot) bool {
+		return s.Counters.Headroom < 0 && s.Counters.Rejected429+s.Counters.Shed > 0
+	}))
+	s[3].Expect = append(s[3].Expect, Eventually(s[3].Duration, "all 24 slots Ready under overload", func(s api.Snapshot) bool {
+		ready, interactive := 0, 0
+		for _, v := range s.VMs {
+			if v.State == api.VMReady {
+				ready++
+				if v.Priority == api.PriorityInteractive {
+					interactive++
+				}
+			}
+		}
+		return ready == cfg.Racks*cfg.HostsPerRack*cfg.SlotsPerHost && interactive > 0 && s.Counters.Shed > 0
+	}))
+	for _, i := range []int{0, 4, 8, 9, 10, 11} {
+		index := i
+		s[i] = victimRecovery(s[i], func(v api.VM) bool {
+			switch index {
+			case 0, 11:
+				return true
+			case 9:
+				return v.HostID == "r1-h1" || v.HostID == "r2-h1" || v.HostID == "r3-h1"
+			default:
+				return v.Rack == "r2"
+			}
+		}, i == 0, i == 11)
+	}
+	s[5] = restartProgress(s[5], true)
+	s[13] = restartProgress(s[13], false)
+	s[1].Expect = append(s[1].Expect, Check{Name: "hang caused a boot deadline", Until: s[1].Duration, NewTest: func() Predicate {
+		hung := false
+		return func(s api.Snapshot) bool {
+			for _, e := range s.Recent {
+				hung = hung || e.Detail == api.ReasonBootDeadline
+			}
+			for _, v := range s.VMs {
+				hung = hung || v.LastReason == api.ReasonBootDeadline
+			}
+			return hung
+		}
+	}})
+	s[12] = hostileTenant(s[12])
+	s = append(s, wipeLateHost(base("wipe-late-host")))
 	return s
+}
+
+func ReplacementQueueOrdered(s api.Snapshot) bool {
+	newAhead := false
+	for _, q := range s.Queue {
+		if q.Reason == api.QueueReplace {
+			if newAhead || q.Priority != api.PriorityReplacement || q.EffectivePriority != api.PriorityReplacement {
+				return false
+			}
+		} else {
+			newAhead = true
+		}
+	}
+	return true
+}
+
+func readyCohort() Predicate {
+	ids := map[string]bool{}
+	return func(s api.Snapshot) bool {
+		current := map[string]api.VM{}
+		for _, v := range s.VMs {
+			current[v.ID] = v
+			if v.State == api.VMReady {
+				ids[v.ID] = true
+			}
+		}
+		for id := range ids {
+			v := current[id]
+			if v.State != api.VMReady && !(v.State == api.VMFailed && v.LastReason == api.ReasonQuarantined) {
+				return false
+			}
+		}
+		return len(ids) > 0
+	}
+}
+
+// Capture the complete victim cohort before the fault, not a single lucky
+// higher-generation survivor. Maintenance also forbids terminal losses.
+func victimRecovery(base Scenario, pick func(api.VM) bool, first, maintenance bool) Scenario {
+	base.NewRun = func() Scenario {
+		run := base
+		run.NewRun = nil
+		run.Timeline = append([]Step(nil), base.Timeline...)
+		victims := map[string]api.VM{}
+		action := run.Timeline[0].Do
+		run.Timeline[0].Do = func(ctx context.Context, f System) error {
+			for _, v := range f.Latest().VMs {
+				if v.State == api.VMReady && pick(v) {
+					victims[v.ID] = v
+					if first {
+						break
+					}
+				}
+			}
+			if len(victims) == 0 {
+				return fmt.Errorf("no Ready victims before %s", run.Name)
+			}
+			return action(ctx, f)
+		}
+		run.Expect = append(append([]Check(nil), base.Expect...), Eventually(run.Duration, "every affected VM recovered at a higher generation", func(s api.Snapshot) bool {
+			recovered := 0
+			for _, v := range s.VMs {
+				if old, ok := victims[v.ID]; ok && v.State == api.VMReady && v.Generation > old.Generation && (!first || v.HostID == old.HostID) {
+					recovered++
+				}
+			}
+			return len(victims) > 0 && recovered == len(victims)
+		}))
+		if run.Name == "thundering-herd" {
+			run.Timeline = append(run.Timeline, Step{40 * time.Second, func(ctx context.Context, f System) error {
+				for i := 1; i <= config.Default().HostsPerRack; i++ {
+					if _, err := f.Do(ctx, "restart-host", api.ChaosRequest{Target: fmt.Sprintf("r2-h%d", i)}); err != nil {
+						return err
+					}
+				}
+				return nil
+			}})
+			waiting, replacements := map[string]bool{}, map[string]bool{}
+			priority := Always("lost victims wait at class 0 and are never shed", func(s api.Snapshot) bool {
+				queued := map[string]bool{}
+				for _, q := range s.Queue {
+					queued[q.VMID] = q.Reason == api.QueueReplace && q.Priority == api.PriorityReplacement && q.EffectivePriority == api.PriorityReplacement
+				}
+				for _, v := range s.VMs {
+					if _, victim := victims[v.ID]; victim && replacements[v.ID] &&
+						(v.State == api.VMFailed || v.State == api.VMTerminated || (v.State == api.VMPending && !queued[v.ID])) {
+						return false
+					}
+				}
+				return true
+			})
+			priority.EventTest = func(e api.Event) bool {
+				if e.Kind != api.EventTransition {
+					return true
+				}
+				if e.To == api.VMLost {
+					replacements[e.VMID], waiting[e.VMID] = true, true
+				}
+				if replacements[e.VMID] && e.To == api.VMPending {
+					waiting[e.VMID] = true
+				}
+				if _, victim := victims[e.VMID]; victim && replacements[e.VMID] && (e.To == api.VMFailed || e.To == api.VMTerminated || e.Detail == api.ReasonShed) {
+					return false
+				}
+				if e.To == api.VMBooting {
+					// No preemption: placements before loss detection are valid.
+					// After loss, every newly available slot serves replacements first.
+					if !replacements[e.VMID] && len(waiting) > 0 {
+						return false
+					}
+					delete(waiting, e.VMID)
+				}
+				return true
+			}
+			run.Expect = append(run.Expect, priority)
+		}
+		if maintenance {
+			check := Always("no VM lost during maintenance", func(s api.Snapshot) bool {
+				for _, v := range s.VMs {
+					if _, ok := victims[v.ID]; ok && (v.State == api.VMFailed || v.State == api.VMTerminated) {
+						return false
+					}
+				}
+				return true
+			})
+			check.EventTest = func(e api.Event) bool {
+				_, victim := victims[e.VMID]
+				return !(victim && e.Kind == api.EventTransition && (e.To == api.VMFailed || e.To == api.VMTerminated))
+			}
+			run.Expect = append(run.Expect, check)
+		}
+		return run
+	}
+	return base
+}
+
+func restartProgress(base Scenario, create bool) Scenario {
+	base.NewRun = func() Scenario {
+		run := base
+		run.NewRun = nil
+		run.Timeline = append([]Step(nil), base.Timeline...)
+		probe := ""
+		placed, restartedAt, ambientEvents := false, int64(0), 0
+		// The restart is the final scheduler restart in these timelines.
+		at := 20 * time.Second
+		if !create {
+			at = 40 * time.Second
+		}
+		for i, step := range run.Timeline {
+			if step.At == at {
+				run.Timeline[i].Do = func(ctx context.Context, f System) error {
+					err := step.Do(ctx, f)
+					restartedAt = f.Latest().At
+					return err
+				}
+			}
+		}
+		if create {
+			run.Timeline = append(run.Timeline, Step{25 * time.Second, func(ctx context.Context, f System) error {
+				v, err := f.CreateVM(ctx, "post-restart", api.CreateVMRequest{Pool: "ios-xcode16-m", Priority: "interactive"})
+				probe = v.ID
+				return err
+			}})
+		}
+		check := Eventually(run.Duration, "restarted scheduler places useful work", func(s api.Snapshot) bool {
+			if s.Scheduler != api.SchedulerUp || !placed {
+				return false
+			}
+			if !create {
+				return ambientEvents > 0
+			}
+			for _, v := range s.VMs {
+				if v.ID == probe && probe != "" && v.State == api.VMReady {
+					return true
+				}
+			}
+			return false
+		})
+		// Use an Always event observer; Eventually is decided only at the end.
+		observe := Always("observe restart and ambient events", func(api.Snapshot) bool { return true })
+		observe.EventTest = func(e api.Event) bool {
+			if restartedAt != 0 && e.At > restartedAt && e.Kind == api.EventTransition && e.To == api.VMBooting {
+				placed = true
+			}
+			if !create && e.Kind == api.EventChaos {
+				// Exclude all explicit injections; these other successful chaos
+				// actions can only have come from the ambient engine.
+				parts := strings.Fields(e.Detail)
+				if len(parts) > 0 {
+					switch parts[0] {
+					case "scenario", "sustained-load", "flood", "latency-spike", "kill-scheduler", "restart-scheduler", "ambient", "failed", "load:":
+					default:
+						ambientEvents++
+					}
+				}
+			}
+			return true
+		}
+		run.Expect = append(append([]Check(nil), base.Expect...), observe, check)
+		return run
+	}
+	return base
 }
 
 // TargetScenario is an opt-in measurement, not a quieter replacement for the
@@ -191,20 +437,193 @@ func unavailableCreate(ctx context.Context, f System) error {
 	}
 	return fmt.Errorf("create during scheduler outage: want 503, got %v", err)
 }
-func compromiseThree(ctx context.Context, f System) error {
-	count := 0
-	for _, v := range f.Latest().VMs {
-		if v.State == api.VMReady {
-			if _, err := f.Do(ctx, "compromise", api.ChaosRequest{Target: v.ID}); err != nil {
-				return err
-			}
-			count++
-			if count == 3 {
-				return nil
-			}
+
+// Capture victims and check outcomes in per-run state, not shared catalog
+// closures: Suite runs the same scenario with several seeds concurrently.
+func hostileTenant(base Scenario) Scenario {
+	base.NewRun = func() Scenario {
+		run := base
+		run.NewRun = nil
+		victims := map[string]int64{}
+		run.Timeline = []Step{
+			{10 * time.Second, Chaos("flood", "", map[string]float64{"count": 60})},
+			{11 * time.Second, Chaos("packet-loss", "", map[string]float64{"percent": 25})},
+			{11 * time.Second, func(ctx context.Context, f System) error {
+				for _, v := range f.Latest().VMs {
+					if v.State != api.VMReady {
+						continue
+					}
+					victims[v.ID] = v.Generation
+					if _, err := f.Do(ctx, "compromise", api.ChaosRequest{Target: v.ID}); err != nil {
+						return err
+					}
+					if len(victims) == 3 {
+						return nil
+					}
+				}
+				return fmt.Errorf("hostile tenant needs 3 Ready VMs, found %d", len(victims))
+			}},
+			{40 * time.Second, Chaos("packet-loss", "", map[string]float64{"percent": 0})},
 		}
+		noResurrection := Always("compromised victims never Ready at a higher generation", func(s api.Snapshot) bool {
+			for _, v := range s.VMs {
+				if gen, ok := victims[v.ID]; ok && v.Generation > gen && v.State == api.VMReady {
+					return false
+				}
+			}
+			return true
+		})
+		noResurrection.EventTest = func(e api.Event) bool {
+			gen, victim := victims[e.VMID]
+			return !(victim && e.Kind == api.EventTransition && e.To == api.VMReady && e.Generation > gen)
+		}
+		run.Expect = append(append([]Check(nil), base.Expect...), noResurrection,
+			Eventually(60*time.Second, "all compromised victims end quarantined Failed", func(s api.Snapshot) bool {
+				failed := 0
+				for _, v := range s.VMs {
+					if _, ok := victims[v.ID]; ok && v.State == api.VMFailed && v.LastReason == api.ReasonQuarantined {
+						failed++
+					}
+				}
+				return len(victims) == 3 && failed == len(victims)
+			}))
+		return run
 	}
-	return fmt.Errorf("hostile tenant needs 3 Ready VMs, found %d", count)
+	return base
+}
+
+func wipeLateHost(base Scenario) Scenario {
+	base.NewRun = func() Scenario {
+		run := base
+		run.NewRun = nil
+		run.Load.Count = 0 // The time-zero action retains the IDs returned for all 12 keys.
+		type request struct {
+			key, original, retry string
+			late                 bool
+		}
+		requests := make([]request, 12)
+		keyByID := map[string]string{}
+		wipeAt, wipeEpoch := int64(0), int64(0)
+		wiped := false
+		retry := func(ctx context.Context, f System) error {
+			for i := range requests {
+				r := &requests[i]
+				v, err := f.CreateVM(ctx, r.key, api.CreateVMRequest{Pool: "ios-xcode16-m", Priority: "standard"})
+				if err != nil {
+					return err
+				}
+				if (!r.late && v.ID != r.original) || (r.retry != "" && v.ID != r.retry) {
+					return fmt.Errorf("key %s moved: original=%s previous retry=%s returned=%s", r.key, r.original, r.retry, v.ID)
+				}
+				r.retry = v.ID
+				keyByID[v.ID] = r.key
+			}
+			return nil
+		}
+		run.Timeline = []Step{
+			{0, func(ctx context.Context, f System) error {
+				for i := range requests {
+					key := fmt.Sprintf("wipe-key-%d", i)
+					v, err := f.CreateVM(ctx, key, api.CreateVMRequest{Pool: "ios-xcode16-m", Priority: "standard"})
+					if err != nil {
+						return err
+					}
+					requests[i] = request{key: key, original: v.ID}
+					keyByID[v.ID] = key
+				}
+				return nil
+			}},
+			{10 * time.Second, func(ctx context.Context, f System) error {
+				late := 0
+				for i := range requests {
+					v, err := f.GetVM(ctx, requests[i].original)
+					if err != nil {
+						return err
+					}
+					if v.State != api.VMReady {
+						return fmt.Errorf("wipe baseline %s not Ready: %s", v.ID, v.State)
+					}
+					requests[i].late = v.Rack == "r2"
+					if requests[i].late {
+						late++
+					}
+				}
+				if late == 0 || late == len(requests) {
+					return fmt.Errorf("wipe requires both reachable and late keys, got %d late", late)
+				}
+				_, err := f.Do(ctx, "partition-rack", api.ChaosRequest{Target: "r2"})
+				return err
+			}},
+			{12 * time.Second, func(ctx context.Context, f System) error {
+				before := f.Latest()
+				wipeAt, wipeEpoch = before.At, before.Epoch
+				_, err := f.Do(ctx, "wipe-store", api.ChaosRequest{})
+				wiped = err == nil
+				return err
+			}},
+			{30 * time.Second, retry},
+			{40 * time.Second, Chaos("heal-rack", "r2", nil)},
+			{60 * time.Second, retry},
+			{80 * time.Second, retry},
+		}
+		unique := Always("at most one desired-running VM per key", func(s api.Snapshot) bool {
+			counts := map[string]int{}
+			for _, v := range s.VMs {
+				if v.Desired != api.DesiredRunning {
+					continue
+				}
+				key, known := keyByID[v.ID]
+				if !known {
+					return false
+				}
+				counts[key]++
+				if counts[key] > 1 {
+					return false
+				}
+			}
+			return true
+		})
+		lateNeverReady := Always("late copies never adopted Ready", func(s api.Snapshot) bool {
+			if !wiped || s.Epoch <= wipeEpoch {
+				return true // Ignore pre-wipe snapshots buffered during actions.
+			}
+			for _, v := range s.VMs {
+				for _, r := range requests {
+					if r.late && v.ID == r.original && v.State == api.VMReady {
+						return false
+					}
+				}
+			}
+			return true
+		})
+		lateNeverReady.EventTest = func(e api.Event) bool {
+			if wiped && e.At >= wipeAt && e.Kind == api.EventTransition && e.To == api.VMReady {
+				for _, r := range requests {
+					if r.late && e.VMID == r.original {
+						return false
+					}
+				}
+			}
+			return true
+		}
+		run.Expect = []Check{Always("invariants", NoInvariantViolations), unique, lateNeverReady,
+			Eventually(90*time.Second, "one Ready VM per retried key", func(s api.Snapshot) bool {
+				ready := 0
+				for _, r := range requests {
+					if r.retry == "" {
+						return false
+					}
+					for _, v := range s.VMs {
+						if v.ID == r.retry && v.State == api.VMReady && v.Desired == api.DesiredRunning {
+							ready++
+						}
+					}
+				}
+				return ready == len(requests)
+			}), Eventually(90*time.Second, "late driver copies stopped", NoStaleCopies)}
+		return run
+	}
+	return base
 }
 func ambient(ctx context.Context, f System) error {
 	intensity := 0.5

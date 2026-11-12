@@ -40,8 +40,11 @@ type Step struct {
 type Predicate func(api.Snapshot) bool
 type Check struct {
 	Name  string
-	Until time.Duration // zero means Always, otherwise satisfied by the deadline
+	Until time.Duration // zero means Always; nonzero checks the final frame, not an earlier success
 	Test  Predicate
+	// EventTest checks transitions that may occur between snapshot frames.
+	// Like Always, a failure is permanent for the run.
+	EventTest func(api.Event) bool
 	// NewTest allocates observation state separately for each parallel run.
 	NewTest func() Predicate
 	Metric  string
@@ -54,6 +57,8 @@ type Scenario struct {
 	Duration time.Duration
 	Timeline []Step
 	Expect   []Check
+	// NewRun isolates state shared by a scenario's actions and assertions.
+	NewRun func() Scenario
 }
 
 func Always(name string, p Predicate) Check { return Check{Name: name, Test: p} }
@@ -96,8 +101,30 @@ func AllDesiredVMsReady(s api.Snapshot) bool {
 	return true
 }
 func NoStaleCopies(s api.Snapshot) bool {
+	observed := make(map[string]bool, len(s.Observed))
+	current := make(map[string]api.VM, len(s.VMs))
+	for _, v := range s.VMs {
+		current[v.ID] = v
+	}
+	for _, h := range s.Observed {
+		// A disconnected driver cannot establish that an old copy stopped.
+		if !h.Connected {
+			return false
+		}
+		observed[h.HostID] = true
+		for _, actual := range h.Actual {
+			if !actual.Running {
+				continue
+			}
+			v, ok := current[actual.VMID]
+			if !ok || v.Generation != actual.Generation || v.HostID != h.HostID ||
+				v.Desired != api.DesiredRunning || (v.State != api.VMBooting && v.State != api.VMReady && v.State != api.VMUnhealthy) {
+				return false
+			}
+		}
+	}
 	for _, h := range s.Hosts {
-		if len(h.Stale) > 0 {
+		if h.Lease == api.LeaseHealthy && !observed[h.ID] {
 			return false
 		}
 	}

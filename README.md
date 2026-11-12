@@ -1,10 +1,10 @@
 # macOS VM control plane
 
-A Go control plane for macOS VMs across three racks, four hosts per rack and two VM slots per host. It demonstrates lifecycle correctness under guest, host, rack and scheduler failures: readiness comes from a checked guest registration, placement is persisted before commands are sent, and generations fence stale copies. Live deployment: **https://controlplane-production-0652d599.up.railway.app** (`/healthz`). The initial deployment is the Phase 0 health stub; the source now serves the dashboard and assembled fleet, pending release. Built as five parallel workstreams; see [COORDINATION.md](COORDINATION.md).
+A Go control plane for macOS VMs across three racks, four hosts per rack and two VM slots per host. Readiness comes from a checked guest registration, placement is persisted before commands are sent, and generations fence stale copies. The [live deployment](https://controlplane-production-0652d599.up.railway.app) serves the real dashboard, assembled simulated fleet, SSE and recorded-run playback, not the initial health stub. Its previous green gate did not cover all recovery guarantees: see the review limitations below. Built as five parallel workstreams; see [COORDINATION.md](COORDINATION.md).
 
 ## Try this: a 60-second tour
 
-In the local dashboard (or the live deployment after release):
+In the local or live dashboard:
 
 1. Flood the 24 slots. Watch admission queue by priority, then 429s or shedding at the 32-entry cap.
 2. Kill a host. Its lease becomes Suspect, then Lost; replacement VMs receive a new generation.
@@ -27,9 +27,9 @@ make e2e
 
 The default is four concurrent isolated fleets. On the 16-vCPU / 31-GiB verification orb, use `make verify VERIFY_PARALLEL=8`; this changes concurrency only, not speeds, repeats or thresholds.
 
-The runner defaults to **5×**, including under `-race`. Explicit `--speed 0` calibrates the complete suite at 5× and 50× with the same seeds. Different liveness pass rates select 5×; this includes time-bounded invariants 2 (stale-copy stop deadline) and 8 (prompt placement). Any violation of invariant 1 or 3–7 at either speed fails calibration: reducing speed must never conceal those safety bugs. Failures at both speeds also stop calibration. Use `--speed` for an explicit diagnostic override, `--seed` to choose the seed range, `--parallel` to cap isolated systems and `--output` to choose the recording directory. Seeds reproduce fault choices, not goroutine scheduling. Recovery latency is measured from Lost/Unhealthy to Ready transition events, not snapshots, which can miss transient lifecycle states.
+The runner defaults to **5×**, including under `-race`. Explicit `--speed 0` compares the complete suite at 5× and 50× with the same seeds. Any failed 5× baseline returns an error. Only a green baseline with high-speed-only liveness failures can select 5×; invariants 2 and 8 are time-bounded, but every other invariant (including idempotency uniqueness) is safety and can never be calibrated away. Use `--speed` for a diagnostic override, `--seed` to choose the seed range, `--parallel` to cap isolated systems and `--output` to choose the recording directory. Seeds reproduce fault choices, not goroutine scheduling. Eventually is evaluated at the final frame, not latched from an earlier good state. Recovery metrics use Lost/Unhealthy → Ready events; unrecovered VMs are counted separately as `recovery_failures`, not zero-latency samples. Any source event-sequence gap fails the recording.
 
-Each recorded run contains the following files. `vmctl verify` writes `runs/<id>/` by default; `make verify` keeps each full batch under `runs/verify-*/` and bundles one passing run per scenario from the latest successful batch into `runs/latest/`. The bundle keeps every twentieth frame, both endpoints, and every frame within ±2 simulated seconds of a chaos/violation marker. Reports, metrics and event logs are unchanged. Bundling fails above 100 MB; failed batches never replace the last green image evidence. `vmctl bundle --input runs/verify-...` can regenerate the bundle without rerunning the suite.
+Each recorded run contains the following files. `vmctl verify` writes `runs/<id>/` by default; `make verify` keeps each full batch under `runs/verify-*/` and bundles one passing run per catalog scenario from the latest successful batch into `runs/latest/`. The catalog now has 15 names, including the wipe/late-host regression. The bundle thins quiet frames by simulated time (2 s), retaining both endpoints and every frame within ±2 simulated seconds of a chaos/violation marker. Events in dropped frames' `recent` lists are carried into the next retained frame for playback. Reports, metrics and event logs are unchanged. Incomplete catalogs and bundles above 100 MB fail. Failed verification never promotes new image evidence; an existing `runs/latest` remains historical evidence, not proof of the failed revision. `vmctl bundle --input runs/verify-...` regenerates a complete green bundle without rerunning the suite.
 
 | File | Contents |
 | --- | --- |
@@ -71,7 +71,7 @@ Desired state is separate from observed state, so a deleted VM is not resurrecte
 
 ## Failure modes
 
-These are intended contracts, not claims that the current health-only deployment already passes them.
+These are intended contracts for the real simulated fleet. The deployed dashboard and its original 14 recordings work, but the review found coverage gaps and product bugs; an old passing recording does not prove the strengthened checks below.
 
 | Failure | Detection | Response | Guarantee |
 | --- | --- | --- | --- |
@@ -98,11 +98,11 @@ The simulated policy denies guest-to-guest and guest-to-control-plane access. Gu
 
 On real Macs, Virtualization.framework's default NAT puts a host's guests on a shared subnet; NAT alone is not tenant isolation. Replace the simulated policy with per-VM pf rules or a separate userspace network stack per VM, plus an allowlisted egress proxy. Hypervisor escapes are outside this simulator's security model.
 
-The public demo has no authentication and must contain no secrets or tenant workloads. Real deployment requires mTLS between agents and scheduler, OIDC/RBAC on the API, real vsock channel binding, actual network sandboxing, quotas and audit retention. Global demo caps and per-IP chaos limits are part of the integration plan, not security guarantees of the initial stub.
+The public demo has no authentication and must contain no secrets or tenant workloads. Real deployment requires mTLS between agents and scheduler, OIDC/RBAC on the API, real vsock channel binding, actual network sandboxing, quotas and audit retention. Demo caps and per-IP chaos limits are not a production security boundary.
 
 ## Scaling
 
-Rack spreading reduces correlated loss; reserve headroom if a rack failure must be absorbed without shedding. A scheduler per rack would fragment capacity and complicate ownership. Scale by independent cells with a routing layer, then regions. Image distribution, boot latency, storage throughput and the single durable writer are likely limits before placement scoring. Measure before adding hierarchy.
+Rack spreading reduces correlated loss; reserve headroom operationally if a rack failure must be absorbed without waiting. The scheduler reserves no headroom and does not preempt running VMs. New requests may legitimately fill surviving slots during the host-lease detection window. Once a VM is declared Lost, its replacement waits at class 0 ahead of new requests, and the next available slot goes to a replacement first; it never evicts an existing VM. Negative rack-loss headroom (for example −8) means replacements must wait for capacity or power to return. The thundering-herd recording checks that waiting victims remain class 0 without failure/shedding, placement events respect that priority, and every victim is Ready at a newer generation after power returns. A scheduler per rack would fragment capacity and complicate ownership. Scale by independent cells with a routing layer, then regions. Image distribution, boot latency, storage throughput and the single durable writer are likely limits before placement scoring. Measure before adding hierarchy.
 
 ## Simulated versus real
 
@@ -112,7 +112,7 @@ Railway runs a Linux container, **not macOS VMs**. The fake hypervisor models bo
 
 The multi-stage Dockerfile builds a static `CGO_ENABLED=0` binary with `golang:1.27`, then runs it as non-root in `gcr.io/distroless/static`. Railway serves `$PORT`, checks `/healthz`, runs one replica and has sleep disabled. SQLite and recordings live on ephemeral local disk, without a volume: redeploys lose demo state. This is deliberate and not a production durability design. Deploy credentials stay outside the repository and container.
 
-Run `make verify` in the deployment build context before building or uploading the image. The Dockerfile embeds `runs/latest/` at `/runs` and sets `RUNS_DIR=/runs`; `.dockerignore` excludes earlier/failed batches and Git metadata. The files are owned by the non-root runtime user so dashboard-started recordings can share that directory. A source-only build still works but has no bundled evidence; a Git-only deploy cannot include ignored local recordings. For an approved release, upload the verified workspace with `railway up --no-gitignore --service controlplane`; `.railwayignore` includes only the latest batch while excluding historical runs, databases and local scratch files. Without `--no-gitignore`, the CLI's normal Git-ignore handling excludes the recordings.
+Run `make verify` in the deployment build context before building or uploading the image. The Dockerfile embeds `runs/latest/` at `/runs` and sets `RUNS_DIR=/runs`; `.dockerignore` excludes earlier/failed batches and Git metadata. The files are owned by the non-root runtime user so dashboard-started recordings can share that directory. A build without evidence fails; a Git-only deploy cannot include ignored local recordings. For an approved release, upload the verified workspace with `railway up --no-gitignore --service controlplane`; `.railwayignore` includes only the latest bundle while excluding historical runs, databases and local scratch files. Without `--no-gitignore`, the CLI's normal Git-ignore handling excludes the recordings.
 
 The 0%-chaos interactive baseline at 5× under `-race` is p99 **6017 ms** (340 boots, 20 seeds, 17/24 slots per seed). The configured chart target is twice that, **12034 ms** of simulation time. The separate, opt-in `target-50pct-chaos` profile offers 17 interactive VMs on 24 slots (70.8%), with 50% ambient guest/host/network/control faults enabled before boot. Only this measurement filters load/topology injections, so its offered load and capacity stay fixed. The default `bad-day` preset keeps unfiltered 50% ambient chaos, the flood, latency spike and scheduler restart mid-flood. The measurement reports first-Ready p99, sample/request counts and target attainment in `report.json`; missing/unready requests prevent a target-met result. The target is reported, never used to waive or add an invariant gate. Run it separately with `go run -race ./cmd/vmctl verify --scenario target-50pct-chaos --repeat 20 --parallel 8 --speed 5 --output runs/target-50pct-chaos`.
 
@@ -120,16 +120,23 @@ Measured across seeds 1–20 at 5× under `-race` (parallel2): **17925 ms pooled
 
 Known limitation: the 5× repeat50 diagnostic (seeds 20–69) passed **49/50**, with all **12 invariant-2 events from seed 21**. The last event was **3994 ms after gen2 placement**, or **1994 ms past the 2 s bound**; this is the last observed violation, not the driver's stop time. At 2× the same seed range passed **49/50**, with 16 invariant-2 events from seed 21 (last violation 4314 ms after placement, 2314 ms past the bound). At 1× it passed **50/50**, with zero violations. The exact seed-20 reruns also pass at 2× and 1×. These are diagnostics at the stated speeds, not a relaxed bound or proof of a bounded driver stop. The measurement stays outside the default gate and release image.
 
-The stale-copy bound (one heartbeat) is checked only while the host's heartbeat lease is healthy. With paused heartbeats or ack loss, an old copy is stopped by the next delivered StartVM or heartbeat ack; the agent does not self-fence on missed acks, so stop time on a heartbeat-silent host is not bounded or observed by these recordings. One authoritative copy held in every run.
+The stale-copy bound (one heartbeat) is checked only while the host is `Connected`: its heartbeat lease is healthy, it is not marked kill-host or one-way-partition, and its rack is not partitioned. With paused heartbeats or ack loss, an old copy is stopped by a delivered StartVM, StopVM or stale heartbeat ack; the agent does not self-fence on missed acks. Stop time on a heartbeat-silent host was not bounded or observed by those original recordings. The claim of one authoritative copy rests on invariant 1, which allows one heartbeat of cross-component observation slack, not instantaneous global agreement.
+
+### Review results and pending fixes
+
+The original 14×20 green gate is historical, not proof of recovery. Whole-system review reproduced six guarantee-breaking bugs: lost quarantine reports allowing resurrection; late post-wipe adoption duplicating a key; agent restart losing generation/epoch fences; delayed sequence-1 heartbeats bypassing ordering; capacity refusals consuming boot attempts; and restart during wipe recovery losing its adoption window. Owner fixes and new full-system evidence are pending integration; none is claimed fixed here yet.
+
+The strengthened W5 checks track every compromised victim to terminal quarantine, forbid later Ready generations, and exercise partition at 10 s → wipe at 12 s → retry at 30 s → heal at 40 s, with further retries at 60/80 s. Reachable keys retain their IDs; late keys may receive new IDs, but subsequent retries must remain bound to those IDs, with no duplicate desired-running VM and no adoption of the late original. Physical stale-copy assertions require raw checker observations, never the scheduler's cached `Host.Stale`. The recovery review also adds final-frame assertions, every-victim recovery, post-restart placement, event-gap rejection, honest missing-recovery counts and plan-faithful preset timelines. Fresh gate results and owner-fix commits will be recorded after integration.
 
 ### Release sequence (approval required)
 
 Upload only after release approval and a passing `make verify` (including e2e). Use a production-scoped project token in `RAILWAY_TOKEN`, not the workspace `RAILWAY_API_TOKEN`; do not paste either into the repository or a thread. Run this sequence in the verified workspace containing the ignored recordings, not a fresh Git-only checkout.
 
 ```sh
+set -e
 make verify VERIFY_PARALLEL=8
+test "$(find runs/latest -mindepth 2 -maxdepth 2 -name report.json | wc -l)" -eq 15
 docker build -t vm-controlplane:verified .
-test "$(find runs/latest -mindepth 2 -maxdepth 2 -name report.json | wc -l)" -eq 14
 : "${RAILWAY_TOKEN:?Set the production project token securely before uploading}"
 env -u RAILWAY_API_TOKEN npm exec --yes --package @railway/cli -- railway up \
   --project bdb8a2f4-7793-4941-a9c6-8caf5ed9f35b \

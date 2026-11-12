@@ -57,8 +57,13 @@ func Bundle(input, output string) (int, int64, error) {
 			selected[report.Scenario] = run{path, report}
 		}
 	}
-	if len(selected) == 0 {
-		return 0, 0, fmt.Errorf("no recordings in %s", input)
+	for _, s := range Catalog() {
+		if _, ok := selected[s.Name]; !ok {
+			return 0, 0, fmt.Errorf("missing catalog scenario %s in %s", s.Name, input)
+		}
+	}
+	if len(selected) != len(Catalog()) {
+		return 0, 0, fmt.Errorf("bundle must contain exactly the catalog scenarios")
 	}
 	if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil {
 		return 0, 0, err
@@ -92,8 +97,22 @@ func Bundle(input, output string) (int, int64, error) {
 				}
 				decoder, encoder := json.NewDecoder(in), json.NewEncoder(out)
 				var last json.RawMessage
-				index, written := 0, -1
-				stride := max(1, int(cfg.HostHeartbeat/cfg.SnapshotEvery))
+				var carried []json.RawMessage
+				var lastKept int64
+				written, lastWritten := false, false
+				emit := func(frame json.RawMessage) error {
+					var fields map[string]json.RawMessage
+					if err := json.Unmarshal(frame, &fields); err != nil {
+						return err
+					}
+					var err error
+					fields["recent"], err = json.Marshal(carried)
+					if err != nil {
+						return err
+					}
+					carried = nil
+					return encoder.Encode(fields)
+				}
 				for {
 					var frame json.RawMessage
 					err := decoder.Decode(&frame)
@@ -104,12 +123,14 @@ func Bundle(input, output string) (int, int64, error) {
 						return err
 					}
 					var stamp struct {
-						At int64 `json:"at"`
+						At     int64             `json:"at"`
+						Recent []json.RawMessage `json:"recent"`
 					}
 					if err := json.Unmarshal(frame, &stamp); err != nil {
 						return err
 					}
-					keep := index%stride == 0
+					carried = append(carried, stamp.Recent...)
+					keep := !written || stamp.At-lastKept >= cfg.HostHeartbeat.Milliseconds()
 					for _, marker := range r.report.Markers {
 						delta := stamp.At - marker.At
 						if delta >= -cfg.HostHeartbeat.Milliseconds() && delta <= cfg.HostHeartbeat.Milliseconds() {
@@ -118,19 +139,19 @@ func Bundle(input, output string) (int, int64, error) {
 						}
 					}
 					if keep {
-						if err := encoder.Encode(frame); err != nil {
+						if err := emit(frame); err != nil {
 							return err
 						}
-						written = index
+						lastKept, written = stamp.At, true
 					}
 					last = frame
-					index++
+					lastWritten = keep
 				}
-				if index == 0 {
+				if !written {
 					return fmt.Errorf("empty snapshots in %s", r.path)
 				}
-				if written != index-1 {
-					return encoder.Encode(last)
+				if !lastWritten {
+					return emit(last)
 				}
 				return nil
 			}()
@@ -156,11 +177,19 @@ func Bundle(input, output string) (int, int64, error) {
 	if size > 100_000_000 {
 		return 0, size, fmt.Errorf("recording bundle exceeds 100 MB: %d bytes", size)
 	}
-	if err := os.RemoveAll(output); err != nil {
+	// Preserve the previous evidence until the new directory is in place.
+	backup := staged + "-previous"
+	if err := os.Rename(output, backup); err != nil && !os.IsNotExist(err) {
 		return 0, size, err
 	}
 	if err := os.Rename(staged, output); err != nil {
+		if restore := os.Rename(backup, output); restore != nil && !os.IsNotExist(restore) {
+			return 0, size, fmt.Errorf("publish: %v; restore previous bundle: %w", err, restore)
+		}
 		return 0, size, err
+	}
+	if err := os.RemoveAll(backup); err != nil {
+		return len(selected), size, err
 	}
 	return len(selected), size, nil
 }

@@ -63,7 +63,7 @@ func Suite(ctx context.Context, scenarios []Scenario, factory Factory, opt Optio
 	wg.Wait()
 	failed := false
 	for i, s := range scenarios {
-		passed, violations := 0, 0
+		passed, violations, unrecovered := 0, 0, 0
 		var recovery []int64
 		for _, r := range reports[i*opt.Repeat : (i+1)*opt.Repeat] {
 			if r.Passed {
@@ -72,9 +72,16 @@ func Suite(ctx context.Context, scenarios []Scenario, factory Factory, opt Optio
 				failed = true
 			}
 			violations += r.Violations
-			recovery = append(recovery, r.P99RecoverMs)
+			unrecovered += int(r.Metrics["recovery_failures"])
+			if _, sampled := r.Metrics["p99_recover_ms"]; sampled {
+				recovery = append(recovery, r.P99RecoverMs)
+			}
 		}
-		fmt.Fprintf(out, "%s: %d/%d passed, p99 recovery %dms, violations %d\n", s.Name, passed, opt.Repeat, percentile(recovery), violations)
+		p99 := "not sampled"
+		if len(recovery) > 0 {
+			p99 = fmt.Sprintf("%dms", percentile(recovery))
+		}
+		fmt.Fprintf(out, "%s: %d/%d passed, p99 recovery %s, unrecovered %d, violations %d\n", s.Name, passed, opt.Repeat, p99, unrecovered, violations)
 	}
 	if firstErr != nil {
 		return reports, firstErr
@@ -86,6 +93,9 @@ func Suite(ctx context.Context, scenarios []Scenario, factory Factory, opt Optio
 }
 
 func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed float64, dir string) (report api.RunReport, err error) {
+	if s.NewRun != nil {
+		s = s.NewRun()
+	}
 	if speed <= 0 || s.Duration <= 0 {
 		return report, fmt.Errorf("speed and duration must be positive")
 	}
@@ -230,17 +240,28 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 		}
 	}
 	report.Checks = results
-	lastAction := time.Duration(0)
-	if len(steps) > 0 {
-		lastAction = steps[len(steps)-1].At
-	}
 	lost := map[string]int64{}
 	createdAt := map[string]int64{}
 	firstReady := map[string]int64{}
 	var recoveries []int64
+	var lastEventSeq int64
 	recordEvent := func(ev api.Event) error {
 		if e := json.NewEncoder(events).Encode(ev); e != nil {
 			return e
+		}
+		if lastEventSeq != 0 && ev.Seq != lastEventSeq+1 {
+			return fmt.Errorf("event sequence gap: after %d received %d", lastEventSeq, ev.Seq)
+		}
+		if ev.Seq <= 0 {
+			return fmt.Errorf("invalid event sequence %d", ev.Seq)
+		}
+		lastEventSeq = ev.Seq
+		for i, check := range s.Expect {
+			if check.EventTest != nil && !check.EventTest(ev) && results[i].Passed {
+				results[i].Passed = false
+				results[i].FirstBadSeq = ev.Seq
+				results[i].Detail = fmt.Sprintf("failed on event %d: %s", ev.Seq, ev.Detail)
+			}
 		}
 		if ev.Kind == api.EventChaos || ev.Kind == api.EventInvariant {
 			report.Markers = append(report.Markers, ev)
@@ -323,10 +344,6 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 					results[i].FirstBadSeq = snap.Seq
 					results[i].Detail = fmt.Sprintf("failed at sim +%s", elapsed)
 				}
-				// Recovery cannot be satisfied by the healthy state before the fault.
-				if c.Until > 0 && elapsed > lastAction && elapsed <= c.Until && good {
-					results[i].Passed = true
-				}
 			}
 			violations := 0
 			safety := 0
@@ -366,6 +383,14 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 					report.P99RecoverMs = percentile(recoveries)
 					report.Metrics["p99_recover_ms"] = float64(report.P99RecoverMs)
 				}
+				// Failed quarantine is intentional, not a promised recovery.
+				for _, v := range snap.VMs {
+					if v.State == api.VMFailed && v.LastReason == api.ReasonQuarantined {
+						delete(lost, v.ID)
+					}
+				}
+				report.Metrics["recovery_failures"] = float64(len(lost))
+				report.Metrics["recovery_samples"] = float64(len(recoveries))
 				// Target attainment is evidence, never a pass/fail check. Count
 				// only first Ready for the initial interactive cohort; lost or
 				// failed boots remain visible as missing samples, not successes.
@@ -390,6 +415,13 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 					}
 				}
 				for i, c := range s.Expect {
+					if c.Until > 0 {
+						results[i].Passed = tests[i](snap)
+						if !results[i].Passed {
+							results[i].FirstBadSeq = snap.Seq
+							results[i].Detail = "condition false at end of run"
+						}
+					}
 					if c.Metric != "" {
 						value, ok := report.Metrics[c.Metric]
 						results[i].Passed = ok && value < c.Limit
@@ -441,8 +473,8 @@ func Calibrate(ctx context.Context, scenarios []Scenario, f Factory, opt Options
 		}
 	}
 	fmt.Fprintf(out, "calibration: selected %gx (5x and 50x compared with identical seeds)\n", selected)
-	if e1 != nil && e2 != nil {
-		return selected, fmt.Errorf("both calibration speeds failed: 5x: %v; 50x: %v", e1, e2)
+	if e1 != nil {
+		return selected, fmt.Errorf("5x calibration baseline failed: %v (50x: %v)", e1, e2)
 	}
 	return selected, nil
 }
