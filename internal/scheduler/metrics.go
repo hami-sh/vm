@@ -88,6 +88,8 @@ func (p *planner) snapshot() api.Snapshot {
 	s := api.Snapshot{Seq: p.seq, At: p.now.UnixMilli(), Epoch: p.epoch, Scheduler: api.SchedulerUp, VMs: []api.VM{}, Hosts: []api.Host{}, Racks: []api.Rack{}, Pools: []api.Pool{}, Queue: p.ordered(false), Recent: append([]api.Event(nil), p.recent...), Counters: p.counters, Latency: map[string]api.LatencyStats{}}
 	if p.down {
 		s.Scheduler = api.SchedulerDown
+	} else if p.now.UnixMilli() < p.recoverUntil {
+		s.Scheduler = api.SchedulerReconciling
 	}
 	s.Counters.ByState = map[api.VMState]int{}
 	s.Counters.Recoveries = maps.Clone(p.counters.Recoveries)

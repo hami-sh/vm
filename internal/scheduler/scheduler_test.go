@@ -489,11 +489,18 @@ func TestActorConcurrentIdempotencyAndRealRestart(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		var maxEpoch int64
+		metadata := map[string]api.StartVM{}
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case inventory := <-registrations:
+				for j, i := range inventory {
+					if m, ok := metadata[i.VMID]; ok {
+						inventory[j].IdempotencyKey = m.IdempotencyKey
+						inventory[j].RequestHash = m.RequestHash
+					}
+				}
 				_ = agent.Send(Address, api.PortControl, api.RegisterHost{HostID: "a", Rack: "r1", Slots: 2, Epoch: maxEpoch, Inventory: inventory})
 			case e := <-agent.Inbox():
 				switch m := e.Msg.(type) {
@@ -502,6 +509,7 @@ func TestActorConcurrentIdempotencyAndRealRestart(t *testing.T) {
 						continue
 					}
 					maxEpoch = m.Epoch
+					metadata[m.VMID] = m
 					_ = agent.Send(Address, api.PortControl, api.StartVMResult{VMID: m.VMID, Generation: m.Generation, HostID: "a", Admitted: true})
 					_ = agent.Send(Address, api.PortControl, api.ReadyReport{VMID: m.VMID, Generation: m.Generation, HostID: "a"})
 				case api.StopVM:
@@ -518,6 +526,7 @@ func TestActorConcurrentIdempotencyAndRealRestart(t *testing.T) {
 			}
 		}
 	}()
+	c.Advance(config.Default().HostLeaseTTL)
 	register()
 	await(t, ctx, func() bool { hs, e := s.ListHosts(ctx); return e == nil && len(hs) == 1 })
 	var calls sync.WaitGroup
@@ -645,6 +654,19 @@ func TestActorConcurrentIdempotencyAndRealRestart(t *testing.T) {
 	if wiped.Epoch <= beforeSnap.Epoch {
 		t.Fatal("wiped-store epoch went backwards")
 	}
+	_, err = s.CreateVM(ctx, "same", api.CreateVMRequest{Pool: before.Pool})
+	status(t, err, 503)
+	c.Advance(config.Default().HostLeaseTTL - time.Millisecond)
+	_, err = s.CreateVM(ctx, "same", api.CreateVMRequest{Pool: before.Pool})
+	status(t, err, 503)
+	c.Advance(time.Millisecond)
+	register(api.InventoryItem{VMID: id, Generation: beforeWipe.Generation, State: api.VMReady, Pool: before.Pool})
+	recovered, err := s.CreateVM(ctx, "same", api.CreateVMRequest{Pool: before.Pool})
+	if err != nil || recovered.ID != id {
+		t.Fatalf("wiped-store idempotency not recovered: %+v %v", recovered, err)
+	}
+	_, err = s.CreateVM(ctx, "same", api.CreateVMRequest{Pool: before.Pool, Priority: "batch"})
+	status(t, err, 422)
 	newVM, err := s.CreateVM(ctx, "after-wipe", api.CreateVMRequest{Pool: before.Pool})
 	if err != nil {
 		t.Fatal(err)
@@ -713,11 +735,13 @@ func TestFailedCommitSendsNoStartAndReturns503(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer agent.Close()
-	s, err := New(ctx, config.Default(), clock.NewFake(time.Unix(1000, 0)), net, db)
+	c := clock.NewFake(time.Unix(1000, 0))
+	s, err := New(ctx, config.Default(), c, net, db)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { cancel(); <-s.Done() }()
+	c.Advance(config.Default().HostLeaseTTL)
 	_ = agent.Send(Address, api.PortControl, api.RegisterHost{HostID: "a", Rack: "r1", Slots: 1})
 	await(t, ctx, func() bool { hs, e := s.ListHosts(ctx); return e == nil && len(hs) == 1 })
 	if err = db.Close(); err != nil {
@@ -738,5 +762,35 @@ func TestFailedCommitSendsNoStartAndReturns503(t *testing.T) {
 		default:
 			return
 		}
+	}
+}
+
+func TestAdoptedIdempotencyKeyChoosesHighestGeneration(t *testing.T) {
+	for _, sameReport := range []bool{false, true} {
+		t.Run(fmt.Sprint(sameReport), func(t *testing.T) {
+			h := newHarness(t)
+			key := "duplicate-key"
+			low := api.InventoryItem{VMID: "low", Generation: 3, State: api.VMReady, Pool: config.Pools[0].Name, IdempotencyKey: key, RequestHash: "low-hash"}
+			high := low
+			high.VMID = "high"
+			high.Generation = 8
+			high.RequestHash = "high-hash"
+			if sameReport {
+				h.register("a", "r1", 2, low, high)
+			} else {
+				h.register("a", "r1", 2, low)
+				h.register("b", "r2", 2, high)
+			}
+			if h.s.state.data.VMs[low.VMID].Key != "" || h.s.state.data.VMs[high.VMID].Key != key {
+				t.Fatal("higher-generation claim did not win")
+			}
+			loaded, _, err := h.db.Start(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if loaded.VMs[high.VMID].Key != key || loaded.VMs[high.VMID].Hash != "high-hash" || loaded.VMs[low.VMID].Key != "" {
+				t.Fatal("recovered key claim not persisted")
+			}
+		})
 	}
 }

@@ -53,6 +53,7 @@ type state struct {
 	replacement  map[string]bool
 	claims       map[string]string
 	fresh        bool
+	recoverUntil int64
 	down         bool
 	epoch        int64
 	counters     api.Counters
@@ -95,6 +96,9 @@ func New(ctx context.Context, cfg config.Config, c clock.Clock, transport api.Tr
 	s := &Scheduler{cfg: cfg, clock: c, store: db, endpoint: ep, inbox: make(chan request, cfg.MaxVMs), done: make(chan struct{})}
 	s.state = newState(d, epoch, c.Now())
 	s.state.fresh = db.Fresh()
+	if s.state.fresh {
+		s.state.recoverUntil = c.Now().Add(cfg.HostLeaseTTL).UnixMilli()
+	}
 	events, err := db.Events(ctx)
 	if err != nil {
 		ep.Close()

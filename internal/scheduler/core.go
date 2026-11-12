@@ -192,6 +192,9 @@ func (p *planner) request(r request) result {
 }
 
 func (p *planner) create(key string, req api.CreateVMRequest) result {
+	if remaining := p.recoverUntil - p.now.UnixMilli(); remaining > 0 {
+		return result{err: &api.Error{Status: 503, Msg: "recovering idempotency keys from hosts", RetryAfterS: int((remaining + 999) / 1000)}}
+	}
 	// Hash the actual body, before defaults: different bodies with one key
 	// are rejected rather than silently treated as equivalent.
 	b, _ := json.Marshal(req)
@@ -375,7 +378,7 @@ func (p *planner) place(id, hostID string) {
 	}
 	p.reservations[id] = reservation{host: hostID, gen: v.Generation, until: p.now.Add(p.cfg.ReservationTTL).UnixMilli()}
 	pl, _ := pool(v.Pool)
-	p.send(hostID, api.StartVM{VMID: id, Generation: v.Generation, Epoch: p.epoch, Token: uuid.NewString(), Spec: api.VMSpec{Pool: pl.Name, Image: pl.Image, CPUs: pl.CPUs, MemoryMB: pl.MemoryMB}})
+	p.send(hostID, api.StartVM{VMID: id, Generation: v.Generation, Epoch: p.epoch, Token: uuid.NewString(), Spec: api.VMSpec{Pool: pl.Name, Image: pl.Image, CPUs: pl.CPUs, MemoryMB: pl.MemoryMB}, IdempotencyKey: r.Key, RequestHash: r.Hash})
 	p.counters.Placed++
 	p.log(api.EventAdmission, id, hostID, "placed")
 }

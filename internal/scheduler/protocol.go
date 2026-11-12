@@ -182,11 +182,31 @@ func (p *planner) reconcile(hostID string, inventory []api.InventoryItem, strict
 		if !known {
 			_, validPool := pool(i.Pool)
 			if p.fresh {
-				p.log(api.EventAlert, i.VMID, hostID, "store lost unknown VM; idempotency key lost")
+				detail := "store lost unknown VM; idempotency key recovered"
+				if i.IdempotencyKey == "" || i.RequestHash == "" {
+					detail = "store lost unknown VM; idempotency key lost"
+				}
+				p.log(api.EventAlert, i.VMID, hostID, detail)
 			}
 			if p.fresh && i.State == api.VMReady && validPool {
 				v := api.VM{ID: i.VMID, Pool: i.Pool, Generation: i.Generation, HostID: hostID, Rack: h.record.Rack, Desired: api.DesiredRunning, Priority: api.PriorityStandard, CreatedAt: p.now.UnixMilli()}
-				p.data.VMs[i.VMID] = store.Record{VM: v}
+				key := i.IdempotencyKey
+				if key != "" {
+					for id, existing := range p.data.VMs {
+						if existing.Key != key {
+							continue
+						}
+						p.log(api.EventAlert, i.VMID, hostID, "two adopted VMs claim one idempotency key; highest generation retained")
+						if i.Generation > existing.VM.Generation {
+							existing.Key = ""
+							p.data.VMs[id] = existing
+						} else {
+							key = ""
+						}
+						break
+					}
+				}
+				p.data.VMs[i.VMID] = store.Record{VM: v, Key: key, Hash: i.RequestHash}
 				p.move(i.VMID, api.VMReady, "adopted after store loss")
 				p.claims[i.VMID] = hostID
 				seen[i.VMID] = true

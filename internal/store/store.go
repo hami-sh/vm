@@ -200,6 +200,15 @@ func (s *Store) Commit(ctx context.Context, before, after Data, events []api.Eve
 			return err
 		}
 	}
+	// Release losing recovered-key claims before inserting their winners;
+	// map iteration order must not decide whether a UNIQUE constraint fires.
+	for id, old := range before.VMs {
+		if next, ok := after.VMs[id]; ok && old.Key != "" && old.Key != next.Key {
+			if _, err = tx.ExecContext(ctx, "UPDATE vms SET idempotency_key=NULL WHERE id=? AND generation=?", id, old.VM.Generation); err != nil {
+				return err
+			}
+		}
+	}
 	for id, r := range after.VMs {
 		old, exists := before.VMs[id]
 		if exists && reflect.DeepEqual(old, r) {
@@ -210,7 +219,7 @@ func (s *Store) Commit(ctx context.Context, before, after Data, events []api.Eve
 			if v.Generation < old.VM.Generation {
 				return ErrCAS
 			}
-			res, e := tx.ExecContext(ctx, `UPDATE vms SET desired=?,state=?,generation=?,host_id=nullif(?,''),priority=?,attempts=?,boot_deadline_at=nullif(?,0),last_reason=?,updated_at=? WHERE id=? AND generation=?`, v.Desired, v.State, v.Generation, v.HostID, v.Priority, v.Attempts, r.Deadline, v.LastReason, v.UpdatedAt, id, old.VM.Generation)
+			res, e := tx.ExecContext(ctx, `UPDATE vms SET desired=?,state=?,generation=?,host_id=nullif(?,''),priority=?,attempts=?,boot_deadline_at=nullif(?,0),last_reason=?,updated_at=?,idempotency_key=nullif(?,''),request_hash=? WHERE id=? AND generation=?`, v.Desired, v.State, v.Generation, v.HostID, v.Priority, v.Attempts, r.Deadline, v.LastReason, v.UpdatedAt, r.Key, r.Hash, id, old.VM.Generation)
 			if e != nil {
 				return e
 			}
