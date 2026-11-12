@@ -119,7 +119,7 @@ func (p presetSnapshots) Subscribe() (<-chan api.Snapshot, <-chan api.Event, fun
 	for _, f := range p.frames {
 		snaps <- f
 	}
-	events := make(chan api.Event, len(p.events)+1)
+	events := make(chan api.Event, len(p.events)+2)
 	for _, e := range p.events {
 		events <- e
 	}
@@ -255,7 +255,10 @@ func TestDashboardPresetRecording(t *testing.T) {
 						for {
 							select {
 							case events := <-src.streams:
-								events <- api.Event{Seq: 18, At: 21000, Kind: api.EventTransition, VMID: "slow", To: api.VMReady, Generation: 2}
+								// Accepted security evidence attributes the blocked attack
+								// to the compromised generation before it resurrects.
+								events <- api.Event{Seq: 18, At: 20000, Kind: api.EventSecurity, VMID: "slow", HostID: "r2-h1", Generation: 1, Detail: "blocked impersonate"}
+								events <- api.Event{Seq: 19, At: 21000, Kind: api.EventTransition, VMID: "slow", To: api.VMReady, Generation: 2}
 							default:
 								return
 							}
@@ -324,10 +327,14 @@ func TestDashboardPresetRecording(t *testing.T) {
 			}
 			if mode == "hostile-resurrected-event" {
 				check := slices.IndexFunc(r.Checks, func(c api.CheckResult) bool {
-					return c.Name == "compromised victims never Ready at a higher generation"
+					return c.Name == "victims with attributed blocked attacks never return Ready"
 				})
-				if check < 0 || r.Checks[check].Passed || r.Checks[check].FirstBadSeq != 18 {
+				if check < 0 || r.Checks[check].Passed || r.Checks[check].FirstBadSeq != 19 {
 					t.Fatalf("EventTest must reject a resurrection between frames: %+v", r)
+				}
+				integrity := slices.IndexFunc(r.Checks, func(c api.CheckResult) bool { return c.Name == "recording events contiguous" })
+				if integrity < 0 || !r.Checks[integrity].Passed {
+					t.Fatalf("attribution and resurrection events must remain contiguous: %+v", r)
 				}
 			}
 			if mode == "event-gap" {
