@@ -63,6 +63,7 @@ func main() {
 		Snapshots:    fleet,
 		Config:       config.Default(),
 		RunsDir:      *runsDir,
+		Fixture:      true,
 		Static:       os.DirFS(*staticDir),
 	})
 	log.Printf("webdev: fake fleet from %s, static from %s, runs in %s, listening on %s", *fixture, *staticDir, *runsDir, *addr)

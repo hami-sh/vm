@@ -85,4 +85,5 @@ api.catalog().then(
   (catalog) => update((st) => (st.catalog = catalog)),
   () => {}, // the menus stay empty; the stream's state already shows the outage
 );
+api.source().then((source) => update((st) => (st.source = source.label)));
 route();

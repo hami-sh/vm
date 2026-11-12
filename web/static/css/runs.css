@@ -55,6 +55,6 @@
 }
 .marker-row:hover { background: var(--panel-2); color: var(--text); }
 .marker-row.past { color: var(--text); }
-.marker-row.violation { box-shadow: inset 2px 0 0 var(--bad); background: rgba(255, 93, 108, .07); }
+.marker-row.violation { background: rgba(255, 93, 108, .07); }
 .marker-row .t { font: 11.5px var(--mono); color: var(--faint); }
 .marker-row .d { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -39,6 +39,8 @@ type Options struct {
 	Clock clock.Clock
 	// RunsDir holds runs/<id>/ recordings. Default "runs".
 	RunsDir string
+	// Fixture labels the development preview distinctly from the real fleet.
+	Fixture bool
 	// Metrics serves /metrics (the scheduler's Prometheus handler). When nil,
 	// a minimal exposition is derived from the latest snapshot.
 	Metrics http.Handler
@@ -112,6 +114,13 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /v1/queue/{vm_id}/priority", s.setPriority)
 	m.HandleFunc("GET /v1/events", s.events)
 	m.HandleFunc("GET /v1/snapshot", s.snapshot)
+	m.HandleFunc("GET /v1/source", func(w http.ResponseWriter, _ *http.Request) {
+		label := "Real fleet · simulated macOS hosts"
+		if s.o.Fixture {
+			label = "Fixture preview · fabricated data"
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"label": label})
+	})
 	m.HandleFunc("GET /v1/chaos/actions", s.chaosActions)
 	m.HandleFunc("POST /v1/chaos/{action}", s.limited(s.chaosDo))
 	m.HandleFunc("POST /v1/sim/{action}", s.sim)

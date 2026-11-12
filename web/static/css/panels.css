@@ -1,13 +1,13 @@
 /* Controls, event log, detail, evidence and queue panels. */
 
 /* ---------------------------------------------------------------- controls */
-.controls { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.ctl { display: grid; align-content: start; gap: 9px; padding: 11px 12px 12px; border-left: 1px solid var(--line); min-width: 0; }
+.controls { display: grid; grid-template-columns: minmax(0, 1fr); }
+.ctl { display: grid; align-content: start; gap: 14px; padding: 16px; border-top: 1px solid var(--line); min-width: 0; }
 .ctl:first-child { border-left: 0; }
-.ctl-title { display: flex; align-items: baseline; gap: 8px; }
+.ctl-title { display: grid; gap: 4px; }
 .ctl-title .dim { font-size: 12px; }
 .ctl-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }
-.ctl-row > .lbl { width: 62px; flex: none; color: var(--dim); font-size: 12px; }
+.ctl-row > .lbl { width: 100%; flex: none; color: var(--dim); font-size: 12px; }
 .ctl-row input[type=range] { flex: 1; min-width: 80px; }
 .ctl-row output { width: 52px; text-align: right; font: 12px var(--mono); color: var(--text); }
 .ctl-row select.input { max-width: 100%; }
@@ -44,8 +44,7 @@ body.playback .controls { display: none; }
 .log-text { min-width: 0; overflow-wrap: anywhere; }
 .log-text .arrow { color: var(--faint); }
 .log-n { margin-left: 6px; padding: 0 5px; font: 600 10.5px var(--mono); color: var(--dim); background: var(--raise); border-radius: 8px; }
-.log-row.strong { background: rgba(255, 93, 108, .07); box-shadow: inset 2px 0 0 var(--bad); }
-.log-row.chaos { box-shadow: inset 2px 0 0 var(--warn); }
+.log-row.strong { background: rgba(255, 93, 108, .07); }
 .ref {
   padding: 0 3px; font: 500 11.5px var(--mono); color: var(--text); cursor: pointer;
   background: var(--raise); border: 0; border-radius: 3px;
@@ -153,8 +152,8 @@ body.playback .controls { display: none; }
 .q-row { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto auto; gap: 8px; align-items: center; padding: 4px 12px; border-bottom: 1px solid rgba(30, 38, 50, .6); font-size: 12px; }
 .q-row:hover { background: var(--panel-2); }
 .q-pos { color: var(--faint); font: 11px var(--mono); text-align: right; }
-.q-main { display: flex; align-items: center; gap: 6px; min-width: 0; }
-.q-main .ref { flex: none; white-space: nowrap; }
+.q-main { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.q-main .ref { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .q-main .vm-prio { flex: none; }
 .q-main .aged { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--faint); font-size: 11px; white-space: nowrap; }
 .q-wait { font: 11.5px var(--mono); color: var(--dim); white-space: nowrap; text-align: right; }

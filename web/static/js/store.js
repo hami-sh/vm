@@ -74,6 +74,7 @@ export function pushSnapshot(s) {
 }
 
 export function pushEvent(e) {
+  if (e.at < (state.live.since || 0)) return;
   const events = state.live.events;
   // The stream and each snapshot's recent list overlap; keep one copy.
   for (let i = events.length - 1; i >= 0 && i >= events.length - 120; i--) {

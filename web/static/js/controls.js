@@ -110,8 +110,7 @@ function presets(catalog) {
       <div class="presets">${catalog.presets
         .map((p) => `<button class="btn" data-act="preset" data-name="${esc(p.name)}">${esc(p.label)}</button>`)
         .join('')}</div>
-      <span class="spacer"></span>
-      <button class="btn" data-act="open-menu" data-kind="global" title="Latency, packet loss, duplicated and reordered messages">Network faults…</button></div>
+      </div>
   </div>`;
 }
 
@@ -122,7 +121,7 @@ export function render(st, v) {
     mount(el, '');
     return;
   }
-  mount(el, load(s) + topology(s) + chaos(s, st.catalog) + presets(st.catalog));
+  mount(el, load(s) + presets(st.catalog) + `<div class="ctl"><button class="btn" data-act="controls-more" aria-expanded="${!!st.controlsMore}">${st.controlsMore ? 'Hide' : 'Show'} advanced controls</button><span class="dim">Topology, ambient chaos and network faults</span></div>` + (st.controlsMore ? topology(s) + chaos(s, st.catalog) + '<div class="ctl"><button class="btn" data-act="open-menu" data-kind="global">Network faults…</button></div>' : ''));
 }
 
 // After a slider request the panel is redrawn from the snapshot even if the
@@ -157,6 +156,7 @@ export const changes = {
 };
 
 export const actions = {
+  'controls-more': () => update((st) => (st.controlsMore = !st.controlsMore)),
   async mix(el) {
     const key = el.dataset.mix;
     const { label, ...weights } = MIXES[key];

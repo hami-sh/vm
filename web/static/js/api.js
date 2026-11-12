@@ -28,6 +28,8 @@ const get = (path) => request('GET', path);
 const post = (path, body = {}, headers) => request('POST', path, body, headers);
 
 export const api = {
+  snapshot: () => get('/v1/snapshot'),
+  source: () => get('/v1/source'),
   catalog: () => get('/v1/chaos/actions'),
   chaos: (action, target, params) => post(`/v1/chaos/${action}`, { target: target || undefined, params }),
   sim: (action, body) => post(`/v1/sim/${action}`, body),

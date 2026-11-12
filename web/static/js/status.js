@@ -1,6 +1,7 @@
 // Top bar (navigation, time controls, connection) and the status bar.
 import { $, esc, mount, clock, STATES, stateVar, badge } from './util.js';
 import { api, attempt } from './api.js';
+import { state, update, pushSnapshot } from './store.js';
 
 const SPEEDS = [1, 2, 5, 10];
 const SCHED = { up: 'var(--ok)', reconciling: 'var(--warn)', down: 'var(--bad)' };
@@ -43,8 +44,7 @@ function right(st, v) {
   const label = { live: 'Live', reconnecting: 'Reconnecting…', connecting: 'Connecting…' }[st.conn];
   mount(
     $('#topright'),
-    `<span class="conn ${st.conn}">${label}</span>
-     ${st.route.page === 'live' ? '<button class="btn danger" data-act="reset" title="Back to a clean seeded fleet">Reset</button>' : ''}`,
+    `<span class="dim">${esc(st.source || 'Connecting to fleet…')}</span><span class="conn ${st.conn}">${label}</span>`,
   );
 }
 
@@ -83,11 +83,24 @@ export function render(st, v) {
 }
 
 export const actions = {
-  'sim-pause': () => attempt('Paused', () => api.sim('pause')),
-  'sim-play': () => attempt('Playing', () => api.sim('play')),
+  'sim-pause': () => setPaused(true),
+  'sim-play': () => setPaused(false),
   'sim-step': () => attempt('Stepped 1 s', () => api.sim('step', { step_ms: 1000 })),
   'sim-speed': (el) => attempt(`Speed ${el.dataset.speed}×`, () => api.sim('speed', { speed: Number(el.dataset.speed) })),
-  reset: () => {
-    if (confirm('Reset to a clean seeded fleet? Every VM and all chaos is cleared.')) attempt('Fleet reset', () => api.chaos('reset'));
+  reset: async () => {
+    if (!confirm('Reset to an empty fleet? Every VM, traffic source and scheduled fault is cleared.')) return;
+    const result = await attempt('Fleet reset', () => api.chaos('reset'));
+    if (!result) return;
+    const snapshot = await api.snapshot();
+    update((st) => {
+      st.live = { snapshot: null, history: [], events: [], since: snapshot.at };
+      st.selection = st.menu = st.highlight = st.invariant = null;
+      pushSnapshot(snapshot);
+    });
   },
 };
+
+async function setPaused(paused) {
+  const result = await attempt(paused ? 'Paused' : 'Playing', () => api.sim(paused ? 'pause' : 'play'));
+  if (result) update(() => { state.live.snapshot.sim.paused = result.paused; });
+}

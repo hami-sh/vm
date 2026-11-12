@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>macOS VM control plane</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23151a23'/%3E%3Cpath d='M7 8h18v13H7z' fill='none' stroke='%236aa8ff' stroke-width='2'/%3E%3Cpath d='M12 25h8' stroke='%236aa8ff' stroke-width='2'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/css/base.css">
 <link rel="stylesheet" href="/css/fleet.css">
 <link rel="stylesheet" href="/css/panels.css">
@@ -13,17 +14,24 @@
 <header class="topbar">
   <a class="brand" href="#/"><span class="brand-mark"></span>macOS VM control plane</a>
   <nav class="nav" id="nav"></nav>
-  <div class="sim" id="sim"></div>
   <div class="topbar-right" id="topright"></div>
 </header>
 
-<div class="statusbar" id="status"></div>
 <div id="runbar"></div>
 
 <main class="layout" id="dash">
+  <aside class="panel controls-rail">
+    <header class="panel-head"><h2>Controls</h2><span class="spacer"></span><button class="btn danger" data-act="reset">Reset fleet</button></header>
+    <div class="sim" id="sim"></div>
+    <div class="controls" id="controls"></div>
+  </aside>
   <div class="col-main">
+    <section class="panel statusbar" id="status" aria-label="Fleet statistics"></section>
     <section class="panel fleet-panel" id="fleet"></section>
-    <section class="panel controls" id="controls"></section>
+    <div class="row-bottom">
+      <section class="panel queue" id="queue"></section>
+      <section class="panel evidence" id="evidence"></section>
+    </div>
     <div class="row-bottom">
       <section class="panel log-panel">
         <header class="panel-head">
@@ -36,12 +44,8 @@
       </section>
       <section class="panel detail-panel" id="detail"></section>
     </div>
-  </div>
-  <aside class="col-side">
     <section class="panel report-panel" id="report" hidden></section>
-    <section class="panel evidence" id="evidence"></section>
-    <section class="panel queue" id="queue"></section>
-  </aside>
+  </div>
 </main>
 
 <main class="runs-page" id="runs" hidden></main>

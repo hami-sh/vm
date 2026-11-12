@@ -29,9 +29,9 @@
 
 .host {
   padding: 6px 7px 7px; background: var(--bg); cursor: pointer; min-width: 0;
-  border: 1px solid var(--line); border-left: 3px solid var(--lease); border-radius: 6px;
+  border: 1px solid var(--line); border-radius: 6px;
 }
-.host:hover { border-color: var(--line-2); border-left-color: var(--lease); }
+.host:hover { border-color: var(--line-2); }
 .host.sel { box-shadow: 0 0 0 2px var(--accent); }
 .host.lease-lost { background: repeating-linear-gradient(135deg, rgba(255, 93, 108, .06) 0 6px, transparent 6px 12px), var(--bg); }
 .host.admin-cordoned, .host.admin-draining { border-top-style: dashed; border-right-style: dashed; border-bottom-style: dashed; }
@@ -59,7 +59,7 @@
   display: grid; align-content: center; gap: 1px; height: 40px; min-width: 0; padding: 3px 7px 3px 6px;
   font: inherit; color: var(--text); text-align: left; cursor: pointer;
   background: color-mix(in srgb, var(--c) 12%, var(--panel));
-  border: 1px solid color-mix(in srgb, var(--c) 38%, transparent); border-left: 3px solid var(--c); border-radius: 5px;
+  border: 1px solid color-mix(in srgb, var(--c) 38%, transparent); border-radius: 5px;
 }
 .vm:hover { background: color-mix(in srgb, var(--c) 22%, var(--panel)); }
 .vm-top { display: flex; align-items: center; gap: 5px; font: 500 11.5px var(--mono); min-width: 0; }
