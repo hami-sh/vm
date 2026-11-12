@@ -919,3 +919,95 @@ func TestRestartSuspectHostGetsFreshLostGrace(t *testing.T) {
 		t.Fatal("restart gave suspect host another healthy TTL")
 	}
 }
+
+func TestHeartbeatEchoDoesNotBumpEpochAndRestartResetsSequence(t *testing.T) {
+	h := newHarness(t)
+	e := h.agent("a", "r1", api.RegisterHost{HostID: "a", Rack: "r1", Slots: 1, Epoch: 100})
+	ackEpoch := int64(0)
+	for _, d := range e.sends {
+		if ack, ok := d.msg.(api.HeartbeatAck); ok {
+			ackEpoch = ack.Epoch
+		}
+	}
+	if ackEpoch != 101 {
+		t.Fatal("did not move past reported epoch")
+	}
+	for n := 1; n <= 10; n++ {
+		h.c.Advance(h.s.cfg.HostHeartbeat)
+		e = h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: uint64(n), Epoch: ackEpoch})
+		for _, d := range e.sends {
+			if ack, ok := d.msg.(api.HeartbeatAck); ok {
+				ackEpoch = ack.Epoch
+			}
+		}
+		if ackEpoch != 101 || h.s.state.epoch != 101 || len(e.events) != 0 {
+			t.Fatal("echoed ack epoch changed the epoch or emitted audit events")
+		}
+	}
+	// RegisterHost from the restarted agent was dropped; seq=1 must still
+	// renew its lease despite the previous process having reached seq=10.
+	h.c.Advance(h.s.cfg.HostLeaseTTL - time.Millisecond)
+	h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: 1, Epoch: ackEpoch})
+	h.c.Advance(time.Millisecond)
+	h.step(tick{})
+	if h.s.state.hosts["a"].lease != api.LeaseHealthy || h.s.state.hosts["a"].seq != 1 {
+		t.Fatal("lost registration made restart heartbeats look stale")
+	}
+}
+
+func TestBatchRetryCannotShedQueuedInteractive(t *testing.T) {
+	for _, cause := range []string{"refusal", "boot deadline"} {
+		t.Run(cause, func(t *testing.T) {
+			h := newHarness(t)
+			h.register("a", "r1", 1)
+			batch := h.create("batch", "batch")
+			ids := []string{}
+			for n := 0; n < h.s.cfg.QueueCap; n++ {
+				ids = append(ids, h.create(fmt.Sprint(n), "interactive").ID)
+			}
+			if cause == "refusal" {
+				h.agent("a", "r1", api.StartVMResult{HostID: "a", VMID: batch.ID, Generation: batch.Generation, Admitted: false, Reason: "disk full"})
+			} else {
+				h.c.Advance(h.s.cfg.BootDeadline)
+				h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: 1, Inventory: []api.InventoryItem{{VMID: batch.ID, Generation: batch.Generation, State: api.VMBooting, Pool: batch.Pool}}})
+				h.step(tick{})
+			}
+			if got := h.s.state.data.VMs[batch.ID].VM; got.State != api.VMFailed || got.LastReason != api.ReasonShed {
+				t.Fatalf("retry was not shed: %+v", got)
+			}
+			for _, id := range ids {
+				if _, ok := h.s.state.data.Queue[id]; !ok || h.s.state.data.VMs[id].VM.State != api.VMPending {
+					t.Fatal("batch retry shed an interactive request")
+				}
+			}
+		})
+	}
+}
+
+func TestEqualGenerationUnexpectedHostKeepsPersistedOwner(t *testing.T) {
+	h := newHarness(t)
+	h.register("a", "r1", 1)
+	v := h.create("v", "standard")
+	h.ready(v)
+	d, epoch, err := h.db.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.s.state = newState(d, epoch, h.c.Now(), h.s.cfg)
+	e := h.register("b", "r2", 1, api.InventoryItem{VMID: v.ID, Generation: v.Generation, State: api.VMReady, Pool: v.Pool})
+	alert, stopped := false, false
+	for _, ev := range e.events {
+		alert = alert || ev.Kind == api.EventAlert
+	}
+	for _, out := range e.sends {
+		if cmd, ok := out.msg.(api.StopVM); ok {
+			if out.to.ID == "a" {
+				t.Fatal("stopped persisted owner")
+			}
+			stopped = stopped || out.to.ID == "b" && cmd.VMID == v.ID
+		}
+	}
+	if !alert || !stopped || h.s.state.data.VMs[v.ID].VM.HostID != "a" {
+		t.Fatal("unexpected equal-generation host stole ownership after restart")
+	}
+}

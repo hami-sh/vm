@@ -448,9 +448,14 @@ func (p *planner) enqueue(id string, replacement bool, reason string) {
 			nb = p.now.Add(time.Duration(rand.Int64N(int64(backoff) + 1))).UnixMilli()
 		}
 	}
-	if !p.makeRoom(pr, true) {
-		if v.State == api.VMBooting {
-			p.move(id, api.VMPending, reason)
+	if !p.makeRoom(pr, replacement) {
+		if !replacement {
+			if v.State == api.VMLost {
+				p.move(id, api.VMPending, reason)
+			}
+			p.move(id, api.VMFailed, api.ReasonShed)
+			p.counters.Shed++
+			p.log(api.EventAdmission, id, "", "retry shed")
 		}
 		return
 	}

@@ -36,7 +36,9 @@ func (p *planner) receive(from api.Addr, msg any) {
 			return
 		}
 		p.observeEpoch(m.Epoch)
-		if m.Seq != 0 && m.Seq <= h.seq {
+		// A restarted agent begins at 1. Its registration can be lost, so
+		// that first heartbeat also resets the scheduler's sequence window.
+		if m.Seq != 0 && m.Seq != 1 && m.Seq <= h.seq {
 			return
 		}
 		rejoin := h.lease != api.LeaseHealthy
@@ -131,7 +133,7 @@ func (p *planner) current(hostID, id string, gen int64) bool {
 // Epoch changes are part of the same durable transaction as reconciliation.
 // The runtime cannot send any of its effects until this counter is committed.
 func (p *planner) observeEpoch(reported int64) {
-	if reported >= p.epoch {
+	if reported > p.epoch {
 		p.epoch = reported + 1
 		p.data.Epoch = p.epoch
 		p.log(api.EventReconcile, "", "", "advanced scheduler epoch past host report")
@@ -258,8 +260,11 @@ func (p *planner) reconcile(hostID string, inventory []api.InventoryItem, strict
 		}
 		claim := p.claims[v.ID]
 		wrongHost := claim != "" && claim != hostID
+		if claim == "" && i.Generation == v.Generation && v.HostID != "" && v.HostID != hostID && p.hosts[v.HostID].lease != api.LeaseLost {
+			wrongHost = true
+		}
 		if i.Generation == v.Generation && wrongHost {
-			p.log(api.EventAlert, v.ID, hostID, "equal-generation copies on two hosts; first report retained")
+			p.log(api.EventAlert, v.ID, hostID, "equal-generation copies on two hosts; existing owner retained")
 		}
 		if i.Generation != v.Generation || wrongHost || v.Desired == api.DesiredDeleted || vm.Terminal(v.State) || v.State == api.VMPending || v.State == api.VMLost || v.State == api.VMTerminating {
 			stale = append(stale, i)
