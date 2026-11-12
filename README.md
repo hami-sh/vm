@@ -96,6 +96,8 @@ Identity comes from the transport-stamped sending channel, never a guest-supplie
 
 The simulated policy denies guest-to-guest and guest-to-control-plane access. Guests may speak vsock only to their own host agent; permitted egress goes through an allowlist. The evidence panel counts blocked attacks and successful attacks separately; any success fails verification. Rate limiting, bounded messages, disk limits and quarantine constrain abuse. These are modeled controls, not proof of a hardened macOS boundary.
 
+A compromised guest stopped by lease expiry before any observed attack is recycled clean, not quarantined; hostile-tenant requires attributed blocked attacks to end in quarantine, every compromised generation to stop in raw driver observations, and at least one quarantine per run.
+
 On real Macs, Virtualization.framework's default NAT puts a host's guests on a shared subnet; NAT alone is not tenant isolation. Replace the simulated policy with per-VM pf rules or a separate userspace network stack per VM, plus an allowlisted egress proxy. Hypervisor escapes are outside this simulator's security model.
 
 The public demo has no authentication and must contain no secrets or tenant workloads. Real deployment requires mTLS between agents and scheduler, OIDC/RBAC on the API, real vsock channel binding, actual network sandboxing, quotas and audit retention. Demo caps and per-IP chaos limits are not a production security boundary.

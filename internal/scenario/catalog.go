@@ -468,27 +468,69 @@ func hostileTenant(base Scenario) Scenario {
 			}},
 			{40 * time.Second, Chaos("packet-loss", "", map[string]float64{"percent": 0})},
 		}
-		noResurrection := Always("compromised victims never Ready at a higher generation", func(s api.Snapshot) bool {
+		// Only accepted SecurityReports carry a generation. Runtime attack
+		// verdicts such as "unknown impersonate" cannot attribute a blocked
+		// attack to an incarnation, and a clean recycle is not compromised.
+		blocked := map[string]int64{}
+		resurrected := map[string]bool{}
+		noResurrection := Always("victims with attributed blocked attacks never return Ready", func(s api.Snapshot) bool {
 			for _, v := range s.VMs {
-				if gen, ok := victims[v.ID]; ok && v.Generation > gen && v.State == api.VMReady {
+				gen, victim := victims[v.ID]
+				if victim && v.Generation > gen && v.State == api.VMReady {
+					resurrected[v.ID] = true
+				}
+				if victim && blocked[v.ID] >= gen && resurrected[v.ID] {
 					return false
 				}
 			}
 			return true
 		})
 		noResurrection.EventTest = func(e api.Event) bool {
+			if e.Kind == api.EventSecurity && e.Generation > blocked[e.VMID] {
+				blocked[e.VMID] = e.Generation
+			}
+			if e.Kind == api.EventTransition && e.To == api.VMReady && blocked[e.VMID] > 0 && e.Generation >= blocked[e.VMID] {
+				resurrected[e.VMID] = true
+			}
 			gen, victim := victims[e.VMID]
-			return !(victim && e.Kind == api.EventTransition && e.To == api.VMReady && e.Generation > gen)
+			return !(victim && blocked[e.VMID] >= gen && resurrected[e.VMID])
 		}
 		run.Expect = append(append([]Check(nil), base.Expect...), noResurrection,
-			Eventually(60*time.Second, "all compromised victims end quarantined Failed", func(s api.Snapshot) bool {
+			Eventually(60*time.Second, "attributed victims end quarantined Failed; quarantine exercised", func(s api.Snapshot) bool {
 				failed := 0
+				seen := map[string]bool{}
 				for _, v := range s.VMs {
-					if _, ok := victims[v.ID]; ok && v.State == api.VMFailed && v.LastReason == api.ReasonQuarantined {
-						failed++
+					if gen, ok := victims[v.ID]; ok {
+						seen[v.ID] = true
+						quarantined := v.State == api.VMFailed && v.LastReason == api.ReasonQuarantined
+						if blocked[v.ID] >= gen && !quarantined {
+							return false
+						}
+						if quarantined {
+							failed++
+						}
 					}
 				}
-				return len(victims) == 3 && failed == len(victims)
+				return len(victims) == 3 && len(seen) == 3 && failed > 0
+			}), Eventually(60*time.Second, "every compromised generation stopped in driver observations", func(s api.Snapshot) bool {
+				observed := map[string]bool{}
+				for _, h := range s.Observed {
+					if !h.Connected {
+						return false
+					}
+					observed[h.HostID] = true
+					for _, actual := range h.Actual {
+						if gen, ok := victims[actual.VMID]; ok && actual.Generation == gen && actual.Running {
+							return false
+						}
+					}
+				}
+				for _, h := range s.Hosts {
+					if !observed[h.ID] {
+						return false
+					}
+				}
+				return len(victims) == 3 && len(observed) > 0
 			}))
 		return run
 	}
