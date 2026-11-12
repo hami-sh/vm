@@ -107,3 +107,6 @@ Implementation is compiling under Go 1.27.4; security/lifecycle regression tests
   - Recovery window: after a fresh-store start, `CreateVM` returns 503 with Retry-After for `config.HostLeaseTTL` of sim time, so every live host has reported before a retried key can be mistaken for a new one. Hosts silent past that are presumed lost anyway.
   - Not covered, by design: a VM whose host is lost at the same time as the wipe. Its retry creates a new VM, which is still exactly one running copy.
   - Test (W1): run, create with key K, wipe, New, retry K during the window (503), then after it (same VM ID, 202), and with a different body (422).
+- 2026-11-12, lead, DECISION (W3 CONTRACT-REQUEST): `SimRequest.Racks` and `SimStatus.Racks` added (ambient chaos scope, empty = all). Seed stays `int64`; it is read only by the explicit `seed` action, so 0 is a valid seed there.
+- 2026-11-12, lead, DECISION: the per-IP chaos rate limit is HTTP hardening and lives in W4's middleware (wall time via `clock.Real`), not in the engine. `api.ChaosEngine.Do` stays identity-free; no `DoFromIP`.
+- 2026-11-12, lead, BLOCKER (W2): `TestAdmissionCapAndHostFaults` is flaky under -race (3/10 on w2-host 7ba3020 alone, 20/30 after merging main). 7ba3020 is held off main until it passes `-race -count=50`.

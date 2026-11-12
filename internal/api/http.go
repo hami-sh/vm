@@ -95,7 +95,10 @@ type SimRequest struct {
 	Intensity *float64 `json:"intensity,omitempty"`
 	Filters   []string `json:"filters,omitempty"`
 	LoadRate  *float64 `json:"load_rate,omitempty"`
-	Seed      int64    `json:"seed,omitempty"`
+	// Seed is used only by the "seed" action, where 0 is a valid seed.
+	Seed int64 `json:"seed,omitempty"`
+	// Racks limits ambient chaos to these racks; empty means all.
+	Racks []string `json:"racks,omitempty"`
 }
 
 // TopologyRequest is the body of POST /v1/topology/{action}.
