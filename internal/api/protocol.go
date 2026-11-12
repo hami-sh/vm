@@ -12,6 +12,11 @@ type InventoryItem struct {
 	// Pool is copied from StartVM.Spec.Pool. It lets a scheduler whose store
 	// was wiped adopt a VM it has no record of; the spec follows from the pool.
 	Pool string `json:"pool,omitempty"`
+	// IdempotencyKey and RequestHash are echoed from StartVM so a scheduler
+	// whose store was wiped can restore them when it adopts the VM; a client
+	// retrying its create then gets this VM back, not a second one.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	RequestHash    string `json:"request_hash,omitempty"`
 }
 
 // --- Agent -> Scheduler ---
@@ -92,6 +97,10 @@ type StartVM struct {
 	Token      string `json:"token"` // fresh per boot; the agent checks it when guestd registers
 	Spec       VMSpec `json:"spec"`
 	Epoch      int64  `json:"epoch"` // scheduler_epoch; agents ignore older epochs
+	// Identity of the create request. The agent keeps both and echoes them in
+	// InventoryItem; it never interprets them.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	RequestHash    string `json:"request_hash,omitempty"`
 }
 
 // StopVM asks a host to stop vm at gen. Not running -> ack; running a higher
