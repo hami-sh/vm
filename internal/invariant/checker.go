@@ -18,6 +18,7 @@ type Checker struct {
 	stale, pending map[string]int64
 	duplicates     map[string]int64
 	keyRunning     map[string]int64
+	ahead          map[string]int64
 	replacements   map[string]bool
 	status         map[api.InvariantName]api.InvariantStatus
 	seq            int64
@@ -33,7 +34,7 @@ type Observation struct {
 }
 
 func New(c config.Config) *Checker {
-	return &Checker{cfg: c, gen: map[string]int64{}, stale: map[string]int64{}, pending: map[string]int64{}, duplicates: map[string]int64{}, keyRunning: map[string]int64{}, replacements: map[string]bool{}, status: map[api.InvariantName]api.InvariantStatus{}}
+	return &Checker{cfg: c, gen: map[string]int64{}, stale: map[string]int64{}, pending: map[string]int64{}, duplicates: map[string]int64{}, keyRunning: map[string]int64{}, ahead: map[string]int64{}, replacements: map[string]bool{}, status: map[api.InvariantName]api.InvariantStatus{}}
 }
 func (c *Checker) Status() []api.InvariantStatus {
 	out := make([]api.InvariantStatus, 0, len(api.AllInvariants))
@@ -65,7 +66,9 @@ func (c *Checker) EventsLost(at int64) api.Event {
 func (c *Checker) CheckKeys(s api.Snapshot, keys map[string]string, observations ...Observation) []api.Event {
 	var out []api.Event
 	active := map[string]bool{}
+	published := map[string]api.VM{}
 	for _, v := range s.VMs {
+		published[v.ID] = v
 		if !vm.Terminal(v.State) {
 			active[v.ID] = true
 		}
@@ -78,6 +81,9 @@ func (c *Checker) CheckKeys(s api.Snapshot, keys map[string]string, observations
 		for _, actual := range o.Actual {
 			if !actual.Running {
 				continue
+			}
+			if v, ok := published[actual.VMID]; ok && actual.Generation > v.Generation {
+				continue // Publication lag is checked by generation_monotonic.
 			}
 			copyID := fmt.Sprintf("%s/%s/%d", o.Host.ID, actual.VMID, actual.Generation)
 			at, ok := c.keyRunning[copyID]
@@ -127,6 +133,7 @@ func (c *Checker) Check(s api.Snapshot, observations ...Observation) []api.Event
 	}
 	auth := map[string]int{}
 	staleNow := map[string]int64{}
+	aheadNow := map[string]int64{}
 	free := false
 	hosts := map[string]api.Host{}
 	for _, h := range s.Hosts {
@@ -154,6 +161,22 @@ func (c *Checker) Check(s api.Snapshot, observations ...Observation) []api.Event
 			}
 			used++
 			v, ok := byID[actual.VMID]
+			if ok && actual.Generation > v.Generation {
+				// A durable placement can reach the driver before publication,
+				// especially if the scheduler dies before publishing it.
+				if s.Scheduler == api.SchedulerUp {
+					key := h.ID + "/" + actual.VMID
+					at, seen := c.ahead[key]
+					if !seen {
+						at = s.At
+					}
+					aheadNow[key] = at
+					if s.At-at > c.cfg.HostHeartbeat.Milliseconds() {
+						bad(api.InvGenMonotonic, fmt.Sprintf("%s driver generation %d ahead of published %d", key, actual.Generation, v.Generation))
+					}
+				}
+				continue
+			}
 			if ok && v.State == api.VMReady && actual.Generation == v.Generation {
 				auth[v.ID]++
 			}
@@ -178,6 +201,7 @@ func (c *Checker) Check(s api.Snapshot, observations ...Observation) []api.Event
 		}
 	}
 	c.stale = staleNow
+	c.ahead = aheadNow
 	duplicateNow := map[string]int64{}
 	for id, n := range auth {
 		if n > 1 {
