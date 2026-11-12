@@ -50,6 +50,12 @@ func (s *Scheduler) handle(now time.Time, msg any) []Effect {
 	if !p.down {
 		p.drain()
 	}
+	for id, floor := range p.existence {
+		v := p.data.VMs[id].VM
+		if v.HostID != floor.host || v.Generation != floor.gen || vm.Terminal(v.State) || p.hosts[floor.host].incarnation != floor.incarnation {
+			delete(p.existence, id)
+		}
+	}
 	// Reply with the committed, possibly immediately placed, VM.
 	if _, ok := msg.(request); ok && e.response.err == nil {
 		if r, ok := e.response.value.(api.CreateVMResponse); ok {
