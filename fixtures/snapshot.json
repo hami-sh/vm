@@ -14,7 +14,13 @@
       "latency-spike",
       "compromise"
     ],
-    "load_rate": 1.5
+    "load_rate": 1.5,
+    "lifetime": {
+      "min_ms": 0,
+      "max_ms": 0,
+      "idle_ms": 0,
+      "release_p": 0
+    }
   },
   "pools": [
     {
