@@ -9,7 +9,7 @@ A Go control plane that places macOS VMs across a simulated fleet (3 racks × 4 
 | `internal/api`, `internal/clock` (interface, Real, Fake), `internal/actor`, `internal/config`, `internal/vm/legal.go`, `internal/store/schema.sql` | Phase 0 (lead). Request changes in COORDINATION.md |
 | `internal/vm`, `internal/scheduler`, `internal/store` | W1 Core |
 | `internal/agent`, `internal/driver`, `internal/guest`, `internal/simnet`, `cmd/guestd` | W2 Host side |
-| `internal/chaos`, `internal/invariant`, scaled clock in `internal/clock`, `/v1/sim`, `/v1/topology` | W3 Chaos + sim |
+| `internal/chaos`, `internal/invariant`, `internal/fleet` (assembly), scaled clock in `internal/clock`, `/v1/sim`, `/v1/topology` | W3 Chaos + sim |
 | `internal/web`, `web/static` | W4 Web |
 | `internal/scenario`, `cmd/vmctl`, `Dockerfile`, `README.md`, Makefile `verify` | W5 Ship |
 
