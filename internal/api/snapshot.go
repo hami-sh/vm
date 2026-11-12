@@ -103,9 +103,10 @@ type SimStatus struct {
 	Speed     float64  `json:"speed"`
 	Paused    bool     `json:"paused"`
 	Seed      int64    `json:"seed"`
-	Intensity float64  `json:"intensity"` // 0..1
-	Filters   []string `json:"filters"`   // enabled ambient fault types
-	LoadRate  float64  `json:"load_rate"` // creates per sim second
+	Intensity float64  `json:"intensity"`       // 0..1
+	Filters   []string `json:"filters"`         // enabled ambient fault types
+	Racks     []string `json:"racks,omitempty"` // ambient chaos scope; empty means all
+	LoadRate  float64  `json:"load_rate"`       // creates per sim second
 	// Scenario is set while a scenario started from the dashboard runs.
 	Scenario string `json:"scenario,omitempty"`
 }
