@@ -9,6 +9,88 @@ import (
 	"github.com/hami-sh/vm/internal/api"
 )
 
+func TestExistenceReportOvertakesPreStartInventory(t *testing.T) {
+	for _, report := range []string{"admitted", "ready-only", "admitted-then-ready"} {
+		t.Run(report, func(t *testing.T) {
+			h := newHarness(t)
+			h.register("a", "r1", 1)
+			h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: 20})
+			v := h.create("overtaken-inventory", "standard")
+			if report != "ready-only" {
+				h.agent("a", "r1", api.StartVMResult{HostID: "a", VMID: v.ID, Generation: v.Generation, Admitted: true, Seq: 23})
+				// A later-delivered older result must not lower the floor.
+				h.agent("a", "r1", api.StartVMResult{HostID: "a", VMID: v.ID, Generation: v.Generation, Admitted: true, Seq: 21})
+			}
+			want := api.VMBooting
+			if report != "admitted" {
+				h.agent("a", "r1", api.ReadyReport{HostID: "a", VMID: v.ID, Generation: v.Generation, Seq: 23})
+				want = api.VMReady
+			}
+			floor := uint64(23)
+			if report == "admitted-then-ready" {
+				// Ready removed the reservation, but a later same-copy result
+				// must still advance the existence floor.
+				floor = 25
+				h.agent("a", "r1", api.StartVMResult{HostID: "a", VMID: v.ID, Generation: v.Generation, Admitted: true, Seq: floor})
+			}
+			// Both registrations were captured before admission; equality
+			// is possible because positive reports do not advance shared Seq.
+			for _, seq := range []uint64{21, floor} {
+				e := h.agent("a", "r1", api.RegisterHost{HostID: "a", Rack: "r1", Slots: 1, Seq: seq})
+				for _, event := range e.events {
+					if event.VMID == v.ID && event.To == api.VMLost {
+						t.Fatalf("pre-admission inventory lost %s copy: %+v", report, event)
+					}
+				}
+				if got := h.s.state.data.VMs[v.ID].VM; got.State != want || got.Generation != v.Generation {
+					t.Fatalf("pre-admission inventory changed %s copy: %+v", report, got)
+				}
+			}
+			if queued := h.create("next", "standard"); queued.State != api.VMPending {
+				t.Fatalf("older inventory freed protected capacity: %+v", queued)
+			}
+			// This inventory was captured after admission and really lacks
+			// the VM. Positive reports must not mask genuine loss forever.
+			e := h.agent("a", "r1", api.RegisterHost{HostID: "a", Rack: "r1", Slots: 1, Seq: floor + 1})
+			lost := false
+			for _, event := range e.events {
+				lost = lost || event.VMID == v.ID && event.To == api.VMLost
+			}
+			if !lost {
+				t.Fatal("post-admission absence did not declare the copy Lost")
+			}
+		})
+	}
+}
+
+func TestOldExistenceReportCannotPoisonRestartedIncarnation(t *testing.T) {
+	h := newHarness(t)
+	h.register("a", "r1", 1)
+	h.register("a", "r1", 1)
+	previous := h.s.state.hosts["a"].incarnation
+	v := h.create("reset-existence", "standard")
+	h.agent("a", "r1", api.StartVMResult{HostID: "a", VMID: v.ID, Generation: v.Generation, Admitted: true, Seq: 500})
+	item := api.InventoryItem{VMID: v.ID, Generation: v.Generation, State: api.VMBooting}
+	h.register("a", "r1", 1, item)
+	h.agent("a", "r1", api.StartVMResult{HostID: "a", VMID: v.ID, Generation: v.Generation, Admitted: true, Seq: 1})
+	for _, msg := range []any{
+		api.StartVMResult{HostID: "a", VMID: v.ID, Generation: v.Generation, Admitted: true, Seq: 1000, Incarnation: previous},
+		api.ReadyReport{HostID: "a", VMID: v.ID, Generation: v.Generation, Seq: 1000, Incarnation: previous},
+	} {
+		h.step(api.Envelope{From: api.Addr{Kind: api.KindAgent, ID: "a", Host: "a", Rack: "r1"}, Port: api.PortControl, Msg: msg})
+	}
+	if got := h.s.state.data.VMs[v.ID].VM; got.State != api.VMBooting {
+		t.Fatalf("old ReadyReport changed restarted copy: %+v", got)
+	}
+	e := h.agent("a", "r1", api.RegisterHost{HostID: "a", Rack: "r1", Slots: 1, Seq: 2, Incarnation: h.s.state.hosts["a"].incarnation})
+	for _, event := range e.events {
+		if event.VMID == v.ID && event.To == api.VMLost {
+			return
+		}
+	}
+	t.Fatal("old sequence lifetime masked real absence after restart")
+}
+
 func TestDuplicateRegistrationCannotReopenHeartbeatWindow(t *testing.T) {
 	h := newHarness(t)
 	h.register("a", "r1", 1)

@@ -53,6 +53,12 @@ type stoppedCopy struct {
 	host, id string
 	gen      int64
 }
+type existenceFloor struct {
+	host        string
+	gen         int64
+	seq         uint64
+	incarnation api.HostIncarnation
+}
 type stopRetry struct {
 	reason string
 	at     int64
@@ -65,6 +71,7 @@ type state struct {
 	data         store.Data
 	hosts        map[string]host
 	reservations map[string]reservation
+	existence    map[string]existenceFloor
 	challenges   map[string]api.HostIncarnation
 	stops        map[stoppedCopy]stopRetry
 	exclude      map[string]string
@@ -147,7 +154,7 @@ func New(ctx context.Context, cfg config.Config, c clock.Clock, transport api.Tr
 }
 
 func newState(d store.Data, epoch int64, now time.Time, cfg config.Config) *state {
-	s := &state{data: d, epoch: epoch, hosts: map[string]host{}, reservations: map[string]reservation{}, challenges: map[string]api.HostIncarnation{}, stops: map[stoppedCopy]stopRetry{}, exclude: map[string]string{}, recovering: map[string]int64{}, replacement: map[string]bool{}, claims: map[string]string{}, blocked: map[string]blockedAttack{}, metrics: newMetrics()}
+	s := &state{data: d, epoch: epoch, hosts: map[string]host{}, reservations: map[string]reservation{}, existence: map[string]existenceFloor{}, challenges: map[string]api.HostIncarnation{}, stops: map[stoppedCopy]stopRetry{}, exclude: map[string]string{}, recovering: map[string]int64{}, replacement: map[string]bool{}, claims: map[string]string{}, blocked: map[string]blockedAttack{}, metrics: newMetrics()}
 	s.counters.Recoveries = map[string]int{}
 	for id, h := range d.Hosts {
 		// These leases are already Suspect: only the fresh lost-grace period
@@ -171,6 +178,7 @@ func (st *state) clone() *state {
 		n.hosts[id] = h
 	}
 	n.reservations = maps.Clone(st.reservations)
+	n.existence = maps.Clone(st.existence)
 	n.challenges = maps.Clone(st.challenges)
 	n.stops = maps.Clone(st.stops)
 	n.exclude = maps.Clone(st.exclude)

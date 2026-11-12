@@ -68,6 +68,10 @@ type StartVMResult struct {
 	HostID     string `json:"host_id"`
 	Admitted   bool   `json:"admitted"`
 	Reason     string `json:"reason,omitempty"` // why refused: full, disk_full, stale_generation, cordoned
+	// An admitted result proves existence after every inventory at Seq or
+	// earlier, within this incarnation. Reporting does not advance Seq.
+	Seq         uint64          `json:"seq"`
+	Incarnation HostIncarnation `json:"incarnation"`
 }
 
 // ReadyReport tells the scheduler a guest registered with a valid (vm, gen, token).
@@ -76,6 +80,9 @@ type ReadyReport struct {
 	HostID     string `json:"host_id"`
 	VMID       string `json:"vm_id"`
 	Generation int64  `json:"gen"`
+	// Ready independently proves existence if the admission result was lost.
+	Seq         uint64          `json:"seq"`
+	Incarnation HostIncarnation `json:"incarnation"`
 }
 
 // UnhealthyReport reports a guest lease expiry or a driver-reported exit.

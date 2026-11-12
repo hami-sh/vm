@@ -100,12 +100,15 @@ func (p *planner) receive(from api.Addr, msg any) {
 			}
 		}
 	case api.StartVMResult:
-		if m.HostID != id || !p.current(id, m.VMID, m.Generation) {
+		if m.HostID != id || m.Incarnation != p.hosts[id].incarnation || !p.current(id, m.VMID, m.Generation) {
 			return
 		}
 		if !m.Admitted && m.Reason == api.ReasonQuarantined {
 			p.quarantine(m.VMID)
 			return
+		}
+		if m.Admitted {
+			p.recordExistence(id, m.VMID, m.Generation, m.Seq, m.Incarnation)
 		}
 		r := p.reservations[m.VMID]
 		if r.gen != m.Generation {
@@ -134,7 +137,7 @@ func (p *planner) receive(from api.Addr, msg any) {
 			p.reservations[m.VMID] = r
 		}
 	case api.ReadyReport:
-		if m.HostID != id {
+		if m.HostID != id || m.Incarnation != p.hosts[id].incarnation {
 			return
 		}
 		if !p.current(id, m.VMID, m.Generation) {
@@ -146,6 +149,7 @@ func (p *planner) receive(from api.Addr, msg any) {
 			p.stop(id, m.VMID, m.Generation, api.ReasonDeleted)
 			return
 		}
+		p.recordExistence(id, m.VMID, m.Generation, m.Seq, m.Incarnation)
 		if v.State == api.VMBooting {
 			p.ready(m.VMID)
 		}
@@ -294,8 +298,41 @@ func (p *planner) requestRegistration(from api.Addr, observed api.HostIncarnatio
 	p.effect.sends = append(p.effect.sends, delivery{from, api.HeartbeatAck{HostID: from.ID, Epoch: p.epoch, Reregister: true, Incarnation: challenge}})
 }
 
+func (p *planner) recordExistence(hostID, id string, gen int64, seq uint64, incarnation api.HostIncarnation) {
+	floor := p.existence[id]
+	if floor.host != hostID || floor.gen != gen || floor.incarnation != incarnation {
+		floor = existenceFloor{host: hostID, gen: gen, incarnation: incarnation}
+	}
+	floor.seq = max(floor.seq, seq)
+	p.existence[id] = floor
+}
+
 func (p *planner) reconcile(hostID string, inventory []api.InventoryItem, strict bool) {
 	h := p.hosts[hostID]
+	seen := map[string]bool{}
+	protected := map[string]bool{}
+	for id, floor := range p.existence {
+		v := p.data.VMs[id].VM
+		if floor.host == hostID && floor.gen == v.Generation && v.HostID == hostID && floor.incarnation == h.incarnation && h.seq <= floor.seq && (v.State == api.VMBooting || v.State == api.VMReady) {
+			seen[id] = true
+			protected[id] = true
+		}
+	}
+	// A positive report can overtake inventory captured before admission.
+	// Preserve each protected copy's view and capacity until a causally newer
+	// inventory arrives; other copies on this host still reconcile normally.
+	accepted := make([]api.InventoryItem, 0, len(inventory)+len(seen))
+	for _, item := range inventory {
+		if !seen[item.VMID] {
+			accepted = append(accepted, item)
+		}
+	}
+	for _, item := range h.inventory {
+		if seen[item.VMID] && item.Generation == p.existence[item.VMID].gen {
+			accepted = append(accepted, item)
+		}
+	}
+	inventory = accepted
 	h.inventory = append([]api.InventoryItem(nil), inventory...)
 	p.hosts[hostID] = h
 	for copy := range p.stops {
@@ -313,9 +350,11 @@ func (p *planner) reconcile(hostID string, inventory []api.InventoryItem, strict
 			delete(p.stops, copy)
 		}
 	}
-	seen := map[string]bool{}
 	stale := []api.InventoryItem{}
 	for _, i := range inventory {
+		if protected[i.VMID] {
+			continue
+		}
 		r, known := p.data.VMs[i.VMID]
 		if !known {
 			_, validPool := pool(i.Pool)

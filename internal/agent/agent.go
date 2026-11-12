@@ -245,7 +245,7 @@ func (a *Agent) execute(effects []Effect) {
 	}
 }
 func (a *Agent) result(m api.StartVM, admitted bool, reason string) Effect {
-	return a.report(api.StartVMResult{VMID: m.VMID, Generation: m.Generation, HostID: a.ep.Addr().ID, Admitted: admitted, Reason: reason})
+	return a.report(api.StartVMResult{VMID: m.VMID, Generation: m.Generation, HostID: a.ep.Addr().ID, Admitted: admitted, Reason: reason, Seq: a.seq, Incarnation: a.incarnation})
 }
 func (a *Agent) start(now time.Time, m api.StartVM) []Effect {
 	for key := range a.quarantined {
@@ -463,7 +463,7 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 			v.state = api.VMReady
 			v.slot = api.SlotOccupied
 			v.last = now
-			return []Effect{a.report(api.ReadyReport{HostID: a.ep.Addr().ID, VMID: m.From.ID, Generation: v.start.Generation}), {To: m.From, Port: api.PortVsock, Message: api.GuestRegisterResult{Accepted: true}}}
+			return []Effect{a.report(api.ReadyReport{HostID: a.ep.Addr().ID, VMID: m.From.ID, Generation: v.start.Generation, Seq: a.seq, Incarnation: a.incarnation}), {To: m.From, Port: api.PortVsock, Message: api.GuestRegisterResult{Accepted: true}}}
 		case api.GuestHeartbeat:
 			if g.VMID != m.From.ID {
 				return a.blocked(now, v, api.AttackImpersonate)
@@ -478,7 +478,7 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 				v.recovered = false
 				v.state = api.VMReady
 				v.last = now
-				return []Effect{a.report(api.ReadyReport{HostID: a.ep.Addr().ID, VMID: m.From.ID, Generation: v.start.Generation})}
+				return []Effect{a.report(api.ReadyReport{HostID: a.ep.Addr().ID, VMID: m.From.ID, Generation: v.start.Generation, Seq: a.seq, Incarnation: a.incarnation})}
 			}
 		default:
 			return a.blocked(now, v, api.AttackControl)

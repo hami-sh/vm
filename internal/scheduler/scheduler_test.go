@@ -61,9 +61,16 @@ func (h *harness) step(msg any) Effect {
 	return e
 }
 func (h *harness) agent(id, rack string, msg any) Effect {
-	if heartbeat, ok := msg.(api.HostHeartbeat); ok {
-		heartbeat.Incarnation = h.s.state.hosts[id].incarnation
-		msg = heartbeat
+	switch m := msg.(type) {
+	case api.HostHeartbeat:
+		m.Incarnation = h.s.state.hosts[id].incarnation
+		msg = m
+	case api.StartVMResult:
+		m.Incarnation = h.s.state.hosts[id].incarnation
+		msg = m
+	case api.ReadyReport:
+		m.Incarnation = h.s.state.hosts[id].incarnation
+		msg = m
 	}
 	return h.step(api.Envelope{From: api.Addr{Kind: api.KindAgent, ID: id, Host: id, Rack: rack}, Port: api.PortControl, Msg: msg})
 }
