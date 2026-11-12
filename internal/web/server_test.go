@@ -128,6 +128,14 @@ func TestDashboardPresetRecording(t *testing.T) {
 			final := api.Snapshot{At: 52000, Sim: initial.Sim,
 				Invariants: []api.InvariantStatus{{Name: api.InvSlotCapacity, Violations: 3}},
 				Recent:     append(append([]api.Event{}, initial.Recent...), api.Event{Seq: 7, At: 1100, Kind: api.EventChaos, Detail: "partition-rack"})}
+			final.Recent = append(final.Recent,
+				api.Event{Seq: 20, At: 2000, Kind: api.EventTransition, VMID: "slow", To: api.VMLost},
+				api.Event{Seq: 21, At: 3000, Kind: api.EventTransition, VMID: "slow", To: api.VMUnhealthy},
+				api.Event{Seq: 22, At: 3500, Kind: api.EventTransition, VMID: "fast", To: api.VMUnhealthy},
+				api.Event{Seq: 23, At: 6000, Kind: api.EventTransition, VMID: "fast", To: api.VMReady},
+				api.Event{Seq: 24, At: 9000, Kind: api.EventTransition, VMID: "slow", To: api.VMReady},
+				api.Event{Seq: 25, At: 10000, Kind: api.EventTransition, VMID: "slow", To: api.VMLost},
+				api.Event{Seq: 26, At: 12000, Kind: api.EventTransition, VMID: "slow", To: api.VMReady})
 			if mode == "violation" {
 				final.Invariants[0].Violations = 4
 				final.Invariants[0].LastDetail = "capacity exceeded"
@@ -163,6 +171,9 @@ func TestDashboardPresetRecording(t *testing.T) {
 			}
 			if mode != "reset" && (r.DurationMs != 51000 || r.Checks[0].Passed != true) {
 				t.Fatalf("horizon: %+v", r)
+			}
+			if mode != "reset" && (r.P99RecoverMs != 7000 || r.Metrics["recovery_samples"] != 3) {
+				t.Fatalf("per-run recovery durations should be 2500, 7000, 2000ms: %+v", r)
 			}
 			frames := h.do("GET", "/v1/runs/"+r.ID+"/snapshots", "")
 			wantStatus(t, frames, 200)
