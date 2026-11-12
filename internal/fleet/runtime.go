@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"slices"
@@ -23,12 +24,13 @@ import (
 var schedulerAddr = api.Addr{Kind: api.KindScheduler, ID: "scheduler"}
 
 type host struct {
-	addr   api.Addr
-	agent  *agent.Agent
-	driver *driver.Fake
-	cancel context.CancelFunc
-	admin  api.AdminState
-	faults []string
+	addr     api.Addr
+	agent    *agent.Agent
+	driver   *driver.Fake
+	cancel   context.CancelFunc
+	admin    api.AdminState
+	faults   []string
+	security api.SecurityStatus
 }
 type operation struct {
 	ctx   context.Context
@@ -43,6 +45,7 @@ type observed struct {
 	snapshot api.Snapshot
 	raw      []invariant.Observation
 	epoch    int64
+	keys     map[string]string
 }
 type eventBatch struct {
 	events    []api.Event
@@ -85,12 +88,14 @@ type runtime struct {
 	logIncarnation     int64
 	compromised        map[string]bool
 	success            api.SecurityStatus
+	security           api.SecurityStatus
+	keys               map[string]string
 	cached             api.Snapshot
 	emit               func(api.Event)
 }
 
 func newRuntime(ctx context.Context, cfg config.Config, c clock.Clock, o Options, emit func(api.Event)) (*runtime, error) {
-	r := &runtime{ctx: ctx, cfg: cfg, clock: c, options: o, inbox: make(chan operation), done: make(chan struct{}), hosts: map[string]*host{}, compromised: map[string]bool{}, success: api.SecurityStatus{ByAttack: map[string]int{}}, emit: emit}
+	r := &runtime{ctx: ctx, cfg: cfg, clock: c, options: o, inbox: make(chan operation), done: make(chan struct{}), hosts: map[string]*host{}, compromised: map[string]bool{}, success: api.SecurityStatus{ByAttack: map[string]int{}}, security: api.SecurityStatus{ByAttack: map[string]int{}}, keys: map[string]string{}, emit: emit}
 	if r.options.SchedulerFactory == nil {
 		r.options.SchedulerFactory = newScheduler
 	}
@@ -244,16 +249,16 @@ func (r *runtime) addHost(rack, id string) error {
 }
 func (r *runtime) ControlPlane() api.ControlPlane { return r }
 func (r *runtime) Snapshot(ctx context.Context) (api.Snapshot, error) {
-	s, _, _, err := r.observe(ctx)
-	return s, err
+	o, err := r.observe(ctx)
+	return o.snapshot, err
 }
-func (r *runtime) observe(ctx context.Context) (api.Snapshot, []invariant.Observation, int64, error) {
+func (r *runtime) observe(ctx context.Context) (observed, error) {
 	v, err := r.call(ctx, func(ctx context.Context) (any, error) { return r.read(ctx) })
 	if err != nil {
-		return api.Snapshot{}, nil, 0, err
+		return observed{}, err
 	}
 	o := v.(observed)
-	return o.snapshot, o.raw, o.epoch, nil
+	return o, nil
 }
 func (r *runtime) read(ctx context.Context) (observed, error) {
 	s := clone(r.cached)
@@ -273,7 +278,6 @@ func (r *runtime) read(ctx context.Context) (observed, error) {
 		leases[h.ID] = h
 	}
 	var raw []invariant.Observation
-	s.Security = api.SecurityStatus{ByAttack: map[string]int{}, Succeeded: r.success.Succeeded}
 	ids := make([]string, 0, len(r.hosts))
 	for id := range r.hosts {
 		ids = append(ids, id)
@@ -285,6 +289,13 @@ func (r *runtime) read(ctx context.Context) (observed, error) {
 		if err != nil {
 			return observed{}, err
 		}
+		// Agent counters are monotonic over this host actor's lifetime. Fold
+		// their deltas before removal; reusing a host ID starts a new baseline.
+		r.security.Blocked += a.Security.Blocked - h.security.Blocked
+		for attack, count := range a.Security.ByAttack {
+			r.security.ByAttack[attack] += count - h.security.ByAttack[attack]
+		}
+		h.security = a.Security
 		if h.admin == api.AdminDraining && s.Scheduler == api.SchedulerUp {
 			empty := len(a.Inventory) == 0 &&
 				!slices.ContainsFunc(a.Actual, func(v api.DriverVM) bool { return v.Running }) &&
@@ -312,16 +323,21 @@ func (r *runtime) read(ctx context.Context) (observed, error) {
 		a.Host.AdminState = h.admin
 		a.Host.Lease = sh.Lease
 		a.Host.Faults = slices.Clone(h.faults)
-		raw = append(raw, invariant.Observation{Host: a.Host, Actual: a.Actual, Connected: connected, Security: a.Security})
+		raw = append(raw, invariant.Observation{Host: a.Host, Actual: a.Actual, Connected: connected})
+		if connected {
+			for _, actual := range a.Actual {
+				if actual.Running && r.keys[actual.VMID] == "" {
+					if launch, ok := h.driver.LaunchInfo(actual.VMID, actual.Generation); ok {
+						r.keys[actual.VMID] = launch.IdempotencyKey
+					}
+				}
+			}
+		}
 		if !ok {
 			s.Hosts = append(s.Hosts, a.Host)
 		}
-		s.Security.Blocked += a.Security.Blocked
-		s.Security.Succeeded += a.Security.Succeeded
-		for k, n := range a.Security.ByAttack {
-			s.Security.ByAttack[k] += n
-		}
 	}
+	s.Security = api.SecurityStatus{Blocked: r.security.Blocked, Succeeded: r.success.Succeeded, ByAttack: maps.Clone(r.security.ByAttack)}
 	s.Hosts = slices.DeleteFunc(s.Hosts, func(h api.Host) bool { return r.hosts[h.ID] == nil })
 	for i := range s.Hosts {
 		if h := r.hosts[s.Hosts[i].ID]; h != nil {
@@ -336,7 +352,7 @@ func (r *runtime) read(ctx context.Context) (observed, error) {
 	for i := range s.VMs {
 		s.VMs[i].Compromised = r.compromised[s.VMs[i].ID]
 	}
-	return observed{snapshot: s, raw: raw, epoch: r.logIncarnation}, nil
+	return observed{snapshot: s, raw: raw, epoch: r.logIncarnation, keys: maps.Clone(r.keys)}, nil
 }
 func (r *runtime) Apply(ctx context.Context, action string, req api.ChaosRequest) error {
 	_, err := r.call(ctx, func(ctx context.Context) (any, error) { return nil, r.apply(ctx, action, req) })
@@ -587,6 +603,8 @@ func (r *runtime) Reset(ctx context.Context) error {
 		r.cached = api.Snapshot{}
 		r.compromised = map[string]bool{}
 		r.success = api.SecurityStatus{ByAttack: map[string]int{}}
+		r.security = api.SecurityStatus{ByAttack: map[string]int{}}
+		r.keys = map[string]string{}
 		for _, suffix := range []string{"", "-wal", "-shm"} {
 			if err := os.Remove(r.options.StorePath + suffix); err != nil && !os.IsNotExist(err) {
 				return nil, err
@@ -647,7 +665,11 @@ func (r *runtime) CreateVM(ctx context.Context, key string, q api.CreateVMReques
 		if r.down {
 			return nil, &api.Error{Status: 503, Msg: "scheduler down", RetryAfterS: 1}
 		}
-		return r.scheduler.CreateVM(ctx, key, q)
+		response, err := r.scheduler.CreateVM(ctx, key, q)
+		if err == nil && r.keys[response.ID] == "" {
+			r.keys[response.ID] = key
+		}
+		return response, err
 	})
 	if err != nil {
 		return api.CreateVMResponse{}, err

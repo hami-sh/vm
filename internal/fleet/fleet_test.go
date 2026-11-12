@@ -2,6 +2,8 @@ package fleet
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"slices"
 	"sync"
 	"testing"
@@ -233,6 +235,253 @@ func TestDrainCompletionWaitsForTerminationAndEmptyDriver(t *testing.T) {
 type eventScheduler struct {
 	standIn
 	truncated bool
+}
+
+func TestRecordingSubscriptionBuffersSlowFloodAndPreservesGaps(t *testing.T) {
+	ctx := t.Context()
+	c := clock.NewScaled(time.Unix(0, 0), 1)
+	c.Pause()
+	f, err := New(ctx, Options{Clock: c, Racks: 1, HostsPerRack: 1, SchedulerFactory: newStandIn})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	snapshots, events, unsubscribe := f.Subscribe()
+	defer unsubscribe()
+	<-snapshots
+	barrier := func() {
+		t.Helper()
+		c.Step(config.Default().InvariantEvery)
+		at := c.Now().UnixMilli()
+		timer := (clock.Real{}).NewTimer(5 * time.Second)
+		defer timer.Stop()
+		for {
+			select {
+			case s := <-snapshots:
+				if s.At >= at {
+					return
+				}
+			case <-timer.C():
+				t.Fatal("publisher did not drain events at sim tick")
+			}
+		}
+	}
+	// Deliberately consume no events until all synchronous calls finish. This
+	// exceeds the old 64-event buffer, like a recorder busy issuing a flood.
+	for range 200 {
+		if _, err := f.Chaos.Do(ctx, "fill-disk", api.ChaosRequest{Target: "r1-h1"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A checked sim tick drains all enqueued events before publishing.
+	if _, err := f.Chaos.Do(ctx, "clock-skew", api.ChaosRequest{Target: "r1-h1"}); err != nil {
+		t.Fatal(err)
+	}
+	barrier()
+	timer := (clock.Real{}).NewTimer(5 * time.Second)
+	defer timer.Stop()
+	var last int64
+	count := 0
+	for count < 201 {
+		select {
+		case e := <-events:
+			if last != 0 && e.Seq != last+1 {
+				t.Fatalf("recording dropped events: %d -> %d", last, e.Seq)
+			}
+			last = e.Seq
+			count++
+		case <-timer.C():
+			t.Fatalf("slow subscriber received only %d of 201 events", count)
+		}
+	}
+	// Deliberately exceed even the larger bounded capacity. Subsequent
+	// delivered events must keep the publisher's sequence gap, not hide loss.
+	for range f.runtime.cfg.MaxVMs*16 + 10 {
+		if _, err := f.Chaos.Do(ctx, "fill-disk", api.ChaosRequest{Target: "r1-h1"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	barrier()
+	for len(events) > 0 {
+		last = (<-events).Seq
+	}
+	if _, err := f.Chaos.Do(ctx, "clock-skew", api.ChaosRequest{Target: "r1-h1"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case e := <-events:
+		if e.Seq <= last+1 {
+			t.Fatalf("overflow hidden: %d -> %d", last, e.Seq)
+		}
+	case <-timer.C():
+		t.Fatal("fleet blocked on slow subscriber")
+	}
+}
+
+func TestPublishedDriverEvidenceSurvivesJSONAndCallerMutation(t *testing.T) {
+	h := newScenarioFleet(t)
+	h.create(1)
+	s := h.ready(1)
+	v := s.VMs[0]
+	i := slices.IndexFunc(s.Observed, func(o api.HostObservation) bool { return o.HostID == v.HostID })
+	if i < 0 || !s.Observed[i].Connected || !slices.ContainsFunc(s.Observed[i].Actual, func(actual api.DriverVM) bool {
+		return actual.VMID == v.ID && actual.Generation == v.Generation && actual.Running
+	}) {
+		t.Fatalf("missing running raw driver evidence: %+v", s.Observed)
+	}
+	encoded, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded api.Snapshot
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Observed) != len(s.Observed) || decoded.Observed[i].Actual[0] != s.Observed[i].Actual[0] {
+		t.Fatalf("observation lost in recording: %s", encoded)
+	}
+	s.Observed[i].HostID = "mutated"
+	s.Observed[i].Actual[0].VMID = "mutated"
+	if h.f.Latest().Observed[i].HostID != v.HostID || h.f.Latest().Observed[i].Actual[0].VMID != v.ID {
+		t.Fatal("observed evidence aliases published snapshot")
+	}
+	var legacy api.Snapshot
+	if err := json.Unmarshal([]byte(`{"seq":1,"at":0}`), &legacy); err != nil || legacy.Observed != nil {
+		t.Fatalf("legacy recording no longer decodes without evidence: %+v, %v", legacy.Observed, err)
+	}
+}
+
+type keyScheduler struct {
+	drainScheduler
+	next int
+}
+
+func (s *keyScheduler) Snapshot(ctx context.Context) (api.Snapshot, error) {
+	out, err := s.drainScheduler.Snapshot(ctx)
+	for i := range out.Hosts {
+		out.Hosts[i].Lease = api.LeaseHealthy
+	}
+	return out, err
+}
+
+func TestAdoptedLaunchKeyCannotHideSecondLogicalVM(t *testing.T) {
+	ctx := t.Context()
+	c := clock.NewScaled(time.Unix(0, 0), 1)
+	c.Pause()
+	cfg := config.Default()
+	cfg.BootMin, cfg.BootMax = 0, 0
+	scheduler := &keyScheduler{drainScheduler: drainScheduler{admin: map[string]api.AdminState{}}}
+	factory := func(ctx context.Context, cfg config.Config, c clock.Clock, n api.Transport, path string) (Scheduler, func(), error) {
+		_, close, err := newStandIn(ctx, cfg, c, n, path)
+		return scheduler, close, err
+	}
+	f, err := New(ctx, Options{Config: cfg, Clock: c, Racks: 1, HostsPerRack: 1, SchedulerFactory: factory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	// This VM was launched before this runtime's create ledger existed. Only
+	// the driver's trusted launch identity can associate it with K.
+	_, err = f.runtime.call(ctx, func(ctx context.Context) (any, error) {
+		h := f.runtime.hosts["r1-h1"]
+		return nil, h.driver.StartCommand(ctx, api.StartVM{VMID: "adopted", Generation: 7, IdempotencyKey: "K"}, api.BootParams{VMID: "adopted", Generation: 7, Host: h.addr.ID, Rack: h.addr.Rack})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Control.CreateVM(ctx, "K", api.CreateVMRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	snapshots, _, unsubscribe := f.Subscribe()
+	defer unsubscribe()
+	<-snapshots
+	// First check establishes connected running time; the second crosses its
+	// heartbeat bound. Neither scheduler key ownership nor adoption can hide it.
+	for _, step := range []time.Duration{cfg.InvariantEvery, cfg.HostHeartbeat + cfg.InvariantEvery} {
+		c.Step(step)
+		at := c.Now().UnixMilli()
+		timer := (clock.Real{}).NewTimer(5 * time.Second)
+		for {
+			select {
+			case s := <-snapshots:
+				if s.At < at {
+					continue
+				}
+				if step > cfg.HostHeartbeat && !slices.ContainsFunc(s.Invariants, func(inv api.InvariantStatus) bool { return inv.Name == api.InvIdempotencyUnique && inv.Violations > 0 }) {
+					t.Fatal("driver LaunchInfo key was not checked", s.Invariants)
+				}
+			case <-timer.C():
+				t.Fatal("missing checked snapshot")
+			}
+			break
+		}
+		timer.Stop()
+	}
+}
+
+func (s *keyScheduler) CreateVM(_ context.Context, _ string, _ api.CreateVMRequest) (api.CreateVMResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.next++
+	id := fmt.Sprintf("logical-%d", s.next)
+	s.vms = append(s.vms, api.VM{ID: id, State: api.VMPending, Desired: api.DesiredRunning})
+	return api.CreateVMResponse{ID: id}, nil
+}
+
+func TestAcceptedKeyLedgerSurvivesWipeAndAdoptedKeyMovement(t *testing.T) {
+	ctx := t.Context()
+	c := clock.NewScaled(time.Unix(0, 0), 1)
+	c.Pause()
+	scheduler := &keyScheduler{drainScheduler: drainScheduler{admin: map[string]api.AdminState{}}}
+	factory := func(ctx context.Context, cfg config.Config, c clock.Clock, n api.Transport, path string) (Scheduler, func(), error) {
+		_, close, err := newStandIn(ctx, cfg, c, n, path)
+		return scheduler, close, err
+	}
+	f, err := New(ctx, Options{Clock: c, Racks: 1, HostsPerRack: 1, SchedulerFactory: factory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	old, err := f.Control.CreateVM(ctx, "K", api.CreateVMRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler.mu.Lock()
+	scheduler.vms = nil
+	scheduler.mu.Unlock()
+	if _, err := f.Chaos.Do(ctx, "wipe-store", api.ChaosRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := f.Control.CreateVM(ctx, "K", api.CreateVMRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The broken scheduler adopts the former key owner alongside its retry.
+	// The runtime ledger must remember both, regardless of the current claim.
+	scheduler.mu.Lock()
+	scheduler.vms = append(scheduler.vms, api.VM{ID: old.ID, State: api.VMReady, Desired: api.DesiredRunning})
+	scheduler.mu.Unlock()
+	snaps, _, unsubscribe := f.Subscribe()
+	defer unsubscribe()
+	<-snaps
+	c.Step(config.Default().InvariantEvery)
+	timer := (clock.Real{}).NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case s := <-snaps:
+			for _, inv := range s.Invariants {
+				if inv.Name == api.InvIdempotencyUnique && inv.Violations > 0 {
+					if old.ID == retry.ID {
+						t.Fatal("stand-in failed to reproduce duplicate logical IDs")
+					}
+					return
+				}
+			}
+		case <-timer.C():
+			t.Fatal("adoption/key movement hid duplicate idempotency key")
+		}
+	}
 }
 
 func TestSimulationChangesPublishWhilePausedWithoutExtraChecks(t *testing.T) {

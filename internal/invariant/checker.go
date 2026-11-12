@@ -13,13 +13,14 @@ import (
 )
 
 type Checker struct {
-	cfg                  config.Config
-	gen                  map[string]int64
-	stale, pending       map[string]int64
-	duplicates, capacity map[string]int64
-	replacements         map[string]bool
-	status               map[api.InvariantName]api.InvariantStatus
-	seq                  int64
+	cfg            config.Config
+	gen            map[string]int64
+	stale, pending map[string]int64
+	duplicates     map[string]int64
+	keyRunning     map[string]int64
+	replacements   map[string]bool
+	status         map[api.InvariantName]api.InvariantStatus
+	seq            int64
 }
 
 // Observation comes from the agent actor and its independent driver.List, not
@@ -29,14 +30,13 @@ type Observation struct {
 	Host      api.Host
 	Actual    []api.DriverVM
 	Connected bool
-	Security  api.SecurityStatus
 }
 
 func New(c config.Config) *Checker {
-	return &Checker{cfg: c, gen: map[string]int64{}, stale: map[string]int64{}, pending: map[string]int64{}, duplicates: map[string]int64{}, capacity: map[string]int64{}, replacements: map[string]bool{}, status: map[api.InvariantName]api.InvariantStatus{}}
+	return &Checker{cfg: c, gen: map[string]int64{}, stale: map[string]int64{}, pending: map[string]int64{}, duplicates: map[string]int64{}, keyRunning: map[string]int64{}, replacements: map[string]bool{}, status: map[api.InvariantName]api.InvariantStatus{}}
 }
 func (c *Checker) Status() []api.InvariantStatus {
-	out := make([]api.InvariantStatus, 0, 8)
+	out := make([]api.InvariantStatus, 0, len(api.AllInvariants))
 	for _, n := range api.AllInvariants {
 		s := c.status[n]
 		s.Name = n
@@ -59,6 +59,56 @@ func (c *Checker) violation(n api.InvariantName, at int64, detail string) api.Ev
 func (c *Checker) EventsLost(at int64) api.Event {
 	return c.violation(api.InvLegalTransitions, at, "events lost")
 }
+
+// CheckKeys uses independently retained create/launch identity, not the store's
+// current key owner: a wiped store can assign the same key to a second VM.
+func (c *Checker) CheckKeys(s api.Snapshot, keys map[string]string, observations ...Observation) []api.Event {
+	var out []api.Event
+	active := map[string]bool{}
+	for _, v := range s.VMs {
+		if !vm.Terminal(v.State) {
+			active[v.ID] = true
+		}
+	}
+	running := map[string]int64{}
+	for _, o := range observations {
+		if !o.Connected {
+			continue
+		}
+		for _, actual := range o.Actual {
+			if !actual.Running {
+				continue
+			}
+			copyID := fmt.Sprintf("%s/%s/%d", o.Host.ID, actual.VMID, actual.Generation)
+			at, ok := c.keyRunning[copyID]
+			if !ok {
+				at = s.At
+			}
+			running[copyID] = at
+			if s.At-at > c.cfg.HostHeartbeat.Milliseconds() {
+				active[actual.VMID] = true
+			}
+		}
+	}
+	c.keyRunning = running
+	owners := map[string]string{}
+	ids := make([]string, 0, len(active))
+	for id := range active {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	for _, id := range ids {
+		key := keys[id]
+		if key == "" {
+			continue
+		}
+		if owner, ok := owners[key]; ok {
+			out = append(out, c.violation(api.InvIdempotencyUnique, s.At, "logical VMs "+owner+" and "+id+" share a create key"))
+		}
+		owners[key] = id
+	}
+	return out
+}
 func (c *Checker) Check(s api.Snapshot, observations ...Observation) []api.Event {
 	var out []api.Event
 	bad := func(n api.InvariantName, detail string) {
@@ -66,9 +116,6 @@ func (c *Checker) Check(s api.Snapshot, observations ...Observation) []api.Event
 	}
 	byID := map[string]api.VM{}
 	for _, v := range s.VMs {
-		if old, ok := byID[v.ID]; ok && old.State == api.VMReady && v.State == api.VMReady {
-			bad(api.InvOneAuthoritative, v.ID)
-		}
 		byID[v.ID] = v
 		if v.Generation < c.gen[v.ID] {
 			bad(api.InvGenMonotonic, v.ID)
@@ -85,7 +132,6 @@ func (c *Checker) Check(s api.Snapshot, observations ...Observation) []api.Event
 	for _, h := range s.Hosts {
 		hosts[h.ID] = h
 	}
-	capacityNow := map[string]int64{}
 	for _, o := range observations {
 		h := o.Host
 		sh, known := hosts[h.ID]
@@ -94,28 +140,26 @@ func (c *Checker) Check(s api.Snapshot, observations ...Observation) []api.Event
 			!slices.Contains(h.Faults, "kill-host") && !slices.Contains(h.Faults, "one-way-partition") &&
 			!slices.Contains(h.Faults, "fill-disk") && !slices.Contains(sh.Faults, "fill-disk")
 		used := 0
-		counted := map[string]bool{}
 		for _, slot := range h.Slots {
-			if slot.State != api.SlotFree {
-				used++
-				counted[fmt.Sprintf("%s/%d", slot.VMID, slot.Generation)] = true
-			} else if placeable && slices.ContainsFunc(sh.Slots, func(s api.Slot) bool { return s.Index == slot.Index && s.State == api.SlotFree }) {
+			if slot.State == api.SlotFree && placeable && slices.ContainsFunc(sh.Slots, func(s api.Slot) bool { return s.Index == slot.Index && s.State == api.SlotFree }) {
 				free = true
 			}
 		}
-		slotUsed := used
+		if !o.Connected {
+			continue // Deliberately no global view of disconnected hosts.
+		}
 		for _, actual := range o.Actual {
 			if !actual.Running {
 				continue
 			}
-			if !counted[fmt.Sprintf("%s/%d", actual.VMID, actual.Generation)] {
-				used++
-			}
+			used++
 			v, ok := byID[actual.VMID]
 			if ok && v.State == api.VMReady && actual.Generation == v.Generation {
 				auth[v.ID]++
 			}
-			if ok && actual.Generation < v.Generation && o.Connected {
+			stale := !ok || actual.Generation != v.Generation || v.HostID != h.ID ||
+				v.Desired != api.DesiredRunning || (v.State != api.VMBooting && v.State != api.VMReady && v.State != api.VMUnhealthy)
+			if stale {
 				key := fmt.Sprintf("%s/%s/%d", h.ID, actual.VMID, actual.Generation)
 				at, ok := c.stale[key]
 				if !ok {
@@ -127,24 +171,13 @@ func (c *Checker) Check(s api.Snapshot, observations ...Observation) []api.Event
 				}
 			}
 		}
-		if slotUsed > h.SlotCount {
+		// This is a single independent hypervisor observation, not a union of
+		// asynchronously sampled agent slots and scheduler inventory.
+		if used > c.cfg.SlotsPerHost {
 			bad(api.InvSlotCapacity, h.ID)
-		} else if used > h.SlotCount {
-			at, ok := c.capacity[h.ID]
-			if !ok {
-				at = s.At
-			}
-			capacityNow[h.ID] = at
-			if s.At-at > c.cfg.HostHeartbeat.Milliseconds() {
-				bad(api.InvSlotCapacity, h.ID)
-			}
-		}
-		if o.Security.Succeeded > 0 {
-			bad(api.InvNoAttackSuccess, "successful guest attack on "+h.ID)
 		}
 	}
 	c.stale = staleNow
-	c.capacity = capacityNow
 	duplicateNow := map[string]int64{}
 	for id, n := range auth {
 		if n > 1 {
