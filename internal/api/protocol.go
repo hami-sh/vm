@@ -87,7 +87,7 @@ type StartVM struct {
 	Generation int64  `json:"gen"`
 	Token      string `json:"token"` // fresh per boot; the agent checks it when guestd registers
 	Spec       VMSpec `json:"spec"`
-	Epoch      int64  `json:"epoch"` // scheduler_epoch; agents ignore older epochs
+	Epoch      int64  `json:"epoch"` // scheduler_epoch = max(stored+1, sim unix ms) at start; agents ignore older epochs
 }
 
 // StopVM asks a host to stop vm at gen. Not running -> ack; running a higher
