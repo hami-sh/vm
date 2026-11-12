@@ -281,6 +281,9 @@ func TestCapacityRefusalsDoNotConsumeBootBudget(t *testing.T) {
 				if v.State != api.VMBooting {
 					t.Fatalf("refusal consumed budget: %+v", v)
 				}
+				// Isolate the refunded state from a valid immediate retry. Each
+				// iteration opens a new host; refused hosts remain unavailable.
+				h.step(request{op: "admin", id: v.HostID, arg: api.AdminCordoned})
 				h.agent(v.HostID, v.Rack, api.StartVMResult{HostID: v.HostID, VMID: v.ID, Generation: v.Generation, Reason: reason})
 				if got := h.s.state.data.VMs[v.ID].VM; got.State != api.VMPending || got.Attempts != 0 {
 					t.Fatalf("capacity refusal counted as boot: %+v", got)
