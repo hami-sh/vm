@@ -87,6 +87,7 @@ type Agent struct {
 	quarantined      map[vmGeneration]api.InventoryItem
 	epoch            int64
 	seq              uint64
+	incarnation      api.HostIncarnation
 	paused, cordoned bool
 	reregister       bool
 	awaitingAck      bool
@@ -197,7 +198,8 @@ func (a *Agent) report(m any) Effect {
 	return Effect{To: a.scheduler, Port: api.PortControl, Message: m}
 }
 func (a *Agent) registration() Effect {
-	return a.report(api.RegisterHost{HostID: a.ep.Addr().ID, Rack: a.ep.Addr().Rack, Slots: min(2, a.cfg.SlotsPerHost), DiskFull: a.diskFull(), Inventory: a.inventory(), Epoch: a.epoch})
+	a.seq++
+	return a.report(api.RegisterHost{HostID: a.ep.Addr().ID, Rack: a.ep.Addr().Rack, Slots: min(2, a.cfg.SlotsPerHost), DiskFull: a.diskFull(), Inventory: a.inventory(), Epoch: a.epoch, Seq: a.seq, Incarnation: a.incarnation})
 }
 func (a *Agent) diskFull() bool {
 	if d, ok := a.driver.(interface{ DiskFull() bool }); ok {
@@ -226,7 +228,7 @@ func (a *Agent) heartbeat() []Effect {
 		return nil
 	}
 	a.seq++
-	out := []Effect{a.report(api.HostHeartbeat{HostID: a.ep.Addr().ID, Seq: a.seq, DiskFull: a.diskFull(), Inventory: a.inventory(), Epoch: a.epoch})}
+	out := []Effect{a.report(api.HostHeartbeat{HostID: a.ep.Addr().ID, Seq: a.seq, DiskFull: a.diskFull(), Inventory: a.inventory(), Epoch: a.epoch, Incarnation: a.incarnation})}
 	if a.reregister {
 		out = append(out, a.registration())
 	}
@@ -395,7 +397,14 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 				if cmd.Epoch < a.epoch || cmd.HostID != a.ep.Addr().ID {
 					return nil
 				}
+				if a.incarnation.After(cmd.Incarnation) {
+					return nil
+				}
+				if cmd.Incarnation != a.incarnation && !cmd.Reregister {
+					return nil
+				}
 				a.epoch = cmd.Epoch
+				a.incarnation = cmd.Incarnation
 				a.awaitingAck = false
 				a.reregister = cmd.Reregister
 				var out []Effect
@@ -557,6 +566,7 @@ func (a *Agent) handle(now time.Time, msg any) (effects []Effect) {
 			clear(a.quarantined)
 			a.epoch = 0
 			a.seq = 0
+			a.incarnation = api.HostIncarnation{}
 			a.paused = false
 			a.cordoned = false
 			a.reregister = false

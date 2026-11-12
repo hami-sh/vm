@@ -61,10 +61,20 @@ func (h *harness) step(msg any) Effect {
 	return e
 }
 func (h *harness) agent(id, rack string, msg any) Effect {
+	if heartbeat, ok := msg.(api.HostHeartbeat); ok {
+		heartbeat.Incarnation = h.s.state.hosts[id].incarnation
+		msg = heartbeat
+	}
 	return h.step(api.Envelope{From: api.Addr{Kind: api.KindAgent, ID: id, Host: id, Rack: rack}, Port: api.PortControl, Msg: msg})
 }
 func (h *harness) register(id, rack string, slots int, items ...api.InventoryItem) Effect {
-	return h.agent(id, rack, api.RegisterHost{HostID: id, Rack: rack, Slots: slots, Inventory: items})
+	registration := api.RegisterHost{HostID: id, Rack: rack, Slots: slots, Inventory: items}
+	e := h.agent(id, rack, registration)
+	if challenge, pending := h.s.state.challenges[id]; pending {
+		registration.Incarnation = challenge
+		e = h.agent(id, rack, registration)
+	}
+	return e
 }
 func (h *harness) create(key, pr string) api.VM {
 	h.t.Helper()
@@ -493,6 +503,7 @@ func TestActorConcurrentIdempotencyAndRealRestart(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		var maxEpoch int64
+		var seq uint64
 		metadata := map[string]api.StartVM{}
 		for {
 			select {
@@ -505,7 +516,8 @@ func TestActorConcurrentIdempotencyAndRealRestart(t *testing.T) {
 						inventory[j].RequestHash = m.RequestHash
 					}
 				}
-				_ = agent.Send(Address, api.PortControl, api.RegisterHost{HostID: "a", Rack: "r1", Slots: 2, Epoch: maxEpoch, Inventory: inventory})
+				seq++
+				_ = agent.Send(Address, api.PortControl, api.RegisterHost{HostID: "a", Rack: "r1", Slots: 2, Epoch: maxEpoch, Seq: seq, Inventory: inventory})
 			case e := <-agent.Inbox():
 				switch m := e.Msg.(type) {
 				case api.StartVM:
@@ -1052,7 +1064,7 @@ func TestUnknownHeartbeatRequestsRegistrationBeforeAdopting(t *testing.T) {
 			if !ok || !ack.Reregister || ack.Epoch <= reported || ack.HostID != "a" || e.sends[0].to.Rack != "r1" {
 				t.Fatalf("bad re-registration request: %+v", e.sends)
 			}
-			h.agent("a", "r1", api.RegisterHost{HostID: "a", Rack: "r1", Slots: 1, DiskFull: true, Epoch: ack.Epoch, Inventory: []api.InventoryItem{i}})
+			h.agent("a", "r1", api.RegisterHost{HostID: "a", Rack: "r1", Slots: 1, DiskFull: true, Epoch: ack.Epoch, Incarnation: ack.Incarnation, Inventory: []api.InventoryItem{i}})
 			if h.s.state.hosts["a"].record.Slots != 1 || !h.s.state.hosts["a"].disk || h.s.state.data.VMs[i.VMID].VM.Generation != 7 {
 				t.Fatal("did not use authoritative registration")
 			}

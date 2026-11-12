@@ -17,13 +17,34 @@ func (p *planner) receive(from api.Addr, msg any) {
 		}
 		p.observeEpoch(m.Epoch)
 		h, exists := p.hosts[id]
+		if challenge, pending := p.challenges[id]; pending {
+			if m.Incarnation != challenge {
+				p.requestRegistration(from, m.Incarnation)
+				return
+			}
+			// Only an echo of this outstanding challenge proves the sender
+			// captured its registration after the sequence-reset request.
+			h.incarnation = m.Incarnation
+			delete(p.challenges, id)
+		} else if h.registered && (m.Incarnation != h.incarnation || m.Seq <= h.seq) {
+			// A restart loses its identity, but can receive an old challenge
+			// before its new registration. Recover that reset once the lease
+			// expires; late reports from a healthy identity need no handshake.
+			if m.Incarnation == (api.HostIncarnation{}) || m.Incarnation.After(h.incarnation) || (h.lease != api.LeaseHealthy && m.Incarnation == h.incarnation && m.Seq < h.seq) {
+				p.requestRegistration(from, m.Incarnation)
+			}
+			return
+		} else if !h.registered {
+			h.incarnation = m.Incarnation
+		}
 		if !exists {
 			h.record = store.HostRecord{ID: id, Rack: m.Rack, Slots: m.Slots, Admin: api.AdminActive, RegisteredAt: p.now.UnixMilli()}
 		} else {
 			h.record.Rack = m.Rack
 			h.record.Slots = m.Slots
 		}
-		h.seq = 0
+		h.seq = m.Seq
+		h.registered = true
 		h.lease = api.LeaseHealthy
 		h.last = p.now.UnixMilli()
 		h.disk = m.DiskFull
@@ -39,30 +60,32 @@ func (p *planner) receive(from api.Addr, msg any) {
 			p.observeEpoch(m.Epoch)
 			// A re-registration request must be strictly ahead even if a
 			// fresh store happens to have the agent's exact epoch already.
-			if p.epoch == m.Epoch {
+			if _, pending := p.challenges[id]; !pending && p.epoch == m.Epoch {
 				p.epoch++
 				p.data.Epoch = p.epoch
 				p.log(api.EventReconcile, "", "", "advanced scheduler epoch for re-registration")
 			}
-			p.effect.sends = append(p.effect.sends, delivery{from, api.HeartbeatAck{HostID: id, Epoch: p.epoch, Reregister: true}})
+			p.requestRegistration(from, m.Incarnation)
 			return
 		}
 		if from.Rack != h.record.Rack {
 			return
 		}
 		p.observeEpoch(m.Epoch)
-		// Only RegisterHost resets the sequence window. Seq 1 may be a
-		// delayed packet, not evidence of a new agent incarnation.
-		if m.Seq <= h.seq {
-			// Repeat the request on each stale heartbeat so packet loss cannot
-			// strand an agent whose initial registration was dropped.
-			p.send(id, api.HeartbeatAck{HostID: id, Epoch: p.epoch, Reregister: true})
+		_, pending := p.challenges[id]
+		if pending || m.Incarnation != h.incarnation || m.Seq <= h.seq {
+			// Retrying the same challenge recovers a lost request or response;
+			// no pre-challenge heartbeat can reset the sequence window.
+			if pending || m.Incarnation == (api.HostIncarnation{}) || m.Incarnation.After(h.incarnation) || !h.registered || (h.lease != api.LeaseHealthy && m.Incarnation == h.incarnation && m.Seq < h.seq) {
+				p.requestRegistration(from, m.Incarnation)
+			}
 			return
 		}
 		rejoin := h.lease != api.LeaseHealthy
 		h.lease = api.LeaseHealthy
 		h.last = p.now.UnixMilli()
 		h.seq = m.Seq
+		h.registered = true
 		h.disk = m.DiskFull
 		p.hosts[id] = h
 		p.reconcile(id, m.Inventory, rejoin)
@@ -262,6 +285,15 @@ func (p *planner) ready(id string) {
 	}
 }
 
+func (p *planner) requestRegistration(from api.Addr, observed api.HostIncarnation) {
+	challenge, pending := p.challenges[from.ID]
+	if !pending || observed.After(challenge) {
+		challenge = api.HostIncarnation{Epoch: p.epoch, Challenge: max(p.hosts[from.ID].incarnation.Challenge, observed.Challenge) + 1}
+		p.challenges[from.ID] = challenge
+	}
+	p.effect.sends = append(p.effect.sends, delivery{from, api.HeartbeatAck{HostID: from.ID, Epoch: p.epoch, Reregister: true, Incarnation: challenge}})
+}
+
 func (p *planner) reconcile(hostID string, inventory []api.InventoryItem, strict bool) {
 	h := p.hosts[hostID]
 	h.inventory = append([]api.InventoryItem(nil), inventory...)
@@ -293,6 +325,8 @@ func (p *planner) reconcile(hostID string, inventory []api.InventoryItem, strict
 					detail = "store lost unknown VM; idempotency key lost"
 				}
 				p.log(api.EventAlert, i.VMID, hostID, detail)
+			} else {
+				p.log(api.EventAlert, i.VMID, hostID, "unknown VM outside store recovery window; stopping copy")
 			}
 			if p.fresh && i.State == api.VMReady && validPool {
 				v := api.VM{ID: i.VMID, Pool: i.Pool, Generation: i.Generation, HostID: hostID, Rack: h.record.Rack, Desired: api.DesiredRunning, Priority: api.PriorityStandard, CreatedAt: p.now.UnixMilli()}
@@ -453,5 +487,5 @@ func (p *planner) reconcile(hostID string, inventory []api.InventoryItem, strict
 			delete(p.exclude, id)
 		}
 	}
-	p.send(hostID, api.HeartbeatAck{HostID: hostID, Epoch: p.epoch, Stale: stale})
+	p.send(hostID, api.HeartbeatAck{HostID: hostID, Epoch: p.epoch, Stale: stale, Incarnation: p.hosts[hostID].incarnation})
 }

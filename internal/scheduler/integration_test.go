@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -90,6 +91,50 @@ func TestRealAgentFleetCapacityAndRackSpreading(t *testing.T) {
 	}
 }
 
+type registrationLoss struct {
+	api.Transport
+	mu                                       sync.Mutex
+	registrations                            []api.RegisterHost
+	acks                                     []api.HeartbeatAck
+	dropChallenge, dropRegistration, dropAck bool
+}
+
+type registrationLossEndpoint struct {
+	api.Endpoint
+	loss *registrationLoss
+}
+
+func (n *registrationLoss) Attach(addr api.Addr) (api.Endpoint, error) {
+	ep, err := n.Transport.Attach(addr)
+	return registrationLossEndpoint{ep, n}, err
+}
+
+func (e registrationLossEndpoint) Send(to api.Addr, port api.Port, message any) error {
+	e.loss.mu.Lock()
+	drop := false
+	switch m := message.(type) {
+	case api.RegisterHost:
+		e.loss.registrations = append(e.loss.registrations, m)
+		if m.Incarnation != (api.HostIncarnation{}) && e.loss.dropRegistration {
+			e.loss.dropRegistration, drop = false, true
+		}
+	case api.HeartbeatAck:
+		if m.Reregister && e.loss.dropChallenge {
+			e.loss.dropChallenge, drop = false, true
+		} else if !m.Reregister && m.Incarnation != (api.HostIncarnation{}) && e.loss.dropAck {
+			e.loss.dropAck, drop = false, true
+		}
+		if !drop {
+			e.loss.acks = append(e.loss.acks, m)
+		}
+	}
+	e.loss.mu.Unlock()
+	if drop {
+		return nil
+	}
+	return e.Endpoint.Send(to, port, message)
+}
+
 func TestRealAgentWipedStoreEpochAndIdempotencyRecovery(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -97,9 +142,10 @@ func TestRealAgentWipedStoreEpochAndIdempotencyRecovery(t *testing.T) {
 	c := clock.NewFake(time.Unix(1000, 0))
 	net := simnet.New(c, cfg, 73)
 	defer net.Close()
+	traffic := &registrationLoss{Transport: net}
 	d := driver.NewFake(c, cfg, net, 73)
 	defer d.Close()
-	ep, err := net.Attach(api.Addr{Kind: api.KindAgent, ID: "a", Host: "a", Rack: "r1"})
+	ep, err := traffic.Attach(api.Addr{Kind: api.KindAgent, ID: "a", Host: "a", Rack: "r1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +161,7 @@ func TestRealAgentWipedStoreEpochAndIdempotencyRecovery(t *testing.T) {
 		}
 		sctx, stop := context.WithCancel(ctx)
 		kill = stop
-		s, err = scheduler.New(sctx, cfg, c, net, db)
+		s, err = scheduler.New(sctx, cfg, c, traffic, db)
 		if err != nil {
 			stop()
 			db.Close()
@@ -169,6 +215,47 @@ func TestRealAgentWipedStoreEpochAndIdempotencyRecovery(t *testing.T) {
 	original, err := s.GetVM(ctx, created.ID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Lose each handshake leg once. A duplicate registration asks for proof,
+	// but neither it nor old heartbeats can change the Ready incarnation.
+	traffic.mu.Lock()
+	duplicate := traffic.registrations[0]
+	traffic.dropChallenge, traffic.dropRegistration, traffic.dropAck = true, true, true
+	traffic.mu.Unlock()
+	if err := ep.Send(scheduler.Address, api.PortControl, duplicate); err != nil {
+		t.Fatal(err)
+	}
+	var established api.HostIncarnation
+	wait(true, func() bool {
+		traffic.mu.Lock()
+		defer traffic.mu.Unlock()
+		for _, ack := range traffic.acks {
+			if !ack.Reregister && ack.Incarnation != (api.HostIncarnation{}) {
+				established = ack.Incarnation
+			}
+		}
+		return established != (api.HostIncarnation{}) && !traffic.dropChallenge && !traffic.dropRegistration && !traffic.dropAck
+	})
+	if v, err := s.GetVM(ctx, created.ID); err != nil || v.State != api.VMReady || v.Generation != original.Generation {
+		t.Fatalf("lost handshake leg invalidated running copy: %+v %v", v, err)
+	}
+	// A real agent restart loses the established sequence/identity. Recovery
+	// must obtain a new proof and reconcile the still-running driver copy.
+	if err := a.Restart(ctx); err != nil {
+		t.Fatal(err)
+	}
+	wait(true, func() bool {
+		traffic.mu.Lock()
+		defer traffic.mu.Unlock()
+		for _, ack := range traffic.acks {
+			if !ack.Reregister && ack.Incarnation.Epoch >= established.Epoch && ack.Incarnation.Challenge > established.Challenge {
+				return true
+			}
+		}
+		return false
+	})
+	if v, err := s.GetVM(ctx, created.ID); err != nil || v.State != api.VMReady || v.Generation != original.Generation {
+		t.Fatalf("restart after challenge did not reconcile original copy: %+v %v", v, err)
 	}
 	paused := c.Now()
 	for n := 0; n < 3; n++ {

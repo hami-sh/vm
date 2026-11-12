@@ -21,6 +21,18 @@ type InventoryItem struct {
 
 // --- Agent -> Scheduler ---
 
+// HostIncarnation identifies a scheduler-issued sequence-reset challenge.
+// Epoch prevents reuse after scheduler restart; Challenge is per host, so
+// requesting a fresh registration does not advance the global epoch.
+type HostIncarnation struct {
+	Epoch     int64  `json:"epoch"`
+	Challenge uint64 `json:"challenge"`
+}
+
+func (i HostIncarnation) After(previous HostIncarnation) bool {
+	return i.Epoch > previous.Epoch || (i.Epoch == previous.Epoch && i.Challenge > previous.Challenge)
+}
+
 // RegisterHost is sent when an agent starts or reconnects. It carries the full
 // inventory so the scheduler can reconcile (adopt / stop / re-place).
 type RegisterHost struct {
@@ -32,16 +44,21 @@ type RegisterHost struct {
 	// Epoch is the highest scheduler_epoch this agent has accepted. A
 	// scheduler whose store was wiped moves its epoch past it.
 	Epoch int64 `json:"epoch,omitempty"`
+	// Seq shares one increasing counter with HostHeartbeat. Incarnation is
+	// echoed from a Reregister challenge before the counter may reset.
+	Seq         uint64          `json:"seq"`
+	Incarnation HostIncarnation `json:"incarnation"`
 }
 
 // HostHeartbeat renews the host lease and carries the inventory. One per host,
 // not one per VM: fan-in at the scheduler is O(hosts).
 type HostHeartbeat struct {
-	HostID    string          `json:"host_id"`
-	Seq       uint64          `json:"seq"`
-	DiskFull  bool            `json:"disk_full,omitempty"`
-	Inventory []InventoryItem `json:"inventory"`
-	Epoch     int64           `json:"epoch,omitempty"` // as in RegisterHost
+	HostID      string          `json:"host_id"`
+	Seq         uint64          `json:"seq"`
+	DiskFull    bool            `json:"disk_full,omitempty"`
+	Inventory   []InventoryItem `json:"inventory"`
+	Epoch       int64           `json:"epoch,omitempty"` // as in RegisterHost
+	Incarnation HostIncarnation `json:"incarnation"`
 }
 
 // StartVMResult answers a StartVM.
@@ -122,6 +139,9 @@ type HeartbeatAck struct {
 	// the scheduler has no record of this host (wiped store, or a dropped
 	// RegisterHost). The host stays the authority on its own capacity.
 	Reregister bool `json:"reregister,omitempty"`
+	// Reregister issues this challenge; normal acknowledgments echo the
+	// accepted incarnation. An older acknowledgment cannot roll it back.
+	Incarnation HostIncarnation `json:"incarnation"`
 }
 
 // --- guestd -> Agent (vsock in real life) ---

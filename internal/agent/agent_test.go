@@ -514,6 +514,65 @@ func TestReregisterAfterDroppedRegistration(t *testing.T) {
 	}
 }
 
+func TestRegistrationChallengeRetriesAndSharedSequence(t *testing.T) {
+	h := newHarness(t)
+	challenge := api.HostIncarnation{Epoch: 7, Challenge: 2}
+	ack := api.HeartbeatAck{HostID: "h1", Epoch: 7, Reregister: true, Incarnation: challenge}
+	registrations := func(inc api.HostIncarnation) int {
+		n := 0
+		for _, message := range h.messages {
+			if registration, ok := message.(api.RegisterHost); ok && registration.Incarnation == inc {
+				n++
+			}
+		}
+		return n
+	}
+	h.send(ack)
+	h.until(func(agent.Snapshot) bool { return registrations(challenge) >= 1 })
+	n := registrations(challenge)
+	// The scheduler did not receive the first response. Equality must still
+	// retry immediately, and heartbeat-driven registration must continue.
+	h.send(ack)
+	h.until(func(agent.Snapshot) bool { return registrations(challenge) > n })
+	n = registrations(challenge)
+	h.until(func(agent.Snapshot) bool { return registrations(challenge) > n })
+	// Neither a smaller counter nor a larger counter in an older epoch
+	// can replace the active identity or terminate its retries.
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 7, Incarnation: api.HostIncarnation{Epoch: 7, Challenge: 1}})
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 7, Reregister: true, Incarnation: api.HostIncarnation{Epoch: 6, Challenge: 100}})
+	n = registrations(challenge)
+	h.until(func(agent.Snapshot) bool { return registrations(challenge) > n })
+	last := uint64(0)
+	heartbeats := 0
+	for _, message := range h.messages {
+		var seq uint64
+		switch m := message.(type) {
+		case api.RegisterHost:
+			seq = m.Seq
+		case api.HostHeartbeat:
+			seq = m.Seq
+			if m.Incarnation == challenge {
+				heartbeats++
+			}
+		default:
+			continue
+		}
+		if seq <= last {
+			t.Fatalf("registration/heartbeat sequence regressed: %d after %d", seq, last)
+		}
+		last = seq
+	}
+	if heartbeats == 0 {
+		t.Fatal("heartbeat did not retain the outstanding challenge identity")
+	}
+	// A higher epoch wins even with a smaller per-host challenge counter.
+	next := api.HostIncarnation{Epoch: 8, Challenge: 1}
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 8, Reregister: true, Incarnation: next})
+	h.until(func(agent.Snapshot) bool { return registrations(next) > 0 })
+	h.send(api.HeartbeatAck{HostID: "h1", Epoch: 8, Incarnation: next})
+	h.until(func(s agent.Snapshot) bool { return s.Epoch == 8 })
+}
+
 func TestBlockedGuestLeaseExpiry(t *testing.T) {
 	for _, recent := range []bool{true, false} {
 		t.Run(fmt.Sprintf("recent=%v", recent), func(t *testing.T) {

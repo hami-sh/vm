@@ -69,19 +69,11 @@ func TestDelayedRegistrationDoesNotInvalidateInFlightStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.Advance(500 * time.Millisecond)
-	for {
-		snapshot, err := s.Snapshot(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if snapshot.Hosts[0].LeaseAgeMs == 0 {
-			v, err := s.GetVM(ctx, created.ID)
-			if err != nil || v.State != api.VMBooting || v.Generation != 1 {
-				t.Fatalf("pre-start registration invalidated in-flight placement: %+v %v", v, err)
-			}
-			break
-		}
-		(clock.Real{}).Sleep(time.Millisecond)
+	// A duplicate registration must no longer renew the lease, so its
+	// receipt cannot be synchronized by waiting for LeaseAgeMs == 0.
+	// Keep checking this same incarnation through delivery and readiness.
+	if v, err := s.GetVM(ctx, created.ID); err != nil || v.State != api.VMBooting || v.Generation != 1 {
+		t.Fatalf("pre-start registration invalidated in-flight placement: %+v %v", v, err)
 	}
 	if actual, err := d.List(ctx); err != nil || len(actual) != 0 {
 		t.Fatalf("StartVM arrived before the delayed registration: %+v %v", actual, err)

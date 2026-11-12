@@ -9,6 +9,134 @@ import (
 	"github.com/hami-sh/vm/internal/api"
 )
 
+func TestDuplicateRegistrationCannotReopenHeartbeatWindow(t *testing.T) {
+	h := newHarness(t)
+	h.register("a", "r1", 1)
+	v := h.create("registration-order", "standard")
+	h.ready(v)
+	old := api.InventoryItem{VMID: v.ID, Generation: v.Generation, State: api.VMReady}
+	h.agent("a", "r1", api.UnhealthyReport{HostID: "a", VMID: v.ID, Generation: v.Generation, Reason: api.ReasonGuestLease})
+	v = h.s.state.data.VMs[v.ID].VM
+	h.ready(v)
+	current := api.InventoryItem{VMID: v.ID, Generation: v.Generation, State: api.VMReady}
+	epoch := h.s.state.epoch
+	h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: 20, Epoch: epoch, Inventory: []api.InventoryItem{current}})
+	h.c.Advance(time.Second)
+	// Even a registration carrying correct inventory must not reopen the
+	// sequence window for the queued, older heartbeat that follows it.
+	h.agent("a", "r1", api.RegisterHost{HostID: "a", Rack: "r1", Slots: 1, Epoch: epoch, Inventory: []api.InventoryItem{current}})
+	h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: 19, Epoch: epoch, Inventory: []api.InventoryItem{old}})
+	got := h.step(request{op: "snapshot"}).response.value.(api.Snapshot)
+	if got.VMs[0].State != api.VMReady || got.VMs[0].Generation != v.Generation || got.Hosts[0].LeaseAgeMs != time.Second.Milliseconds() {
+		t.Fatalf("duplicate registration accepted obsolete inventory or renewed lease: %+v", got)
+	}
+}
+
+func TestLateHeartbeatDoesNotBlockClearedDiskInventory(t *testing.T) {
+	h := newHarness(t)
+	h.register("a", "r1", 1)
+	// Establish a nonzero identity, as after a genuine restart handshake.
+	h.register("a", "r1", 1)
+	h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: 20, DiskFull: true})
+	v := h.create("disk-healed", "standard")
+	if h.s.state.data.VMs[v.ID].VM.State != api.VMPending {
+		t.Fatal("placed on a full disk")
+	}
+	h.c.Advance(time.Second)
+	e := h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: 19, DiskFull: true})
+	for _, send := range e.sends {
+		if ack, ok := send.msg.(api.HeartbeatAck); ok && ack.Reregister {
+			t.Fatal("late heartbeat started a registration cycle for a healthy incarnation")
+		}
+	}
+	h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: 21})
+	if got := h.s.state.data.VMs[v.ID].VM; got.State != api.VMBooting || got.HostID != "a" {
+		t.Fatalf("newer cleared-disk inventory did not enable placement: %+v", got)
+	}
+}
+
+func TestRegistrationResetRequiresExactOutstandingChallenge(t *testing.T) {
+	h := newHarness(t)
+	h.register("a", "r1", 1)
+	v := h.create("challenge", "standard")
+	h.ready(v)
+	item := api.InventoryItem{VMID: v.ID, Generation: v.Generation, State: api.VMReady}
+	h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: 20, Inventory: []api.InventoryItem{item}})
+	epoch := h.s.state.epoch
+	h.c.Advance(time.Second)
+	e := h.agent("a", "r1", api.RegisterHost{HostID: "a", Rack: "r1", Slots: 1})
+	challenge := e.sends[0].msg.(api.HeartbeatAck)
+	if !challenge.Reregister || challenge.Incarnation == (api.HostIncarnation{}) || challenge.Epoch != epoch {
+		t.Fatalf("missing per-host challenge or global epoch changed: %+v", challenge)
+	}
+	// Neither a higher pre-challenge sequence nor a heartbeat that echoes
+	// the challenge substitutes for its authoritative registration.
+	h.agent("a", "r1", api.RegisterHost{HostID: "a", Rack: "r1", Slots: 1, Seq: 99})
+	h.step(api.Envelope{From: api.Addr{Kind: api.KindAgent, ID: "a", Host: "a", Rack: "r1"}, Port: api.PortControl, Msg: api.HostHeartbeat{HostID: "a", Seq: 100, Incarnation: challenge.Incarnation}})
+	before := h.step(request{op: "snapshot"}).response.value.(api.Snapshot)
+	if before.VMs[0].State != api.VMReady || before.Hosts[0].LeaseAgeMs != time.Second.Milliseconds() {
+		t.Fatalf("pre-challenge report became authoritative: %+v", before)
+	}
+	registration := api.RegisterHost{HostID: "a", Rack: "r1", Slots: 1, Seq: 1, Incarnation: challenge.Incarnation, Inventory: []api.InventoryItem{item}}
+	h.agent("a", "r1", registration)
+	h.c.Advance(time.Second)
+	registration.Inventory = nil
+	h.agent("a", "r1", registration)
+	h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: 1})
+	after := h.step(request{op: "snapshot"}).response.value.(api.Snapshot)
+	if after.VMs[0].State != api.VMReady || after.Hosts[0].LeaseAgeMs != time.Second.Milliseconds() {
+		t.Fatalf("duplicate established incarnation refreshed or reconciled: %+v", after)
+	}
+	// A genuinely restarted process has lost its identity and can obtain
+	// another challenge, but an old proof cannot satisfy that new request.
+	e = h.agent("a", "r1", api.RegisterHost{HostID: "a", Rack: "r1", Slots: 1})
+	next := e.sends[0].msg.(api.HeartbeatAck)
+	if next.Incarnation.Epoch != challenge.Incarnation.Epoch || next.Incarnation.Challenge <= challenge.Incarnation.Challenge {
+		t.Fatalf("challenge reused: old=%+v new=%+v", challenge, next)
+	}
+	registration.Seq = 1000
+	h.agent("a", "r1", registration)
+	if h.s.state.data.VMs[v.ID].VM.State != api.VMReady {
+		t.Fatal("old proof satisfied a later challenge")
+	}
+	registration.Incarnation = next.Incarnation
+	registration.Seq = 1
+	e = h.agent("a", "r1", registration)
+	lost := false
+	for _, event := range e.events {
+		lost = lost || event.VMID == v.ID && event.To == api.VMLost
+	}
+	if !lost || h.s.state.epoch != epoch {
+		t.Fatal("fresh restart proof did not reconcile absence, or advanced global epoch")
+	}
+}
+
+func TestNewerRetainedIncarnationObtainsFreshProof(t *testing.T) {
+	h := newHarness(t)
+	previous := api.HostIncarnation{Epoch: 7, Challenge: 2}
+	h.agent("a", "r1", api.RegisterHost{HostID: "a", Rack: "r1", Slots: 1, Epoch: 7, Seq: 20, Incarnation: previous})
+	v := h.create("retained-incarnation", "standard")
+	h.ready(v)
+	// On scheduler restart, an old registration can arrive before the
+	// agent's newer retained identity. That identity is not retired just
+	// because the scheduler bootstrapped from the earlier packet.
+	newer := api.HostIncarnation{Epoch: 7, Challenge: 3}
+	e := h.agent("a", "r1", api.RegisterHost{HostID: "a", Rack: "r1", Slots: 1, Epoch: 7, Seq: 30, Incarnation: newer})
+	if len(e.sends) != 1 {
+		t.Fatalf("newer retained identity stranded without a challenge: %+v", e.sends)
+	}
+	challenge := e.sends[0].msg.(api.HeartbeatAck)
+	if !challenge.Reregister || !challenge.Incarnation.After(newer) {
+		t.Fatalf("challenge reused a previously observed identity: %+v", challenge)
+	}
+	item := api.InventoryItem{VMID: v.ID, Generation: v.Generation, State: api.VMReady}
+	h.agent("a", "r1", api.RegisterHost{HostID: "a", Rack: "r1", Slots: 1, Epoch: challenge.Epoch, Seq: 1, Incarnation: challenge.Incarnation, Inventory: []api.InventoryItem{item}})
+	got := h.step(request{op: "snapshot"}).response.value.(api.Snapshot)
+	if got.VMs[0].State != api.VMReady || got.VMs[0].Generation != v.Generation || got.Hosts[0].Lease != api.LeaseHealthy {
+		t.Fatalf("fresh proof did not recover retained identity: %+v", got)
+	}
+}
+
 func TestRegistrationAbsencePreservesUnadmittedBoot(t *testing.T) {
 	for _, state := range []string{"unadmitted", "admitted", "ready", "unhealthy"} {
 		t.Run(state, func(t *testing.T) {
