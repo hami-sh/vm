@@ -20,6 +20,7 @@ type fakeFleet struct {
 	System
 	initial api.Snapshot
 	frames  []api.Snapshot
+	events  []api.Event
 }
 
 func (f *fakeFleet) Latest() api.Snapshot { return f.initial }
@@ -32,7 +33,12 @@ func (f *fakeFleet) Subscribe() (<-chan api.Snapshot, <-chan api.Event, func()) 
 		s <- v
 	}
 	close(s)
-	return s, make(chan api.Event), func() {}
+	events := make(chan api.Event, len(f.events))
+	for _, ev := range f.events {
+		events <- ev
+	}
+	close(events)
+	return s, events, func() {}
 }
 func snapshot(at int64, state api.VMState) api.Snapshot {
 	s := api.Snapshot{Seq: at/1000 + 1, At: at, Racks: []api.Rack{{ID: "r1"}}, Hosts: []api.Host{{ID: "r1-h1", SlotCount: 2}}, VMs: []api.VM{{ID: "vm-1", Desired: api.DesiredRunning, State: state}}, Counters: api.Counters{QueueCap: 32}}
@@ -53,6 +59,10 @@ func TestRunnerRecordsFirstViolationAndPostFaultRecovery(t *testing.T) {
 			s := Scenario{Name: "fault", Topology: Topology{1, 1, 2}, Duration: 4 * time.Second, Timeline: []Step{{2 * time.Second, func(context.Context, System) error { return nil }}}, Expect: []Check{Always("safe", NoInvariantViolations), Eventually(4*time.Second, "recovered", AllDesiredVMsReady), Metric("p99_recover_ms", 2500)}}
 			factory := func(context.Context, Scenario, int64, float64) (System, func(), error) {
 				f := &fakeFleet{initial: snapshot(0, api.VMReady), frames: frames}
+				f.events = []api.Event{{Kind: api.EventTransition, VMID: "vm-1", At: 2000, To: api.VMLost}}
+				if !broken {
+					f.events = append(f.events, api.Event{Kind: api.EventTransition, VMID: "vm-1", At: 4000, To: api.VMReady})
+				}
 				return FromFleet(f, f, f), func() {}, nil
 			}
 			dir := t.TempDir()

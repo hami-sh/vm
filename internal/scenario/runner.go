@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hami-sh/vm/internal/api"
+	"github.com/hami-sh/vm/internal/config"
 )
 
 type Factory func(context.Context, Scenario, int64, float64) (System, func(), error)
@@ -131,8 +132,66 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 		return report, e
 	}
 	defer closeFleet()
-	snapshots, eventStream, cancel := f.Subscribe()
+	rawSnapshots, rawEvents, cancel := f.Subscribe()
 	defer cancel()
+	// Drain the fleet while a synchronous action (e.g. a 60-create flood)
+	// runs. Fleet subscriptions deliberately drop slow readers; recordings
+	// must not lose those intermediate transitions or published frames.
+	cfg := config.Default()
+	snapshots := make(chan api.Snapshot, int(s.Duration/cfg.SnapshotEvery)+cfg.QueueCap)
+	eventStream := make(chan api.Event, cfg.EventRetention)
+	go func() {
+		defer close(snapshots)
+		defer close(eventStream)
+		pendingEvents := rawEvents
+		forward := func(ev api.Event) bool {
+			select {
+			case eventStream <- ev:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+		for {
+			select {
+			case ev, ok := <-pendingEvents:
+				if !ok {
+					pendingEvents = nil
+					continue
+				}
+				if !forward(ev) {
+					return
+				}
+			case snap, ok := <-rawSnapshots:
+				if !ok {
+					return
+				}
+			drain:
+				for {
+					select {
+					case ev, ok := <-pendingEvents:
+						if !ok {
+							pendingEvents = nil
+							break drain
+						}
+						if !forward(ev) {
+							return
+						}
+					default:
+						break drain
+					}
+				}
+				select {
+				case snapshots <- snap:
+				case <-ctx.Done():
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	var eventsIn <-chan api.Event = eventStream
 	initial := f.Latest()
 	origin := initial.At
 	if len(initial.Racks) != s.Topology.Racks || len(initial.Hosts) != s.Topology.Racks*s.Topology.Hosts {
@@ -174,6 +233,28 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 	}
 	lost := map[string]int64{}
 	var recoveries []int64
+	recordEvent := func(ev api.Event) error {
+		if e := json.NewEncoder(events).Encode(ev); e != nil {
+			return e
+		}
+		if ev.Kind == api.EventChaos || ev.Kind == api.EventInvariant {
+			report.Markers = append(report.Markers, ev)
+		}
+		if ev.Kind == api.EventTransition {
+			if ev.To == api.VMLost || ev.To == api.VMUnhealthy {
+				if _, ok := lost[ev.VMID]; !ok {
+					lost[ev.VMID] = ev.At
+				}
+			}
+			if ev.To == api.VMReady {
+				if at, ok := lost[ev.VMID]; ok && ev.At >= at {
+					recoveries = append(recoveries, ev.At-at)
+					delete(lost, ev.VMID)
+				}
+			}
+		}
+		return nil
+	}
 	seen := false
 	watchdog := WallClock.NewTimer(30*time.Second + time.Duration(float64(s.Duration)/speed)*3)
 	defer watchdog.Stop()
@@ -183,16 +264,13 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 			return report, ctx.Err()
 		case <-watchdog.C():
 			return report, fmt.Errorf("snapshot stream stalled before scenario deadline")
-		case ev, ok := <-eventStream:
+		case ev, ok := <-eventsIn:
 			if !ok {
-				eventStream = nil
+				eventsIn = nil
 				continue
 			}
-			if e := json.NewEncoder(events).Encode(ev); e != nil {
+			if e := recordEvent(ev); e != nil {
 				return report, e
-			}
-			if ev.Kind == api.EventChaos || ev.Kind == api.EventInvariant {
-				report.Markers = append(report.Markers, ev)
 			}
 		case snap, ok := <-snapshots:
 			if !ok {
@@ -214,19 +292,6 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 					return report, e
 				}
 				next++
-			}
-			for _, v := range snap.VMs {
-				if v.State == api.VMLost || v.State == api.VMUnhealthy {
-					if _, ok := lost[v.ID]; !ok {
-						lost[v.ID] = snap.At
-					}
-				}
-				if v.State == api.VMReady {
-					if at, ok := lost[v.ID]; ok {
-						recoveries = append(recoveries, snap.At-at)
-						delete(lost, v.ID)
-					}
-				}
 			}
 			for i, c := range s.Expect {
 				if c.Metric != "" {
@@ -253,6 +318,22 @@ func Run(ctx context.Context, s Scenario, factory Factory, seed int64, speed flo
 			if elapsed >= s.Duration {
 				if !seen || next != len(steps) {
 					return report, fmt.Errorf("timeline did not complete")
+				}
+				// Events and snapshots are separate channels. Consume buffered
+				// transitions before deciding whether a metric had samples.
+			drainEvents:
+				for {
+					select {
+					case ev, ok := <-eventStream:
+						if !ok {
+							break drainEvents
+						}
+						if e := recordEvent(ev); e != nil {
+							return report, e
+						}
+					default:
+						break drainEvents
+					}
 				}
 				if len(recoveries) > 0 {
 					report.P99RecoverMs = percentile(recoveries)

@@ -1,4 +1,4 @@
-.PHONY: build vet test fixture run verify
+.PHONY: build vet test fixture run verify e2e
 
 build:
 	go build ./...
@@ -16,7 +16,10 @@ fixture:
 run:
 	go run ./cmd/controlplane
 
-# This gate intentionally fails against a health-only server stub.
+# Real actors and SQLite run in-process under the race detector.
 verify: vet test
-	go run ./cmd/vmctl verify --repeat 20
+	go run -race ./cmd/vmctl verify --repeat 20
+
+# Separate integration gate; fails until the HTTP server is wired to web.
+e2e:
 	go run ./cmd/vmctl e2e

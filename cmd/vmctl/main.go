@@ -1,4 +1,4 @@
-// Command vmctl verifies isolated controlplane processes and records evidence.
+// Command vmctl verifies isolated in-process fleets and records evidence.
 package main
 
 import (
@@ -31,7 +31,7 @@ func run() error {
 	repeat := fs.Int("repeat", 20, "runs per scenario")
 	parallel := fs.Int("parallel", 4, "isolated concurrent servers")
 	seed := fs.Int64("seed", 1, "first seed")
-	speed := fs.Float64("speed", 0, "sim speed; 0 calibrates at 5x and 50x")
+	speed := fs.Float64("speed", 5, "sim speed; 0 calibrates at 5x and 50x")
 	output := fs.String("output", "runs", "recording directory")
 	filter := fs.String("scenario", "", "run one scenario by name")
 	server := fs.String("server", "", "controlplane binary (default builds current source)")
@@ -40,7 +40,7 @@ func run() error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
-	if *server == "" {
+	if *server == "" && os.Args[1] == "e2e" {
 		dir, err := os.MkdirTemp("", "vmctl-build-")
 		if err != nil {
 			return err
@@ -54,11 +54,15 @@ func run() error {
 			return err
 		}
 	}
-	abs, err := filepath.Abs(*server)
-	if err != nil {
-		return err
+	var err error
+	factory := scenario.RealFleet
+	if *server != "" {
+		abs, e := filepath.Abs(*server)
+		if e != nil {
+			return e
+		}
+		factory = serverFactory(abs)
 	}
-	factory := serverFactory(abs)
 	if os.Args[1] == "e2e" {
 		f, stop, err := factory(ctx, scenario.Catalog()[0], 1, 5)
 		if err != nil {
