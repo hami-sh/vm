@@ -46,6 +46,10 @@ type reservation struct {
 	admitted   bool
 	command    api.StartVM
 }
+type blockedAttack struct {
+	generation int64
+	at         time.Time
+}
 type state struct {
 	data         store.Data
 	hosts        map[string]host
@@ -54,6 +58,7 @@ type state struct {
 	recovering   map[string]int64
 	replacement  map[string]bool
 	claims       map[string]string
+	blocked      map[string]blockedAttack
 	fresh        bool
 	recoverUntil int64
 	down         bool
@@ -129,7 +134,7 @@ func New(ctx context.Context, cfg config.Config, c clock.Clock, transport api.Tr
 }
 
 func newState(d store.Data, epoch int64, now time.Time, cfg config.Config) *state {
-	s := &state{data: d, epoch: epoch, hosts: map[string]host{}, reservations: map[string]reservation{}, exclude: map[string]string{}, recovering: map[string]int64{}, replacement: map[string]bool{}, claims: map[string]string{}, metrics: newMetrics()}
+	s := &state{data: d, epoch: epoch, hosts: map[string]host{}, reservations: map[string]reservation{}, exclude: map[string]string{}, recovering: map[string]int64{}, replacement: map[string]bool{}, claims: map[string]string{}, blocked: map[string]blockedAttack{}, metrics: newMetrics()}
 	s.counters.Recoveries = map[string]int{}
 	for id, h := range d.Hosts {
 		// These leases are already Suspect: only the fresh lost-grace period
@@ -157,6 +162,7 @@ func (st *state) clone() *state {
 	n.recovering = maps.Clone(st.recovering)
 	n.replacement = maps.Clone(st.replacement)
 	n.claims = maps.Clone(st.claims)
+	n.blocked = maps.Clone(st.blocked)
 	n.counters.Recoveries = maps.Clone(st.counters.Recoveries)
 	n.metrics = st.metrics.clone()
 	// Events are append-only; existing elements are never rewritten. Sharing

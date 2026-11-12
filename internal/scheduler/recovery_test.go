@@ -33,6 +33,47 @@ func TestQuarantinedStopCannotBecomeReplacement(t *testing.T) {
 	}
 }
 
+func TestGuestLeaseWithRecentBlockedAttackQuarantines(t *testing.T) {
+	for _, source := range []string{"heartbeat", "report"} {
+		for _, control := range []string{"recent", "expired", "older-generation", "other-reason"} {
+			t.Run(source+"/"+control, func(t *testing.T) {
+				h := newHarness(t)
+				h.register("a", "r1", 1)
+				v := h.create("K", "standard")
+				h.ready(v)
+				generation := v.Generation
+				if control == "older-generation" {
+					generation--
+				}
+				h.agent("a", "r1", api.SecurityReport{HostID: "a", VMID: v.ID, Generation: generation, Attack: api.AttackReplay})
+				age := h.s.cfg.QuarantineWindow - time.Millisecond
+				if control == "expired" {
+					age = h.s.cfg.QuarantineWindow
+				}
+				h.c.Advance(age)
+				reason := api.ReasonGuestLease
+				if control == "other-reason" {
+					reason = "driver_exit"
+				}
+				var e Effect
+				if source == "heartbeat" && control != "other-reason" {
+					e = h.agent("a", "r1", api.HostHeartbeat{HostID: "a", Seq: 1, Inventory: []api.InventoryItem{{VMID: v.ID, Generation: v.Generation, State: api.VMUnhealthy}}})
+				} else {
+					e = h.agent("a", "r1", api.UnhealthyReport{HostID: "a", VMID: v.ID, Generation: v.Generation, Reason: reason})
+				}
+				got := h.s.state.data.VMs[v.ID].VM
+				if control == "recent" {
+					if got.State != api.VMFailed || got.LastReason != api.ReasonQuarantined || got.Generation != v.Generation || !hasStop(e, v.ID, v.Generation) {
+						t.Fatalf("recent blocked attacker recycled: %+v", got)
+					}
+				} else if got.State != api.VMBooting || got.Generation != v.Generation+1 {
+					t.Fatalf("unrelated or expired evidence poisoned recycle: %+v", got)
+				}
+			})
+		}
+	}
+}
+
 func TestQuarantineTombstoneSurvivesLostReports(t *testing.T) {
 	for _, initial := range []api.VMState{api.VMReady, api.VMBooting, api.VMUnhealthy, api.VMTerminating} {
 		t.Run(string(initial), func(t *testing.T) {

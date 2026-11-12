@@ -257,7 +257,11 @@ func (p *planner) create(key string, req api.CreateVMRequest) result {
 	}
 	// Drain older work before deciding whether this request needs a queue slot.
 	p.drain()
-	if len(p.data.Queue) >= p.cfg.QueueCap && p.chooseHost(api.VM{Pool: req.Pool}) == "" {
+	hostID := ""
+	if !p.replacementWaiting() {
+		hostID = p.chooseHost(api.VM{Pool: req.Pool})
+	}
+	if len(p.data.Queue) >= p.cfg.QueueCap && hostID == "" {
 		if !p.makeRoom(pr, false) {
 			return p.reject()
 		}
@@ -270,8 +274,8 @@ func (p *planner) create(key string, req api.CreateVMRequest) result {
 	v := api.VM{ID: id, Pool: req.Pool, Priority: pr, Desired: api.DesiredRunning, CreatedAt: now, UpdatedAt: now}
 	p.data.VMs[id] = store.Record{VM: v, Key: key, Hash: hash}
 	p.move(id, api.VMPending, "created")
-	if h := p.chooseHost(v); h != "" {
-		p.place(id, h)
+	if hostID != "" {
+		p.place(id, hostID)
 	} else {
 		p.data.Queue[id] = api.QueueEntry{VMID: id, Priority: pr, Reason: api.QueueNew, EnqueuedAt: now, NotBefore: now}
 		p.counters.Queued++
@@ -294,9 +298,24 @@ func (p *planner) effective(q api.QueueEntry) api.Priority {
 	}
 	return v
 }
+
+func (p *planner) replacementWaiting() bool {
+	for _, q := range p.data.Queue {
+		if q.Reason == api.QueueReplace {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *planner) ordered(eligible bool) []api.QueueEntry {
 	out := []api.QueueEntry{}
+	// Backoff delays recovery, not its precedence over ordinary demand.
+	replacementsOnly := eligible && p.replacementWaiting()
 	for _, q := range p.data.Queue {
+		if replacementsOnly && q.Reason != api.QueueReplace {
+			continue
+		}
 		if eligible && q.NotBefore > p.now.UnixMilli() {
 			continue
 		}

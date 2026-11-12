@@ -127,6 +127,10 @@ func (p *planner) receive(from api.Addr, msg any) {
 		if m.HostID != id || !p.current(id, m.VMID, m.Generation) {
 			return
 		}
+		if blocked, ok := p.blocked[m.VMID]; ok && m.Reason == api.ReasonGuestLease && blocked.generation == m.Generation && blocked.at.After(p.now.Add(-p.cfg.QuarantineWindow)) {
+			p.quarantine(m.VMID)
+			return
+		}
 		v := p.data.VMs[m.VMID].VM
 		if v.State == api.VMReady {
 			p.move(v.ID, api.VMUnhealthy, m.Reason)
@@ -172,6 +176,7 @@ func (p *planner) receive(from api.Addr, msg any) {
 		if !p.current(id, m.VMID, m.Generation) {
 			return
 		}
+		p.blocked[m.VMID] = blockedAttack{generation: m.Generation, at: p.now}
 		p.metrics.blocked[m.Attack]++
 		p.log(api.EventSecurity, m.VMID, id, m.Attack)
 	}

@@ -682,6 +682,9 @@ func TestReservationTimeoutRefusalAndRecycle(t *testing.T) {
 	h := newHarness(t)
 	h.register("a", "r1", 1)
 	h.register("b", "r2", 1)
+	// Keep the retry queued at the assertions even when jitter rounds to zero.
+	// The releasing copy still occupies a; open b only after checking expiry.
+	h.step(request{op: "admin", id: "b", arg: api.AdminCordoned})
 	v := h.create("v", "standard")
 	h.c.Advance(h.s.cfg.ReservationTTL)
 	for _, id := range []string{"a", "b"} {
@@ -698,10 +701,12 @@ func TestReservationTimeoutRefusalAndRecycle(t *testing.T) {
 		h.agent(id, hh.record.Rack, api.HostHeartbeat{HostID: id, Seq: 2, Inventory: hh.inventory})
 	}
 	h.step(tick{})
+	h.step(request{op: "admin", id: "b", arg: api.AdminActive})
 	retry := h.s.state.data.VMs[v.ID].VM
 	if retry.HostID == v.HostID || retry.Generation != v.Generation+1 {
 		t.Fatalf("did not exclude timed-out host: %+v", retry)
 	}
+	h.step(request{op: "admin", id: "b", arg: api.AdminCordoned})
 	e = h.agent(retry.HostID, retry.Rack, api.StartVMResult{HostID: retry.HostID, VMID: v.ID, Generation: retry.Generation, Admitted: false, Reason: "full"})
 	if h.s.state.data.VMs[v.ID].VM.State != api.VMPending {
 		t.Fatal("refusal not retried")
